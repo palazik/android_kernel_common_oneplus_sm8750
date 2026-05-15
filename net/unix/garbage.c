@@ -371,7 +371,7 @@ static void unix_collect_skb(struct list_head *scc, struct sk_buff_head *hitlist
 
 		spin_lock(&queue->lock);
 
-		if (u->sk.sk_state == TCP_LISTEN) {
+		if (u->sk.sk_state == TCP_LISTEN) { 
 			struct sk_buff *skb;
 
 			skb_queue_walk(queue, skb) {
@@ -382,6 +382,7 @@ static void unix_collect_skb(struct list_head *scc, struct sk_buff_head *hitlist
 			unix_collect_queue(unix_sk(skb->sk), hitlist);
 			spin_unlock(&embryo_queue->lock);
 		}
+			spin_unlock(&queue->lock);
 	} else {
 		unix_collect_queue(u, hitlist);
 		spin_unlock(&queue->lock);

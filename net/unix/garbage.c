@@ -382,10 +382,11 @@ static void unix_collect_skb(struct list_head *scc, struct sk_buff_head *hitlist
 			unix_collect_queue(unix_sk(skb->sk), hitlist);
 			spin_unlock(&embryo_queue->lock);
 		}
-			spin_unlock(&queue->lock);
+		spin_unlock(&queue->lock);
 	} else {
 		unix_collect_queue(u, hitlist);
 		spin_unlock(&queue->lock);
+	}
 	}
 }
 

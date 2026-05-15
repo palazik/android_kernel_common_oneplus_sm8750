@@ -744,10 +744,6 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 		ret = drm_atomic_add_affected_planes(state, crtc);
 		if (ret != 0)
 			return ret;
-
-		ret = drm_atomic_check_valid_clones(state, crtc);
-		if (ret != 0)
-			return ret;
 	}
 
 	/*

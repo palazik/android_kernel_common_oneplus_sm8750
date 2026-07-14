@@ -101,7 +101,6 @@ int smu_v12_0_check_fw_version(struct smu_context *smu)
 			"smu fw program = %d, smu fw version = 0x%08x (%d.%d.%d)\n",
 			smu->smc_driver_if_version, if_version,
 			smu_program, smu_version, smu_major, smu_minor, smu_debug);
-		dev_info(smu->adev->dev, "SMU driver if version not matched\n");
 	}
 
 	return ret;
@@ -301,7 +300,7 @@ static int smu_v12_0_atom_get_smu_clockinfo(struct amdgpu_device *adev,
 					    getsmuclockinfo);
 
 	ret = amdgpu_atom_execute_table(adev->mode_info.atom_context, index,
-					(uint32_t *)&input);
+					(uint32_t *)&input, sizeof(input));
 	if (ret)
 		return -EINVAL;
 

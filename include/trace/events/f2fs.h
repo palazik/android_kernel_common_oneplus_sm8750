@@ -364,7 +364,7 @@ TRACE_EVENT(f2fs_unlink_enter,
 		__entry->ino	= dir->i_ino;
 		__entry->size	= dir->i_size;
 		__entry->blocks	= dir->i_blocks;
-		__assign_str(name, dentry->d_name.name);
+		__assign_str(name);
 	),
 
 	TP_printk("dev = (%d,%d), dir ino = %lu, i_size = %lld, "
@@ -593,6 +593,38 @@ TRACE_EVENT(f2fs_file_write_iter,
 		__entry->offset,
 		__entry->length,
 		__entry->ret)
+);
+
+TRACE_EVENT(f2fs_fadvise,
+
+	TP_PROTO(struct inode *inode, loff_t offset, loff_t len, int advice),
+
+	TP_ARGS(inode, offset, len, advice),
+
+	TP_STRUCT__entry(
+		__field(dev_t,	dev)
+		__field(ino_t,	ino)
+		__field(loff_t, size)
+		__field(loff_t,	offset)
+		__field(loff_t,	len)
+		__field(int,	advice)
+	),
+
+	TP_fast_assign(
+		__entry->dev	= inode->i_sb->s_dev;
+		__entry->ino	= inode->i_ino;
+		__entry->size	= i_size_read(inode);
+		__entry->offset	= offset;
+		__entry->len	= len;
+		__entry->advice	= advice;
+	),
+
+	TP_printk("dev = (%d,%d), ino = %lu, i_size = %lld offset:%llu, len:%llu, advise:%d",
+		show_dev_ino(__entry),
+		(unsigned long long)__entry->size,
+		__entry->offset,
+		__entry->len,
+		__entry->advice)
 );
 
 TRACE_EVENT(f2fs_map_blocks,
@@ -853,7 +885,7 @@ TRACE_EVENT(f2fs_lookup_start,
 	TP_fast_assign(
 		__entry->dev	= dir->i_sb->s_dev;
 		__entry->ino	= dir->i_ino;
-		__assign_str(name, dentry->d_name.name);
+		__assign_str(name);
 		__entry->flags	= flags;
 	),
 
@@ -881,7 +913,7 @@ TRACE_EVENT(f2fs_lookup_end,
 	TP_fast_assign(
 		__entry->dev	= dir->i_sb->s_dev;
 		__entry->ino	= dir->i_ino;
-		__assign_str(name, dentry->d_name.name);
+		__assign_str(name);
 		__entry->cino	= ino;
 		__entry->err	= err;
 	),
@@ -913,9 +945,9 @@ TRACE_EVENT(f2fs_rename_start,
 	TP_fast_assign(
 		__entry->dev		= old_dir->i_sb->s_dev;
 		__entry->ino		= old_dir->i_ino;
-		__assign_str(old_name, old_dentry->d_name.name);
+		__assign_str(old_name);
 		__entry->new_pino	= new_dir->i_ino;
-		__assign_str(new_name, new_dentry->d_name.name);
+		__assign_str(new_name);
 		__entry->flags		= flags;
 	),
 
@@ -947,8 +979,8 @@ TRACE_EVENT(f2fs_rename_end,
 	TP_fast_assign(
 		__entry->dev		= old_dentry->d_sb->s_dev;
 		__entry->ino		= old_dentry->d_inode->i_ino;
-		__assign_str(old_name, old_dentry->d_name.name);
-		__assign_str(new_name, new_dentry->d_name.name);
+		__assign_str(old_name);
+		__assign_str(new_name);
 		__entry->flags		= flags;
 		__entry->ret		= ret;
 	),
@@ -1326,6 +1358,7 @@ DECLARE_EVENT_CLASS(f2fs__folio,
 		__field(int, type)
 		__field(int, dir)
 		__field(pgoff_t, index)
+		__field(pgoff_t, nrpages)
 		__field(int, dirty)
 		__field(int, uptodate)
 	),
@@ -1336,16 +1369,18 @@ DECLARE_EVENT_CLASS(f2fs__folio,
 		__entry->type	= type;
 		__entry->dir	= S_ISDIR(folio->mapping->host->i_mode);
 		__entry->index	= folio->index;
+		__entry->nrpages= folio_nr_pages(folio);
 		__entry->dirty	= folio_test_dirty(folio);
 		__entry->uptodate = folio_test_uptodate(folio);
 	),
 
-	TP_printk("dev = (%d,%d), ino = %lu, %s, %s, index = %lu, "
+	TP_printk("dev = (%d,%d), ino = %lu, %s, %s, index = %lu, nr_pages = %lu, "
 		"dirty = %d, uptodate = %d",
 		show_dev_ino(__entry),
 		show_block_type(__entry->type),
 		show_file_type(__entry->dir),
 		(unsigned long)__entry->index,
+		(unsigned long)__entry->nrpages,
 		__entry->dirty,
 		__entry->uptodate)
 );
@@ -1365,6 +1400,13 @@ DEFINE_EVENT(f2fs__folio, f2fs_do_write_data_page,
 );
 
 DEFINE_EVENT(f2fs__folio, f2fs_readpage,
+
+	TP_PROTO(struct folio *folio, int type),
+
+	TP_ARGS(folio, type)
+);
+
+DEFINE_EVENT(f2fs__folio, f2fs_read_folio,
 
 	TP_PROTO(struct folio *folio, int type),
 
@@ -1566,7 +1608,7 @@ TRACE_EVENT(f2fs_write_checkpoint,
 	TP_fast_assign(
 		__entry->dev		= sb->s_dev;
 		__entry->reason		= reason;
-		__assign_str(dest_msg, msg);
+		__assign_str(dest_msg);
 	),
 
 	TP_printk("dev = (%d,%d), checkpoint for %s, state = %s",
@@ -2342,12 +2384,12 @@ DECLARE_EVENT_CLASS(f2fs__rw_start,
 		 * because this screws up the tooling that parses
 		 * the traces.
 		 */
-		__assign_str(pathbuf, pathname);
+		__assign_str(pathbuf);
 		(void)strreplace(__get_str(pathbuf), ' ', '_');
 		__entry->offset = offset;
 		__entry->bytes = bytes;
 		__entry->i_size = i_size_read(inode);
-		__assign_str(cmdline, command);
+		__assign_str(cmdline);
 		(void)strreplace(__get_str(cmdline), ' ', '_');
 		__entry->pid = pid;
 		__entry->ino = inode->i_ino;

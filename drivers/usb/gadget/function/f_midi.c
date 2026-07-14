@@ -30,15 +30,15 @@
 #include <sound/rawmidi.h>
 
 #include <linux/usb/ch9.h>
+#include <linux/usb/func_utils.h>
 #include <linux/usb/gadget.h>
 #include <linux/usb/audio.h>
 #include <linux/usb/midi.h>
 
-#include "u_f.h"
 #include "u_midi.h"
-#include "android_f_midi_info.h"
 
 MODULE_AUTHOR("Ben Williamson");
+MODULE_DESCRIPTION("USB MIDI class function driver");
 MODULE_LICENSE("GPL v2");
 
 static const char f_midi_shortname[] = "f_midi";
@@ -100,7 +100,7 @@ struct f_midi {
 	unsigned int in_last_port;
 	unsigned char free_ref;
 
-	struct gmidi_in_port	in_ports_array[/* in_ports */];
+	struct gmidi_in_port	in_ports_array[] __counted_by(in_ports);
 };
 
 static inline struct f_midi *func_to_midi(struct usb_function *f)
@@ -789,11 +789,7 @@ static const struct snd_rawmidi_ops gmidi_out_ops = {
 
 static inline void f_midi_unregister_card(struct f_midi *midi)
 {
-	struct f_midi_opts *opts;
 	if (midi->card) {
-		opts = container_of(midi->func.fi, struct f_midi_opts,
-				func_inst);
-		android_clear_midi_device_info(&opts->android_midi_info);
 		snd_card_free(midi->card);
 		midi->card = NULL;
 	}
@@ -802,7 +798,6 @@ static inline void f_midi_unregister_card(struct f_midi *midi)
 /* register as a sound "card" */
 static int f_midi_register_card(struct f_midi *midi)
 {
-	struct f_midi_opts *opts;
 	struct snd_card *card;
 	struct snd_rawmidi *rmidi;
 	int err;
@@ -857,13 +852,6 @@ static int f_midi_register_card(struct f_midi *midi)
 	err = snd_card_register(card);
 	if (err < 0) {
 		ERROR(midi, "snd_card_register() failed\n");
-		goto fail;
-	}
-
-	opts = container_of(midi->func.fi, struct f_midi_opts, func_inst);
-	err = android_set_midi_device_info(&opts->android_midi_info, card->number, rmidi->device);
-	if (err < 0) {
-		ERROR(midi, "android_set_midi_device_info() failed\n");
 		goto fail;
 	}
 
@@ -1199,11 +1187,11 @@ F_MIDI_OPT(out_ports, true, MAX_PORTS);
 static ssize_t f_midi_opts_id_show(struct config_item *item, char *page)
 {
 	struct f_midi_opts *opts = to_f_midi_opts(item);
-	int result;
+	ssize_t result;
 
 	mutex_lock(&opts->lock);
 	if (opts->id) {
-		result = strlcpy(page, opts->id, PAGE_SIZE);
+		result = strscpy(page, opts->id, PAGE_SIZE);
 	} else {
 		page[0] = 0;
 		result = 0;
@@ -1270,7 +1258,6 @@ static void f_midi_free_inst(struct usb_function_instance *f)
 	mutex_lock(&opts->lock);
 	if (!--opts->refcnt) {
 		free = true;
-		android_remove_midi_device(&opts->android_midi_info);
 	}
 	mutex_unlock(&opts->lock);
 
@@ -1284,7 +1271,6 @@ static void f_midi_free_inst(struct usb_function_instance *f)
 static struct usb_function_instance *f_midi_alloc_inst(void)
 {
 	struct f_midi_opts *opts;
-	int err;
 
 	opts = kzalloc(sizeof(*opts), GFP_KERNEL);
 	if (!opts)
@@ -1299,12 +1285,6 @@ static struct usb_function_instance *f_midi_alloc_inst(void)
 	opts->in_ports = 1;
 	opts->out_ports = 1;
 	opts->refcnt = 1;
-
-	err = android_create_midi_device(&opts->android_midi_info);
-	if (err < 0) {
-		kfree(opts);
-		return ERR_PTR(err);
-	}
 
 	config_group_init_type_name(&opts->func_inst.group, "",
 				    &midi_func_type);
@@ -1321,7 +1301,6 @@ static void f_midi_free(struct usb_function *f)
 	midi = func_to_midi(f);
 	opts = container_of(f->fi, struct f_midi_opts, func_inst);
 	mutex_lock(&opts->lock);
-	android_clear_midi_device_info(&opts->android_midi_info);
 	if (!--midi->free_ref) {
 		kfree(midi->id);
 		kfifo_free(&midi->in_req_fifo);
@@ -1380,6 +1359,7 @@ static struct usb_function *f_midi_alloc(struct usb_function_instance *fi)
 		status = -ENOMEM;
 		goto setup_fail;
 	}
+	midi->in_ports = opts->in_ports;
 
 	for (i = 0; i < opts->in_ports; i++)
 		midi->in_ports_array[i].cable = i;
@@ -1390,7 +1370,6 @@ static struct usb_function *f_midi_alloc(struct usb_function_instance *fi)
 		status = -ENOMEM;
 		goto midi_free;
 	}
-	midi->in_ports = opts->in_ports;
 	midi->out_ports = opts->out_ports;
 	midi->index = opts->index;
 	midi->buflen = opts->buflen;

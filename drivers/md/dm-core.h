@@ -140,7 +140,8 @@ struct mapped_device {
 
 #ifdef CONFIG_BLK_DEV_ZONED
 	unsigned int nr_zones;
-	unsigned int *zwp_offset;
+	void *zone_revalidate_map;
+	struct task_struct *revalidate_map_task;
 #endif
 
 #ifdef CONFIG_IMA
@@ -207,7 +208,6 @@ struct dm_table {
 
 	bool integrity_supported:1;
 	bool singleton:1;
-	bool integrity_added:1;
 	/* set if all the targets in the table have "flush_bypasses_map" set */
 	bool flush_bypasses_map:1;
 

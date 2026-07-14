@@ -5,6 +5,7 @@
 #include <linux/limits.h>
 #include <linux/net.h>
 #include <linux/cred.h>
+#include <linux/file.h>
 #include <linux/security.h>
 #include <linux/pid.h>
 #include <linux/nsproxy.h>
@@ -28,18 +29,16 @@ struct unix_edge;
 
 struct scm_fp_list {
 	short			count;
+	short			count_unix;
 	short			max;
-	struct user_struct	*user;
-	struct file		*fp[SCM_MAX_FD];
-#ifndef __GENKSYMS__
 #ifdef CONFIG_UNIX
 	bool			inflight;
 	bool			dead;
 	struct list_head	vertices;
-	struct unix_edge        *edges;
+	struct unix_edge	*edges;
 #endif
-	short			count_unix;
-#endif
+	struct user_struct	*user;
+	struct file		*fp[SCM_MAX_FD];
 };
 
 struct scm_cookie {
@@ -219,6 +218,14 @@ static inline void scm_recv_unix(struct socket *sock, struct msghdr *msg,
 		scm_pidfd_recv(msg, scm);
 
 	scm_destroy_cred(scm);
+}
+
+static inline int scm_recv_one_fd(struct file *f, int __user *ufd,
+				  unsigned int flags)
+{
+	if (!ufd)
+		return -EFAULT;
+	return receive_fd(f, ufd, flags);
 }
 
 #endif /* __LINUX_NET_SCM_H */

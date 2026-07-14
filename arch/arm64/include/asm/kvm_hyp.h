@@ -73,7 +73,7 @@ DECLARE_PER_CPU(int, hyp_cpu_number);
 /*
  * Without an __arch_swab32(), we fall back to ___constant_swab32(), but the
  * static inline can allow the compiler to out-of-line this. KVM always wants
- * the macro version as its always inlined.
+ * the macro version as it's always inlined.
  */
 #define __kvm_swab32(x)	___constant_swab32(x)
 
@@ -96,6 +96,8 @@ void __timer_disable_traps(struct kvm_vcpu *vcpu);
 void __sysreg_save_state_nvhe(struct kvm_cpu_context *ctxt);
 void __sysreg_restore_state_nvhe(struct kvm_cpu_context *ctxt);
 #else
+void __vcpu_load_switch_sysregs(struct kvm_vcpu *vcpu);
+void __vcpu_put_switch_sysregs(struct kvm_vcpu *vcpu);
 void sysreg_save_host_state_vhe(struct kvm_cpu_context *ctxt);
 void sysreg_restore_host_state_vhe(struct kvm_cpu_context *ctxt);
 void sysreg_save_guest_state_vhe(struct kvm_cpu_context *ctxt);
@@ -112,17 +114,14 @@ void __debug_restore_host_buffers_nvhe(struct kvm_vcpu *vcpu);
 
 void __fpsimd_save_state(struct user_fpsimd_state *fp_regs);
 void __fpsimd_restore_state(struct user_fpsimd_state *fp_regs);
-void __sve_save_state(void *sve_pffr, u32 *fpsr);
-void __sve_restore_state(void *sve_pffr, u32 *fpsr);
-
-#ifndef __KVM_NVHE_HYPERVISOR__
-void activate_traps_vhe_load(struct kvm_vcpu *vcpu);
-void deactivate_traps_vhe_put(struct kvm_vcpu *vcpu);
-#endif
+void __sve_save_state(void *sve_pffr, u32 *fpsr, int save_ffr);
+void __sve_restore_state(void *sve_pffr, u32 *fpsr, int restore_ffr);
 
 u64 __guest_enter(struct kvm_vcpu *vcpu);
 
+
 bool kvm_host_psci_handler(struct kvm_cpu_context *host_ctxt, u32 func_id);
+bool kvm_host_scmi_handler(struct kvm_cpu_context *host_ctxt);
 
 #ifdef __KVM_NVHE_HYPERVISOR__
 void __noreturn __hyp_do_panic(struct kvm_cpu_context *host_ctxt, u64 spsr,
@@ -139,14 +138,6 @@ void __hyp_enter(void);
 void __hyp_exit(void);
 #endif
 
-#ifdef __KVM_NVHE_HYPERVISOR__
-struct user_fpsimd_state *get_host_fpsimd_state(struct kvm_vcpu *vcpu);
-struct kvm_host_sve_state *get_host_sve_state(struct kvm_vcpu *vcpu);
-#else
-#define get_host_fpsimd_state(vcpu) NULL
-#define get_host_sve_state(vcpu) NULL
-#endif
-
 extern u64 kvm_nvhe_sym(id_aa64pfr0_el1_sys_val);
 extern u64 kvm_nvhe_sym(id_aa64pfr1_el1_sys_val);
 extern u64 kvm_nvhe_sym(id_aa64zfr0_el1_sys_val);
@@ -160,15 +151,8 @@ extern u64 kvm_nvhe_sym(id_aa64smfr0_el1_sys_val);
 
 extern unsigned long kvm_nvhe_sym(__icache_flags);
 extern unsigned int kvm_nvhe_sym(kvm_arm_vmid_bits);
-extern bool kvm_nvhe_sym(smccc_trng_available);
 extern unsigned int kvm_nvhe_sym(kvm_sve_max_vl);
 extern unsigned int kvm_nvhe_sym(kvm_host_sve_max_vl);
-
-struct kvm_nvhe_clock_data {
-	u32 mult;
-	u32 shift;
-	u64 epoch_ns;
-	u64 epoch_cyc;
-};
+extern bool kvm_nvhe_sym(smccc_trng_available);
 
 #endif /* __ARM64_KVM_HYP_H__ */

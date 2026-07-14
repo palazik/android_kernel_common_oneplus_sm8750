@@ -91,6 +91,8 @@ static int ocfs2_update_last_group_and_inode(handle_t *handle,
 	u16 cl_bpc = le16_to_cpu(cl->cl_bpc);
 	u16 cl_cpg = le16_to_cpu(cl->cl_cpg);
 	u16 old_bg_clusters;
+	u16 contig_bits;
+	__le16 old_bg_contig_free_bits;
 
 	trace_ocfs2_update_last_group_and_inode(new_clusters,
 						first_new_cluster);
@@ -121,6 +123,11 @@ static int ocfs2_update_last_group_and_inode(handle_t *handle,
 						     cl_cpg, old_bg_clusters, 1);
 		le16_add_cpu(&group->bg_free_bits_count, -1 * backups);
 	}
+
+	contig_bits = ocfs2_find_max_contig_free_bits(group->bg_bitmap,
+					le16_to_cpu(group->bg_bits), 0);
+	old_bg_contig_free_bits = group->bg_contig_free_bits;
+	group->bg_contig_free_bits = cpu_to_le16(contig_bits);
 
 	ocfs2_journal_dirty(handle, group_bh);
 
@@ -160,6 +167,7 @@ out_rollback:
 		le16_add_cpu(&group->bg_free_bits_count, backups);
 		le16_add_cpu(&group->bg_bits, -1 * num_bits);
 		le16_add_cpu(&group->bg_free_bits_count, -1 * num_bits);
+		group->bg_contig_free_bits = old_bg_contig_free_bits;
 	}
 out:
 	if (ret)
@@ -500,13 +508,13 @@ int ocfs2_group_add(struct inode *inode, struct ocfs2_new_group_input *input)
 		goto out_unlock;
 	}
 
+	ocfs2_set_new_buffer_uptodate(INODE_CACHE(inode), group_bh);
+
 	ret = ocfs2_verify_group_and_input(main_bm_inode, fe, input, group_bh);
 	if (ret) {
 		mlog_errno(ret);
 		goto out_free_group_bh;
 	}
-
-	ocfs2_set_new_buffer_uptodate(INODE_CACHE(main_bm_inode), group_bh);
 
 	trace_ocfs2_group_add((unsigned long long)input->group,
 			       input->chain, input->clusters, input->frees);
@@ -515,7 +523,7 @@ int ocfs2_group_add(struct inode *inode, struct ocfs2_new_group_input *input)
 	if (IS_ERR(handle)) {
 		mlog_errno(PTR_ERR(handle));
 		ret = -EINVAL;
-		goto out_remove_cache;
+		goto out_free_group_bh;
 	}
 
 	cl_bpc = le16_to_cpu(fe->id2.i_chain.cl_bpc);
@@ -569,11 +577,9 @@ int ocfs2_group_add(struct inode *inode, struct ocfs2_new_group_input *input)
 out_commit:
 	ocfs2_commit_trans(osb, handle);
 
-out_remove_cache:
-	if (ret < 0)
-		ocfs2_remove_from_cache(INODE_CACHE(main_bm_inode), group_bh);
-
 out_free_group_bh:
+	if (ret < 0)
+		ocfs2_remove_from_cache(INODE_CACHE(inode), group_bh);
 	brelse(group_bh);
 
 out_unlock:

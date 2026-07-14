@@ -55,12 +55,11 @@
 	NFSERR_NODEV = 19,		/* v2 v3 v4 */
 	NFSERR_NOTDIR = 20,		/* v2 v3 v4 */
 	NFSERR_ISDIR = 21,		/* v2 v3 v4 */
-	NFSERR_INVAL = 22,		/* v2 v3 v4 */
+	NFSERR_INVAL = 22,		/*    v3 v4 */
 	NFSERR_FBIG = 27,		/* v2 v3 v4 */
 	NFSERR_NOSPC = 28,		/* v2 v3 v4 */
 	NFSERR_ROFS = 30,		/* v2 v3 v4 */
 	NFSERR_MLINK = 31,		/*    v3 v4 */
-	NFSERR_OPNOTSUPP = 45,		/* v2 v3 */
 	NFSERR_NAMETOOLONG = 63,	/* v2 v3 v4 */
 	NFSERR_NOTEMPTY = 66,		/* v2 v3 v4 */
 	NFSERR_DQUOT = 69,		/* v2 v3 v4 */

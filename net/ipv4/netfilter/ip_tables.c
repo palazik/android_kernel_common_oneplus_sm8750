@@ -981,7 +981,7 @@ static int get_info(struct net *net, void __user *user, const int *len)
 		       sizeof(info.underflow));
 		info.num_entries = private->number;
 		info.size = private->size;
-		strcpy(info.name, name);
+		strscpy(info.name, name);
 
 		if (copy_to_user(user, &info, *len) != 0)
 			ret = -EFAULT;
@@ -1767,7 +1767,7 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
 		goto out_free;
 	}
 
-	ops = kmemdup(template_ops, sizeof(*ops) * num_ops, GFP_KERNEL);
+	ops = kmemdup_array(template_ops, num_ops, sizeof(*ops), GFP_KERNEL);
 	if (!ops) {
 		ret = -ENOMEM;
 		goto out_free;
@@ -1805,28 +1805,17 @@ void ipt_unregister_table_exit(struct net *net, const char *name)
 		__ipt_unregister_table(net, table);
 }
 
-#define DEFINE_IPT_STANDARD_TARGET(compat)	\
-	{					\
-		.name             = XT_STANDARD_TARGET, \
-		.targetsize       = sizeof(int),	\
-		.family           = NFPROTO_IPV4,	\
-		.has_compat_metadata = compat		\
-	}
-
-#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
-static struct compat_xt_target_ext ipt_std_tg_ext __read_mostly = {
-	.compatsize       = sizeof(compat_int_t),
-	.compat_from_user = compat_standard_from_user,
-	.compat_to_user   = compat_standard_to_user,
-	.target = DEFINE_IPT_STANDARD_TARGET(true),
-};
-
-#define ipt_std_tg (ipt_std_tg_ext.target)
-#else
-static struct xt_target ipt_std_tg __read_mostly = DEFINE_IPT_STANDARD_TARGET(false);
-#endif
-
 static struct xt_target ipt_builtin_tg[] __read_mostly = {
+	{
+		.name             = XT_STANDARD_TARGET,
+		.targetsize       = sizeof(int),
+		.family           = NFPROTO_IPV4,
+#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
+		.compatsize       = sizeof(compat_int_t),
+		.compat_from_user = compat_standard_from_user,
+		.compat_to_user   = compat_standard_to_user,
+#endif
+	},
 	{
 		.name             = XT_ERROR_TARGET,
 		.target           = ipt_error,
@@ -1870,25 +1859,19 @@ static int __init ip_tables_init(void)
 		goto err1;
 
 	/* No one else will be downing sem now, so we won't sleep */
-	ret = xt_register_target(&ipt_std_tg);
-	if (ret < 0)
-		goto err2;
-
 	ret = xt_register_targets(ipt_builtin_tg, ARRAY_SIZE(ipt_builtin_tg));
 	if (ret < 0)
-		goto err4;
+		goto err2;
 
 	/* Register setsockopt */
 	ret = nf_register_sockopt(&ipt_sockopts);
 	if (ret < 0)
-		goto err8;
+		goto err4;
 
 	return 0;
 
-err8:
-	xt_unregister_targets(ipt_builtin_tg, ARRAY_SIZE(ipt_builtin_tg));
 err4:
-	xt_unregister_target(&ipt_std_tg);
+	xt_unregister_targets(ipt_builtin_tg, ARRAY_SIZE(ipt_builtin_tg));
 err2:
 	unregister_pernet_subsys(&ip_tables_net_ops);
 err1:
@@ -1900,7 +1883,6 @@ static void __exit ip_tables_fini(void)
 	nf_unregister_sockopt(&ipt_sockopts);
 
 	xt_unregister_targets(ipt_builtin_tg, ARRAY_SIZE(ipt_builtin_tg));
-	xt_unregister_target(&ipt_std_tg);
 	unregister_pernet_subsys(&ip_tables_net_ops);
 }
 

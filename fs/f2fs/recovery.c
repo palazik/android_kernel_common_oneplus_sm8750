@@ -5,7 +5,7 @@
  * Copyright (c) 2012 Samsung Electronics Co., Ltd.
  *             http://www.samsung.com/
  */
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/fs.h>
 #include <linux/f2fs_fs.h>
 #include <linux/sched/mm.h>
@@ -45,10 +45,6 @@
  */
 
 static struct kmem_cache *fsync_entry_slab;
-
-#if IS_ENABLED(CONFIG_UNICODE)
-extern struct kmem_cache *f2fs_cf_name_slab;
-#endif
 
 bool f2fs_space_for_roll_forward(struct f2fs_sb_info *sbi)
 {
@@ -153,11 +149,8 @@ static int init_recovered_filename(const struct inode *dir,
 		if (err)
 			return err;
 		f2fs_hash_filename(dir, fname);
-#if IS_ENABLED(CONFIG_UNICODE)
 		/* Case-sensitive match is fine for recovery */
-		kmem_cache_free(f2fs_cf_name_slab, fname->cf_name.name);
-		fname->cf_name.name = NULL;
-#endif
+		f2fs_free_casefolded_name(fname);
 	} else {
 		f2fs_hash_filename(dir, fname);
 	}
@@ -321,12 +314,12 @@ static int recover_inode(struct inode *inode, struct page *page)
 	}
 
 	f2fs_i_size_write(inode, le64_to_cpu(raw->i_size));
-	inode->i_atime.tv_sec = le64_to_cpu(raw->i_atime);
+	inode_set_atime(inode, le64_to_cpu(raw->i_atime),
+			le32_to_cpu(raw->i_atime_nsec));
 	inode_set_ctime(inode, le64_to_cpu(raw->i_ctime),
 			le32_to_cpu(raw->i_ctime_nsec));
-	inode->i_mtime.tv_sec = le64_to_cpu(raw->i_mtime);
-	inode->i_atime.tv_nsec = le32_to_cpu(raw->i_atime_nsec);
-	inode->i_mtime.tv_nsec = le32_to_cpu(raw->i_mtime_nsec);
+	inode_set_mtime(inode, le64_to_cpu(raw->i_mtime),
+			le32_to_cpu(raw->i_mtime_nsec));
 
 	fi->i_advise = raw->i_advise;
 	fi->i_flags = le32_to_cpu(raw->i_flags);

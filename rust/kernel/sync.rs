@@ -11,11 +11,16 @@ mod arc;
 mod condvar;
 pub mod lock;
 mod locked_by;
+pub mod poll;
+mod set_once;
 
 pub use arc::{Arc, ArcBorrow, UniqueArc};
-pub use condvar::CondVar;
-pub use lock::{mutex::Mutex, spinlock::SpinLock};
+pub use condvar::{new_condvar, CondVar, CondVarTimeoutResult};
+pub use lock::global::{global_lock, GlobalGuard, GlobalLock, GlobalLockBackend, GlobalLockedBy};
+pub use lock::mutex::{new_mutex, Mutex};
+pub use lock::spinlock::{new_spinlock, SpinLock};
 pub use locked_by::LockedBy;
+pub use set_once::SetOnce;
 
 /// Represents a lockdep class. It's a wrapper around C's `lock_class_key`.
 #[repr(transparent)]
@@ -26,7 +31,8 @@ pub struct LockClassKey(Opaque<bindings::lock_class_key>);
 unsafe impl Sync for LockClassKey {}
 
 impl LockClassKey {
-    pub(crate) fn as_ptr(&self) -> *mut bindings::lock_class_key {
+    /// Returns a raw pointer to the lock class key.
+    pub fn as_ptr(&self) -> *mut bindings::lock_class_key {
         self.0.get()
     }
 }

@@ -16,7 +16,6 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_fdt.h>
-#include <linux/of_reserved_mem.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
 #include <linux/errno.h>
@@ -34,7 +33,7 @@
 
 /*
  * __dtb_empty_root_begin[] and __dtb_empty_root_end[] magically created by
- * cmd_dt_S_dtb in scripts/Makefile.lib
+ * cmd_wrap_S_dtb in scripts/Makefile.dtbs
  */
 extern uint8_t __dtb_empty_root_begin[];
 extern uint8_t __dtb_empty_root_end[];
@@ -52,28 +51,7 @@ void __init of_fdt_limit_memory(int limit)
 	int memory;
 	int len;
 	const void *val;
-	int nr_address_cells = OF_ROOT_NODE_ADDR_CELLS_DEFAULT;
-	int nr_size_cells = OF_ROOT_NODE_SIZE_CELLS_DEFAULT;
-	const __be32 *addr_prop;
-	const __be32 *size_prop;
-	int root_offset;
-	int cell_size;
-
-	root_offset = fdt_path_offset(initial_boot_params, "/");
-	if (root_offset < 0)
-		return;
-
-	addr_prop = fdt_getprop(initial_boot_params, root_offset,
-				"#address-cells", NULL);
-	if (addr_prop)
-		nr_address_cells = fdt32_to_cpu(*addr_prop);
-
-	size_prop = fdt_getprop(initial_boot_params, root_offset,
-				"#size-cells", NULL);
-	if (size_prop)
-		nr_size_cells = fdt32_to_cpu(*size_prop);
-
-	cell_size = sizeof(uint32_t)*(nr_address_cells + nr_size_cells);
+	int cell_size = sizeof(uint32_t)*(dt_root_addr_cells + dt_root_size_cells);
 
 	memory = fdt_path_offset(initial_boot_params, "/memory");
 	if (memory > 0) {
@@ -87,7 +65,7 @@ void __init of_fdt_limit_memory(int limit)
 	}
 }
 
-static bool of_fdt_device_is_available(const void *blob, unsigned long node)
+bool of_fdt_device_is_available(const void *blob, unsigned long node)
 {
 	const char *status = fdt_getprop(blob, node, "status", NULL);
 
@@ -484,126 +462,6 @@ phys_addr_t initial_boot_params_pa __ro_after_init;
 
 static u32 of_fdt_crc32;
 
-static int __init early_init_dt_reserve_memory(phys_addr_t base,
-					       phys_addr_t size, bool nomap)
-{
-	if (nomap) {
-		/*
-		 * If the memory is already reserved (by another region), we
-		 * should not allow it to be marked nomap, but don't worry
-		 * if the region isn't memory as it won't be mapped.
-		 */
-		if (memblock_overlaps_region(&memblock.memory, base, size) &&
-		    memblock_is_region_reserved(base, size))
-			return -EBUSY;
-
-		return memblock_mark_nomap(base, size);
-	}
-	return memblock_reserve(base, size);
-}
-
-/*
- * __reserved_mem_reserve_reg() - reserve all memory described in 'reg' property
- */
-static int __init __reserved_mem_reserve_reg(unsigned long node,
-					     const char *uname)
-{
-	int t_len = (dt_root_addr_cells + dt_root_size_cells) * sizeof(__be32);
-	phys_addr_t base, size;
-	int len;
-	const __be32 *prop;
-	int first = 1;
-	bool nomap;
-
-	prop = of_get_flat_dt_prop(node, "reg", &len);
-	if (!prop)
-		return -ENOENT;
-
-	if (len && len % t_len != 0) {
-		pr_err("Reserved memory: invalid reg property in '%s', skipping node.\n",
-		       uname);
-		return -EINVAL;
-	}
-
-	nomap = of_get_flat_dt_prop(node, "no-map", NULL) != NULL;
-
-	while (len >= t_len) {
-		base = dt_mem_next_cell(dt_root_addr_cells, &prop);
-		size = dt_mem_next_cell(dt_root_size_cells, &prop);
-
-		if (size &&
-		    early_init_dt_reserve_memory(base, size, nomap) == 0)
-			pr_debug("Reserved memory: reserved region for node '%s': base %pa, size %lu MiB\n",
-				uname, &base, (unsigned long)(size / SZ_1M));
-		else
-			pr_err("Reserved memory: failed to reserve memory for node '%s': base %pa, size %lu MiB\n",
-			       uname, &base, (unsigned long)(size / SZ_1M));
-
-		len -= t_len;
-		if (first) {
-			fdt_reserved_mem_save_node(node, uname, base, size);
-			first = 0;
-		}
-	}
-	return 0;
-}
-
-/*
- * __reserved_mem_check_root() - check if #size-cells, #address-cells provided
- * in /reserved-memory matches the values supported by the current implementation,
- * also check if ranges property has been provided
- */
-static int __init __reserved_mem_check_root(unsigned long node)
-{
-	const __be32 *prop;
-
-	prop = of_get_flat_dt_prop(node, "#size-cells", NULL);
-	if (!prop || be32_to_cpup(prop) != dt_root_size_cells)
-		return -EINVAL;
-
-	prop = of_get_flat_dt_prop(node, "#address-cells", NULL);
-	if (!prop || be32_to_cpup(prop) != dt_root_addr_cells)
-		return -EINVAL;
-
-	prop = of_get_flat_dt_prop(node, "ranges", NULL);
-	if (!prop)
-		return -EINVAL;
-	return 0;
-}
-
-/*
- * fdt_scan_reserved_mem() - scan a single FDT node for reserved memory
- */
-static int __init fdt_scan_reserved_mem(void)
-{
-	int node, child;
-	const void *fdt = initial_boot_params;
-
-	node = fdt_path_offset(fdt, "/reserved-memory");
-	if (node < 0)
-		return -ENODEV;
-
-	if (__reserved_mem_check_root(node) != 0) {
-		pr_err("Reserved memory: unsupported node format, ignoring\n");
-		return -EINVAL;
-	}
-
-	fdt_for_each_subnode(child, fdt, node) {
-		const char *uname;
-		int err;
-
-		if (!of_fdt_device_is_available(fdt, child))
-			continue;
-
-		uname = fdt_get_name(fdt, child, NULL);
-
-		err = __reserved_mem_reserve_reg(child, uname);
-		if (err == -ENOENT && of_get_flat_dt_prop(child, "size", NULL))
-			fdt_reserved_mem_save_node(child, uname, 0, 0);
-	}
-	return 0;
-}
-
 /*
  * fdt_reserve_elfcorehdr() - reserves memory for elf core header
  *
@@ -648,8 +506,8 @@ void __init early_init_fdt_scan_reserved_mem(void)
 	memblock_memsize_detect_hole();
 	memblock_memsize_disable_tracking();
 
-	fdt_scan_reserved_mem();
 	fdt_reserve_elfcorehdr();
+	fdt_scan_reserved_mem();
 
 	/* Process header /memreserve/ fields */
 	for (n = 0; ; n++) {
@@ -659,9 +517,6 @@ void __init early_init_fdt_scan_reserved_mem(void)
 		memblock_reserve(base, size);
 		memblock_memsize_record("memreserve", base, size, false, false);
 	}
-
-	fdt_init_reserved_mem();
-
 	memblock_memsize_enable_tracking();
 }
 
@@ -1322,6 +1177,10 @@ bool __init early_init_dt_verify(void *dt_virt, phys_addr_t dt_phys)
 	initial_boot_params_pa = dt_phys;
 	of_fdt_crc32 = crc32_be(~0, initial_boot_params,
 				fdt_totalsize(initial_boot_params));
+
+	/* Initialize {size,address}-cells info */
+	early_init_dt_scan_root();
+
 	return true;
 }
 
@@ -1329,9 +1188,6 @@ bool __init early_init_dt_verify(void *dt_virt, phys_addr_t dt_phys)
 void __init early_init_dt_scan_nodes(void)
 {
 	int rc;
-
-	/* Initialize {size,address}-cells info */
-	early_init_dt_scan_root();
 
 	/* Retrieve various information from the /chosen node */
 	rc = early_init_dt_scan_chosen(boot_command_line);
@@ -1383,6 +1239,9 @@ static void *__init copy_device_tree(void *fdt)
 void __init unflatten_device_tree(void)
 {
 	void *fdt = initial_boot_params;
+
+	/* Save the statically-placed regions in the reserved_mem array */
+	fdt_scan_reserved_mem_reg_nodes();
 
 	/* Populate an empty root node when bootloader doesn't provide one */
 	if (!fdt) {

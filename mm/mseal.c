@@ -31,6 +31,7 @@ static bool is_madv_discard(int behavior)
 	case MADV_REMOVE:
 	case MADV_DONTFORK:
 	case MADV_WIPEONFORK:
+	case MADV_GUARD_INSTALL:
 		return true;
 	}
 
@@ -55,27 +56,6 @@ static bool is_ro_anon(struct vm_area_struct *vma)
 }
 
 /*
- * Check if the vmas of a memory range are allowed to be modified.
- * the memory ranger can have a gap (unallocated memory).
- * return true, if it is allowed.
- */
-bool can_modify_mm(struct mm_struct *mm, unsigned long start, unsigned long end)
-{
-	struct vm_area_struct *vma;
-
-	VMA_ITERATOR(vmi, mm, start);
-
-	/* going through each vma to check. */
-	for_each_vma_range(vmi, vma, end) {
-		if (unlikely(!can_modify_vma(vma)))
-			return false;
-	}
-
-	/* Allow by default. */
-	return true;
-}
-
-/*
  * Check if a vma is allowed to be modified by madvise.
  */
 bool can_modify_vma_madv(struct vm_area_struct *vma, int behavior)
@@ -90,50 +70,27 @@ bool can_modify_vma_madv(struct vm_area_struct *vma, int behavior)
 	return true;
 }
 
-/*
- * mseal_fixup is almost same as mlock_fixup
- */
 static int mseal_fixup(struct vma_iterator *vmi, struct vm_area_struct *vma,
 		struct vm_area_struct **prev, unsigned long start,
 		unsigned long end, vm_flags_t newflags)
 {
-	struct mm_struct *mm = vma->vm_mm;
-	pgoff_t pgoff;
 	int ret = 0;
 	vm_flags_t oldflags = vma->vm_flags;
 
 	if (newflags == oldflags)
 		goto out;
 
-	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
-	*prev = vma_merge(vmi, mm, *prev, start, end, newflags,
-			vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
-			vma->vm_userfaultfd_ctx, anon_vma_name(vma));
-	if (*prev) {
-		vma = *prev;
-		goto success;
+	vma = vma_modify_flags(vmi, *prev, vma, start, end, newflags);
+	if (IS_ERR(vma)) {
+		ret = PTR_ERR(vma);
+		goto out;
 	}
 
-	if (start != vma->vm_start) {
-		ret = split_vma(vmi, vma, start, 1);
-		if (ret)
-			goto out;
-	}
-
-	if (end != vma->vm_end) {
-		ret = split_vma(vmi, vma, end, 0);
-		if (ret)
-			goto out;
-	}
-
-success:
 	set_vma_sealed(vma);
-
 out:
 	*prev = vma;
 	return ret;
 }
-
 
 /*
  * Check for do_mseal:
@@ -254,7 +211,7 @@ static int apply_mm_seal(unsigned long start, unsigned long end)
  *
  *  unseal() is not supported.
  */
-static int do_mseal(unsigned long start, size_t len_in, unsigned long flags)
+int do_mseal(unsigned long start, size_t len_in, unsigned long flags)
 {
 	size_t len;
 	int ret = 0;

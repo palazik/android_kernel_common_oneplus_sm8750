@@ -364,7 +364,7 @@ IOMMUFD IOAS/HWPT to enable userspace DMA::
 				    MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	map.iova = 0; /* 1MB starting at 0x0 from device view */
 	map.length = 1024 * 1024;
-	map.ioas_id = alloc_data.out_ioas_id;;
+	map.ioas_id = alloc_data.out_ioas_id;
 
 	ioctl(iommufd, IOMMU_IOAS_MAP, &map);
 
@@ -668,6 +668,29 @@ This implementation has some specifics:
    VFIO_IOMMU_SPAPR_TCE_REMOVE receives the bus start address of the window
    and removes it.
 
+-------------------------------------------------------------------------------
+
+pvIOMMU implementation note
+-------------------------------
+1) pKVM provides mutual distrust between host kernel and protected VMs(pVM)
+   One solution to provide DMA isolation in this model, is to move the IOMMU
+   control to the hypervisor and para-virtualize the IOMMU interface for
+   the host and guest kernels. (none of them have direct access to IOMMU
+   programming interface).
+
+2) In the case of device assignment, the host can't map memory for the
+   guest kernel in the IOMMU (as it is not trusted).
+
+3) To statify these requirements a new VFIO IOMMU container type is added
+   VFIO_PKVM_IOMMU which attaches the device to a blocking domain, and
+   denies any MAP_DMA/UNMAP_DMA IOCTLs.
+
+4) The guest IOMMU is configured by the host (virtual toplogy) but the mappings
+   are controlled by the guest, you can find more about this in:
+   - Documentation/virt/kvm/devices/vfio.rst
+   - Documentation/virt/kvm/arm/pviommu.rst
+
+So, a new container type is added: `VFIO_PKVM_IOMMU`
 -------------------------------------------------------------------------------
 
 .. [1] VFIO was originally an acronym for "Virtual Function I/O" in its

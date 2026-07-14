@@ -10,6 +10,8 @@
 #include <linux/moduleloader.h>
 #include <linux/sort.h>
 
+#include <asm/kvm_pkvm_module.h>
+
 static struct plt_entry __get_adrp_add_pair(u64 dst, u64 pc,
 					    enum aarch64_insn_register reg)
 {
@@ -200,8 +202,7 @@ static unsigned int count_plts(Elf64_Sym *syms, Elf64_Rela *rela, int num,
 			break;
 		case R_AARCH64_ADR_PREL_PG_HI21_NC:
 		case R_AARCH64_ADR_PREL_PG_HI21:
-			if (!IS_ENABLED(CONFIG_ARM64_ERRATUM_843419) ||
-			    !cpus_have_const_cap(ARM64_WORKAROUND_843419))
+			if (!cpus_have_final_cap(ARM64_WORKAROUND_843419))
 				break;
 
 			/*
@@ -236,13 +237,13 @@ static unsigned int count_plts(Elf64_Sym *syms, Elf64_Rela *rela, int num,
 		}
 	}
 
-	if (IS_ENABLED(CONFIG_ARM64_ERRATUM_843419) &&
-	    cpus_have_const_cap(ARM64_WORKAROUND_843419))
+	if (cpus_have_final_cap(ARM64_WORKAROUND_843419)) {
 		/*
 		 * Add some slack so we can skip PLT slots that may trigger
 		 * the erratum due to the placement of the ADRP instruction.
 		 */
 		ret += DIV_ROUND_UP(ret, (SZ_4K / sizeof(struct plt_entry)));
+	}
 
 	return ret;
 }
@@ -363,6 +364,10 @@ int module_frob_arch_sections(Elf_Ehdr *ehdr, Elf_Shdr *sechdrs,
 		tramp->sh_addralign = __alignof__(struct plt_entry);
 		tramp->sh_size = NR_FTRACE_PLTS * sizeof(struct plt_entry);
 	}
+
+#if IS_ENABLED(CONFIG_KVM)
+	pkvm_el2_mod_frob_sections(ehdr, sechdrs, secstrings);
+#endif
 
 	return 0;
 }

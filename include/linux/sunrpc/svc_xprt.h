@@ -54,7 +54,7 @@ struct svc_xprt {
 	const struct svc_xprt_ops *xpt_ops;
 	struct kref		xpt_ref;
 	struct list_head	xpt_list;
-	struct list_head	xpt_ready;
+	struct lwq_node		xpt_ready;
 	unsigned long		xpt_flags;
 
 	struct svc_serv		*xpt_server;	/* service for transport */
@@ -99,7 +99,26 @@ enum {
 	XPT_HANDSHAKE,		/* xprt requests a handshake */
 	XPT_TLS_SESSION,	/* transport-layer security established */
 	XPT_PEER_AUTH,		/* peer has been authenticated */
+	XPT_PEER_VALID,		/* peer has presented a filehandle that
+				 * it has access to.  It is NOT counted
+				 * in ->sv_tmpcnt.
+				 */
+	XPT_RPCB_UNREG,		/* transport that needs unregistering
+				 * with rpcbind (TCP, UDP) on destroy
+				 */
 };
+
+static inline void svc_xprt_set_valid(struct svc_xprt *xpt)
+{
+	if (test_bit(XPT_TEMP, &xpt->xpt_flags) &&
+	    !test_and_set_bit(XPT_PEER_VALID, &xpt->xpt_flags)) {
+		struct svc_serv *serv = xpt->xpt_server;
+
+		spin_lock(&serv->sv_lock);
+		serv->sv_tmpcnt -= 1;
+		spin_unlock(&serv->sv_lock);
+	}
+}
 
 static inline void unregister_xpt_user(struct svc_xprt *xpt, struct svc_xpt_user *u)
 {
@@ -135,6 +154,9 @@ int	svc_reg_xprt_class(struct svc_xprt_class *);
 void	svc_unreg_xprt_class(struct svc_xprt_class *);
 void	svc_xprt_init(struct net *, struct svc_xprt_class *, struct svc_xprt *,
 		      struct svc_serv *);
+int	svc_xprt_create_from_sa(struct svc_serv *serv, const char *xprt_name,
+				struct net *net, struct sockaddr *sap,
+				int flags, const struct cred *cred);
 int	svc_xprt_create(struct svc_serv *serv, const char *xprt_name,
 			struct net *net, const int family,
 			const unsigned short port, int flags,
@@ -147,6 +169,8 @@ void	svc_xprt_copy_addrs(struct svc_rqst *rqstp, struct svc_xprt *xprt);
 void	svc_xprt_close(struct svc_xprt *xprt);
 int	svc_port_is_privileged(struct sockaddr *sin);
 int	svc_print_xprts(char *buf, int maxlen);
+struct svc_xprt *svc_find_listener(struct svc_serv *serv, const char *xcl_name,
+				   struct net *net, const struct sockaddr *sa);
 struct	svc_xprt *svc_find_xprt(struct svc_serv *serv, const char *xcl_name,
 			struct net *net, const sa_family_t af,
 			const unsigned short port);

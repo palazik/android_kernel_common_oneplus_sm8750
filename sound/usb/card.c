@@ -156,6 +156,38 @@ int snd_usb_unregister_platform_ops(void)
 EXPORT_SYMBOL_GPL(snd_usb_unregister_platform_ops);
 
 /*
+ * Checks to see if requested audio profile, i.e sample rate, # of
+ * channels, etc... is supported by the substream associated to the
+ * USB audio device.
+ */
+struct snd_usb_stream *
+snd_usb_find_suppported_substream(int card_idx, struct snd_pcm_hw_params *params,
+				  int direction)
+{
+	struct snd_usb_audio *chip;
+	struct snd_usb_substream *subs;
+	struct snd_usb_stream *as;
+
+	/*
+	 * Register mutex is held when populating and clearing usb_chip
+	 * array.
+	 */
+	guard(mutex)(&register_mutex);
+	chip = usb_chip[card_idx];
+
+	if (chip && enable[card_idx]) {
+		list_for_each_entry(as, &chip->pcm_list, list) {
+			subs = &as->substream[direction];
+			if (snd_usb_find_substream_format(subs, params))
+				return as;
+		}
+	}
+
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(snd_usb_find_suppported_substream);
+
+/*
  * disconnect streams
  * called from usb_audio_disconnect()
  */
@@ -241,6 +273,8 @@ static int snd_usb_create_stream(struct snd_usb_audio *chip, int ctrlif, int int
 		dev_err(&dev->dev, "low speed audio streaming not supported\n");
 		return -EINVAL;
 	}
+
+	snd_usb_add_ctrl_interface_link(chip, interface, ctrlif);
 
 	if (! snd_usb_parse_audio_interface(chip, interface)) {
 		usb_set_interface(dev, interface, 0); /* reset the current interface */
@@ -466,6 +500,10 @@ static const struct usb_audio_device_name usb_audio_names[] = {
 		     "Realtek", "ALC1220-VB-DT", "Realtek-ALC1220-VB-Desktop"),
 
 	DEVICE_NAME(0x0fd9, 0x0008, "Hauppauge", "HVR-950Q"),
+
+	/* Dock/Stand for HP Engage Go */
+	PROFILE_NAME(0x103c, 0x830a, "HP", "HP Engage Go Dock",
+		     "HP-Engage-Go-Dock"),
 
 	/* Stanton/N2IT Final Scratch v1 device ('Scratchamp') */
 	DEVICE_NAME(0x103d, 0x0100, "Stanton", "ScratchAmp"),
@@ -1149,10 +1187,8 @@ static int usb_audio_suspend(struct usb_interface *intf, pm_message_t message)
 		chip->system_suspend = chip->num_suspended_intf;
 	}
 
-	mutex_lock(&register_mutex);
 	if (platform_ops && platform_ops->suspend_cb)
 		platform_ops->suspend_cb(intf, message);
-	mutex_unlock(&register_mutex);
 
 	return 0;
 }
@@ -1194,10 +1230,8 @@ static int usb_audio_resume(struct usb_interface *intf)
 
 	snd_usb_midi_v2_resume_all(chip);
 
-	mutex_lock(&register_mutex);
 	if (platform_ops && platform_ops->resume_cb)
 		platform_ops->resume_cb(intf);
-	mutex_unlock(&register_mutex);
 
  out:
 	if (chip->num_suspended_intf == chip->system_suspend) {

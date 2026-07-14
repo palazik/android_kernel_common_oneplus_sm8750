@@ -74,30 +74,6 @@
  * intervals and if the stand deviation of these 8 intervals is below a
  * threshold value, we use the average of these intervals as prediction.
  *
- * Limiting Performance Impact
- * ---------------------------
- * C states, especially those with large exit latencies, can have a real
- * noticeable impact on workloads, which is not acceptable for most sysadmins,
- * and in addition, less performance has a power price of its own.
- *
- * As a general rule of thumb, menu assumes that the following heuristic
- * holds:
- *     The busier the system, the less impact of C states is acceptable
- *
- * This rule-of-thumb is implemented using a performance-multiplier:
- * If the exit latency times the performance multiplier is longer than
- * the predicted duration, the C state is not considered a candidate
- * for selection due to a too high performance impact. So the higher
- * this multiplier is, the longer we need to be idle to pick a deep C
- * state, and thus the less likely a busy CPU will hit such a deep
- * C state.
- *
- * Currently there is only one value determining the factor:
- * 10 points are added for each process that is waiting for IO on this CPU.
- * (This value was experimentally determined.)
- * Utilization is no longer a factor as it was shown that it never contributed
- * significantly to the performance multiplier in the first place.
- *
  */
 
 struct menu_device {

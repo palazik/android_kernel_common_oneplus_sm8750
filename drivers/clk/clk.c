@@ -6,21 +6,24 @@
  * Standard functionality for the common clock API.  See Documentation/driver-api/clk.rst
  */
 
+#include <linux/clk/clk-conf.h>
+#include <linux/clkdev.h>
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
-#include <linux/clk/clk-conf.h>
+#include <linux/device.h>
+#include <linux/err.h>
+#include <linux/hashtable.h>
+#include <linux/init.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/spinlock.h>
-#include <linux/err.h>
-#include <linux/list.h>
-#include <linux/slab.h>
 #include <linux/of.h>
-#include <linux/device.h>
-#include <linux/init.h>
 #include <linux/pm_runtime.h>
 #include <linux/sched.h>
-#include <linux/clkdev.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/stringhash.h>
 
 #include "clk.h"
 
@@ -32,6 +35,9 @@ static struct task_struct *enable_owner;
 
 static int prepare_refcnt;
 static int enable_refcnt;
+
+#define CLK_HASH_BITS 9
+static DEFINE_HASHTABLE(clk_hashtable, CLK_HASH_BITS);
 
 static HLIST_HEAD(clk_root_list);
 static HLIST_HEAD(clk_orphan_list);
@@ -89,6 +95,7 @@ struct clk_core {
 	struct clk_duty		duty;
 	struct hlist_head	children;
 	struct hlist_node	child_node;
+	struct hlist_node	hashtable_node;
 	struct hlist_head	clks;
 	unsigned int		notifier_count;
 #ifdef CONFIG_DEBUG_FS
@@ -385,45 +392,20 @@ struct clk_hw *clk_hw_get_parent(const struct clk_hw *hw)
 }
 EXPORT_SYMBOL_GPL(clk_hw_get_parent);
 
-static struct clk_core *__clk_lookup_subtree(const char *name,
-					     struct clk_core *core)
-{
-	struct clk_core *child;
-	struct clk_core *ret;
-
-	if (!strcmp(core->name, name))
-		return core;
-
-	hlist_for_each_entry(child, &core->children, child_node) {
-		ret = __clk_lookup_subtree(name, child);
-		if (ret)
-			return ret;
-	}
-
-	return NULL;
-}
-
 static struct clk_core *clk_core_lookup(const char *name)
 {
-	struct clk_core *root_clk;
-	struct clk_core *ret;
+	struct clk_core *core;
+	u32 hash;
 
 	if (!name)
 		return NULL;
 
-	/* search the 'proper' clk tree first */
-	hlist_for_each_entry(root_clk, &clk_root_list, child_node) {
-		ret = __clk_lookup_subtree(name, root_clk);
-		if (ret)
-			return ret;
-	}
+	hash = full_name_hash(NULL, name, strlen(name));
 
-	/* if not found, then search the orphan tree */
-	hlist_for_each_entry(root_clk, &clk_orphan_list, child_node) {
-		ret = __clk_lookup_subtree(name, root_clk);
-		if (ret)
-			return ret;
-	}
+	/* search the hashtable */
+	hash_for_each_possible(clk_hashtable, core, hashtable_node, hash)
+		if (!strcmp(core->name, name))
+			return core;
 
 	return NULL;
 }
@@ -1031,6 +1013,25 @@ int clk_rate_exclusive_get(struct clk *clk)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(clk_rate_exclusive_get);
+
+static void devm_clk_rate_exclusive_put(void *data)
+{
+	struct clk *clk = data;
+
+	clk_rate_exclusive_put(clk);
+}
+
+int devm_clk_rate_exclusive_get(struct device *dev, struct clk *clk)
+{
+	int ret;
+
+	ret = clk_rate_exclusive_get(clk);
+	if (ret)
+		return ret;
+
+	return devm_add_action_or_reset(dev, devm_clk_rate_exclusive_put, clk);
+}
+EXPORT_SYMBOL_GPL(devm_clk_rate_exclusive_get);
 
 static void clk_core_unprepare(struct clk_core *core)
 {
@@ -3523,6 +3524,21 @@ static int clk_rate_set(void *data, u64 val)
 
 #define clk_rate_mode	0644
 
+static int clk_phase_set(void *data, u64 val)
+{
+	struct clk_core *core = data;
+	int degrees = do_div(val, 360);
+	int ret;
+
+	clk_prepare_lock();
+	ret = clk_core_set_phase_nolock(core, degrees);
+	clk_prepare_unlock();
+
+	return ret;
+}
+
+#define clk_phase_mode	0644
+
 static int clk_prepare_enable_set(void *data, u64 val)
 {
 	struct clk_core *core = data;
@@ -3550,6 +3566,9 @@ DEFINE_DEBUGFS_ATTRIBUTE(clk_prepare_enable_fops, clk_prepare_enable_get,
 #else
 #define clk_rate_set	NULL
 #define clk_rate_mode	0444
+
+#define clk_phase_set	NULL
+#define clk_phase_mode	0644
 #endif
 
 static int clk_rate_get(void *data, u64 *val)
@@ -3564,6 +3583,16 @@ static int clk_rate_get(void *data, u64 *val)
 }
 
 DEFINE_DEBUGFS_ATTRIBUTE(clk_rate_fops, clk_rate_get, clk_rate_set, "%llu\n");
+
+static int clk_phase_get(void *data, u64 *val)
+{
+	struct clk_core *core = data;
+
+	*val = core->phase;
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(clk_phase_fops, clk_phase_get, clk_phase_set, "%llu\n");
 
 static const struct {
 	unsigned long flag;
@@ -3758,7 +3787,8 @@ static void clk_debug_create_one(struct clk_core *core, struct dentry *pdentry)
 	debugfs_create_file("clk_min_rate", 0444, root, core, &clk_min_rate_fops);
 	debugfs_create_file("clk_max_rate", 0444, root, core, &clk_max_rate_fops);
 	debugfs_create_ulong("clk_accuracy", 0444, root, &core->accuracy);
-	debugfs_create_u32("clk_phase", 0444, root, &core->phase);
+	debugfs_create_file("clk_phase", clk_phase_mode, root, core,
+			    &clk_phase_fops);
 	debugfs_create_file("clk_flags", 0444, root, core, &clk_flags_fops);
 	debugfs_create_u32("clk_prepare_count", 0444, root, &core->prepare_count);
 	debugfs_create_u32("clk_enable_count", 0444, root, &core->enable_count);
@@ -4021,6 +4051,8 @@ static int __clk_core_init(struct clk_core *core)
 		hlist_add_head(&core->child_node, &clk_orphan_list);
 		core->orphan = true;
 	}
+	hash_add(clk_hashtable, &core->hashtable_node,
+		 full_name_hash(NULL, core->name, strlen(core->name)));
 
 	/*
 	 * Set clk's accuracy.  The preferred method is to use
@@ -4100,6 +4132,7 @@ out:
 	clk_pm_runtime_put(core);
 unlock:
 	if (ret) {
+		hash_del(&core->hashtable_node);
 		hlist_del_init(&core->child_node);
 		core->hw->core = NULL;
 	}
@@ -4614,6 +4647,7 @@ void clk_unregister(struct clk *clk)
 
 	clk_core_evict_parent_cache(clk->core);
 
+	hash_del(&clk->core->hashtable_node);
 	hlist_del_init(&clk->core->child_node);
 
 	if (clk->core->prepare_count)
@@ -4779,7 +4813,7 @@ void __clk_put(struct clk *clk)
 		clk->exclusive_count = 0;
 	}
 
-	hlist_del(&clk->clks_node);
+	clk_core_unlink_consumer(clk);
 
 	/* If we had any boundaries on that clock, let's drop them. */
 	if (clk->min_rate > 0 || clk->max_rate < ULONG_MAX)
@@ -5249,7 +5283,7 @@ static int of_parse_clkspec(const struct device_node *np, int index,
 		 * clocks.
 		 */
 		np = np->parent;
-		if (np && !of_get_property(np, "clock-ranges", NULL))
+		if (np && !of_property_present(np, "clock-ranges"))
 			break;
 		index = 0;
 	}
@@ -5385,9 +5419,8 @@ EXPORT_SYMBOL_GPL(of_clk_get_parent_count);
 const char *of_clk_get_parent_name(const struct device_node *np, int index)
 {
 	struct of_phandle_args clkspec;
-	struct property *prop;
 	const char *clk_name;
-	const __be32 *vp;
+	bool found = false;
 	u32 pv;
 	int rc;
 	int count;
@@ -5404,16 +5437,19 @@ const char *of_clk_get_parent_name(const struct device_node *np, int index)
 	/* if there is an indices property, use it to transfer the index
 	 * specified into an array offset for the clock-output-names property.
 	 */
-	of_property_for_each_u32(clkspec.np, "clock-indices", prop, vp, pv) {
+	of_property_for_each_u32(clkspec.np, "clock-indices", pv) {
 		if (index == pv) {
 			index = count;
+			found = true;
 			break;
 		}
 		count++;
 	}
 	/* We went off the end of 'clock-indices' without finding it */
-	if (prop && !vp)
+	if (of_property_present(clkspec.np, "clock-indices") && !found) {
+		of_node_put(clkspec.np);
 		return NULL;
+	}
 
 	if (of_property_read_string_index(clkspec.np, "clock-output-names",
 					  index,
@@ -5525,14 +5561,12 @@ static int parent_ready(struct device_node *np)
 int of_clk_detect_critical(struct device_node *np, int index,
 			   unsigned long *flags)
 {
-	struct property *prop;
-	const __be32 *cur;
 	uint32_t idx;
 
 	if (!np || !flags)
 		return -EINVAL;
 
-	of_property_for_each_u32(np, "clock-critical", prop, cur, idx)
+	of_property_for_each_u32(np, "clock-critical", idx)
 		if (index == idx)
 			*flags |= CLK_IS_CRITICAL;
 

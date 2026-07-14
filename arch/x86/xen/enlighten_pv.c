@@ -86,10 +86,6 @@
 #endif
 
 #include "xen-ops.h"
-#include "mmu.h"
-#include "smp.h"
-#include "multicalls.h"
-#include "pmu.h"
 
 #include "../kernel/cpu/cpu.h" /* get_cpu_cap() */
 
@@ -214,7 +210,7 @@ static void __init xen_set_mtrr_data(void)
 
 	/* Only overwrite MTRR state if any MTRR could be got from Xen. */
 	if (reg)
-		mtrr_overwrite_state(var, reg, MTRR_TYPE_UNCACHABLE);
+		guest_force_mtrr_state(var, reg, MTRR_TYPE_UNCACHABLE);
 #endif
 }
 
@@ -238,7 +234,10 @@ static void __init xen_pv_init_platform(void)
 	if (xen_initial_domain())
 		xen_set_mtrr_data();
 	else
-		mtrr_overwrite_state(NULL, 0, MTRR_TYPE_WRBACK);
+		guest_force_mtrr_state(NULL, 0, MTRR_TYPE_WRBACK);
+
+	/* Adjust nr_cpu_ids before "enumeration" happens */
+	xen_smp_count_cpus();
 }
 
 static void __init xen_pv_guest_late_init(void)
@@ -255,13 +254,21 @@ static __read_mostly unsigned int cpuid_leaf5_edx_val;
 static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 		      unsigned int *cx, unsigned int *dx)
 {
-	unsigned maskebx = ~0;
+	unsigned int maskebx = ~0;
+	unsigned int or_ebx = 0;
 
 	/*
 	 * Mask out inconvenient features, to try and disable as many
 	 * unsupported kernel subsystems as possible.
 	 */
 	switch (*ax) {
+	case 0x1:
+		/* Replace initial APIC ID in bits 24-31 of EBX. */
+		/* See xen_pv_smp_config() for related topology preparations. */
+		maskebx = 0x00ffffff;
+		or_ebx = smp_processor_id() << 24;
+		break;
+
 	case CPUID_MWAIT_LEAF:
 		/* Synthesize the values.. */
 		*ax = 0;
@@ -284,6 +291,7 @@ static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 		: "0" (*ax), "2" (*cx));
 
 	*bx &= maskebx;
+	*bx |= or_ebx;
 }
 
 static bool __init xen_check_mwait(void)
@@ -1093,6 +1101,10 @@ static u64 xen_do_read_msr(unsigned int msr, int *err)
 	switch (msr) {
 	case MSR_IA32_APICBASE:
 		val &= ~X2APIC_ENABLE;
+		if (smp_processor_id() == 0)
+			val |= MSR_IA32_APICBASE_BSP;
+		else
+			val &= ~MSR_IA32_APICBASE_BSP;
 		break;
 	}
 	return val;

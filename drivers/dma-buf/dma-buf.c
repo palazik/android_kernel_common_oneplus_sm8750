@@ -30,17 +30,19 @@
 #include <linux/mm.h>
 #include <linux/mount.h>
 #include <linux/pseudo_fs.h>
+#include <linux/fdtable.h>
 
 #include <uapi/linux/dma-buf.h>
 #include <uapi/linux/magic.h>
 
-#ifndef __GENKSYMS__
-#include <linux/fdtable.h>
 #include <trace/events/kmem.h>
-#endif
-#include <trace/hooks/dmabuf.h>
 
 #include "dma-buf-sysfs-stats.h"
+
+#include <trace/hooks/dmabuf.h>
+#include <linux/android_kabi.h>
+
+ANDROID_KABI_DECLONLY(files_struct);
 
 DEFINE_STATIC_KEY_TRUE(dmabuf_accounting_key);
 
@@ -64,38 +66,25 @@ static void __dma_buf_list_del(struct dma_buf *dmabuf)
 	mutex_unlock(&dmabuf_list_mutex);
 }
 
-/**
- * dma_buf_get_each - Helps in traversing the db_list and calls the
- * callback function which can extract required info out of each
- * dmabuf.
- * The db_list needs to be locked to prevent the db_list from being
- * dynamically updated during the traversal process.
- *
- * @callback: [in]   Handle for each dmabuf buffer in db_list.
- * @private:  [in]   User-defined, used to pass in when callback is
- *                   called.
- *
- * Returns 0 on success, otherwise returns a non-zero value for
- * mutex_lock_interruptible or callback.
- */
-int dma_buf_get_each(int (*callback)(const struct dma_buf *dmabuf,
-		     void *private), void *private)
+int get_dmabuf_debugfs_data(int (*fn)(const struct dma_buf *, void *),
+			void *private)
 {
-	struct dma_buf *buf;
-	int ret = mutex_lock_interruptible(&dmabuf_list_mutex);
+	int ret;
+	struct dma_buf *dmabuf;
 
-	if (ret)
-		return ret;
+	mutex_lock(&dmabuf_list_mutex);
 
-	list_for_each_entry(buf, &dmabuf_list, list_node) {
-		ret = callback(buf, private);
+	list_for_each_entry(dmabuf, &dmabuf_list, list_node) {
+		ret = fn(dmabuf, private);
 		if (ret)
 			break;
 	}
+
 	mutex_unlock(&dmabuf_list_mutex);
+
 	return ret;
 }
-EXPORT_SYMBOL_NS_GPL(dma_buf_get_each, MINIDUMP);
+EXPORT_SYMBOL_NS_GPL(get_dmabuf_debugfs_data, DMA_BUF);
 
 /**
  * dma_buf_iter_begin - begin iteration through global list of all DMA buffers
@@ -120,7 +109,7 @@ struct dma_buf *dma_buf_iter_begin(void)
 	 */
 	mutex_lock(&dmabuf_list_mutex);
 	list_for_each_entry(dmabuf, &dmabuf_list, list_node) {
-		if (get_file_rcu(dmabuf->file)) {
+		if (atomic_long_inc_not_zero(&dmabuf->file->f_count)) {
 			ret = dmabuf;
 			break;
 		}
@@ -154,7 +143,7 @@ struct dma_buf *dma_buf_iter_next(struct dma_buf *dmabuf)
 	mutex_lock(&dmabuf_list_mutex);
 	dma_buf_put(dmabuf);
 	list_for_each_entry_continue(dmabuf, &dmabuf_list, list_node) {
-		if (get_file_rcu(dmabuf->file)) {
+		if (atomic_long_inc_not_zero(&dmabuf->file->f_count)) {
 			ret = dmabuf;
 			break;
 		}
@@ -167,12 +156,12 @@ static char *dmabuffs_dname(struct dentry *dentry, char *buffer, int buflen)
 {
 	struct dma_buf *dmabuf;
 	char name[DMA_BUF_NAME_LEN];
-	size_t ret = 0;
+	ssize_t ret = 0;
 
 	dmabuf = dentry->d_fsdata;
 	spin_lock(&dmabuf->name_lock);
 	if (dmabuf->name)
-		ret = strlcpy(name, dmabuf->name, DMA_BUF_NAME_LEN);
+		ret = strscpy(name, dmabuf->name, sizeof(name));
 	spin_unlock(&dmabuf->name_lock);
 
 	return dynamic_dname(buffer, buflen, "/%s:%s",
@@ -511,88 +500,99 @@ static struct task_dma_buf_info *alloc_task_dma_buf_info(void)
 	return dmabuf_info;
 }
 
-#define COUNT_DMABUF_FDS(files, file_lookup_func) ({ \
-	size_t count = 0; \
-	unsigned int max_fds = files_fdtable(files)->max_fds; \
-	for (unsigned int n = 0; n < max_fds; ++n) { \
-		struct file *file = file_lookup_func(files, n); \
-		if (file && is_dma_buf_file(file)) \
-			++count; \
-	} \
-	count; \
-})
+static size_t count_dmabuf_fds(struct files_struct *files)
+{
+	size_t count = 0;
+	unsigned int max_fds;
+
+	lockdep_assert_held(&files->file_lock);
+
+	max_fds = files_fdtable(files)->max_fds;
+	for (unsigned int fd = 0; fd < max_fds; ++fd) {
+		struct file *file = files_lookup_fd_locked(files, fd);
+
+		if (file && is_dma_buf_file(file))
+			++count;
+	}
+
+	return count;
+}
 
 static struct task_dma_buf_info *compute_dmabuf_info(struct task_struct *task)
 {
 	struct task_dma_buf_info *dmabuf_info;
 	size_t count_fd = 0, count_vma = 0;
 	size_t count;
+	unsigned int max_fds;
 
 	dmabuf_info = alloc_task_dma_buf_info();
 	if (!dmabuf_info)
 		return NULL;
 
 	/*
-	 * RCU not actually needed here because task isn't fully formed yet and nobody else can
-	 * access these structures, however lockdep will complain if we don't hold the lock.
+	 * file_lock and RCU not actually needed here because task isn't fully formed yet and nobody
+	 * else can access these structures, however lockdep will complain if we don't hold the lock
 	 */
-	rcu_read_lock();
-	if (task->files)
-		count_fd = COUNT_DMABUF_FDS(task->files, files_lookup_fd_rcu);
+	if (task->files) {
+		spin_lock(&task->files->file_lock);
+		count_fd = count_dmabuf_fds(task->files);
+		spin_unlock(&task->files->file_lock);
+	}
 
 	if (task->mm) {
 		struct vm_area_struct *vma;
 
+		rcu_read_lock();
 		VMA_ITERATOR(vmi, task->mm, 0);
 
 		for_each_vma(vmi, vma)
 			if (vma->vm_file && is_dma_buf_file(vma->vm_file))
 				++count_vma;
+		rcu_read_unlock();
 	}
-	rcu_read_unlock();
 
 	/* count can't change underneath us. See comment above. */
 	count = count_fd + count_vma;
-	if (count > 0) {
-		unsigned int max_fds;
+	if (!count)
+		return dmabuf_info;
 
-		if (!task_dmabuf_records_preload(count)) {
-			kfree(dmabuf_info);
-			return NULL;
-		}
+	if (!task_dmabuf_records_preload(count)) {
+		kfree(dmabuf_info);
+		return NULL;
+	}
 
-		rcu_read_lock();
-		if (count_fd) {
-			max_fds = files_fdtable(task->files)->max_fds;
-			for (unsigned int n = 0; count_fd && n < max_fds; ++n) {
-				struct file *file = files_lookup_fd_rcu(task->files, n);
+	if (count_fd) {
+		spin_lock(&task->files->file_lock);
+		max_fds = files_fdtable(task->files)->max_fds;
+		for (unsigned int n = 0; count_fd && n < max_fds; ++n) {
+			struct file *file = files_lookup_fd_locked(task->files, n);
 
-				if (file && is_dma_buf_file(file)) {
-					__dma_buf_account_task(file->private_data, dmabuf_info,
-							       false);
-					--count_fd;
-				}
+			if (file && is_dma_buf_file(file)) {
+				__dma_buf_account_task(file->private_data, dmabuf_info, false);
+				--count_fd;
 			}
 		}
+		spin_unlock(&task->files->file_lock);
+	}
 
-		if (count_vma) {
-			struct vm_area_struct *vma;
+	if (count_vma) {
+		struct vm_area_struct *vma;
 
-			VMA_ITERATOR(vmi, task->mm, 0);
+		rcu_read_lock();
+		VMA_ITERATOR(vmi, task->mm, 0);
 
-			for_each_vma(vmi, vma) {
-				if (vma->vm_file && is_dma_buf_file(vma->vm_file)) {
-					__dma_buf_account_task(vma->vm_file->private_data,
-							       dmabuf_info, false);
-					if (--count_vma == 0)
-						break;
-				}
+		for_each_vma(vmi, vma) {
+			if (vma->vm_file && is_dma_buf_file(vma->vm_file)) {
+				__dma_buf_account_task(vma->vm_file->private_data, dmabuf_info,
+						       false);
+				if (--count_vma == 0)
+					break;
 			}
 		}
 		rcu_read_unlock();
-
-		task_dmabuf_records_preload_end();
 	}
+
+	task_dmabuf_records_preload_end();
 
 	return dmabuf_info;
 }
@@ -733,10 +733,11 @@ int dma_buf_begin_new_exec(struct files_struct *old_files)
 		unsigned int retries = 0;
 		unsigned int max_fds;
 
-		/* Attempt to count dmabuf FDs locklessly before allocating */
-		rcu_read_lock();
-		num_dmabuf_fds = COUNT_DMABUF_FDS(current->files, files_lookup_fd_rcu);
-		rcu_read_unlock();
+		/* Count dmabuf FDs before allocating */
+		spin_lock(&my_files->file_lock);
+		num_dmabuf_fds = count_dmabuf_fds(my_files);
+		spin_unlock(&my_files->file_lock);
+
 retry:
 		if (!task_dmabuf_records_preload(num_dmabuf_fds))
 			goto err_prealloc;
@@ -744,7 +745,7 @@ retry:
 		spin_lock(&my_files->file_lock);
 
 		/* First make sure we have enough preallocated records */
-		num_dmabuf_fds_check = COUNT_DMABUF_FDS(current->files, files_lookup_fd_locked);
+		num_dmabuf_fds_check = count_dmabuf_fds(my_files);
 
 		if (num_dmabuf_fds_check > num_dmabuf_fds) {
 			spin_unlock(&my_files->file_lock);
@@ -1398,9 +1399,7 @@ struct dma_buf *dma_buf_export(const struct dma_buf_export_info *exp_info)
 	return dmabuf;
 
 err_sysfs:
-	mutex_lock(&dmabuf_list_mutex);
-	list_del(&dmabuf->list_node);
-	mutex_unlock(&dmabuf_list_mutex);
+	__dma_buf_list_del(dmabuf);
 	dmabuf->file = NULL;
 	file->f_path.dentry->d_fsdata = NULL;
 	file->private_data = NULL;

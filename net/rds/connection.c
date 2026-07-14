@@ -673,13 +673,6 @@ void rds_for_each_conn_info(struct socket *sock, unsigned int len,
 	     i++, head++) {
 		hlist_for_each_entry_rcu(conn, head, c_hash_node) {
 
-			/* Zero the per-item buffer before handing it to the
-			 * visitor so any field the visitor does not write -
-			 * including implicit alignment padding - cannot leak
-			 * stack contents to user space via rds_info_copy().
-			 */
-			memset(buffer, 0, item_len);
-
 			/* XXX no c_lock usage.. */
 			if (!visitor(conn, buffer))
 				continue;
@@ -728,13 +721,6 @@ static void rds_walk_conn_path_info(struct socket *sock, unsigned int len,
 			 * a bug in the design of MPRDS.
 			 */
 			cp = conn->c_path;
-
-			/* Zero the per-item buffer for the same reason as
-			 * rds_for_each_conn_info(): any byte the visitor
-			 * does not write (including alignment padding) must
-			 * not leak stack contents via rds_info_copy().
-			 */
-			memset(buffer, 0, item_len);
 
 			/* XXX no cp_lock usage.. */
 			if (!visitor(cp, buffer))
@@ -847,9 +833,7 @@ int rds_conn_init(void)
 	if (ret)
 		return ret;
 
-	rds_conn_slab = kmem_cache_create("rds_connection",
-					  sizeof(struct rds_connection),
-					  0, 0, NULL);
+	rds_conn_slab = KMEM_CACHE(rds_connection, 0);
 	if (!rds_conn_slab) {
 		rds_loop_net_exit();
 		return -ENOMEM;

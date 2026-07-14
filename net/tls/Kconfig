@@ -20,6 +20,7 @@ config TLS
 config TLS_DEVICE
 	bool "Transport Layer Security HW offload"
 	depends on TLS
+	select SKB_DECRYPTED
 	select SOCK_VALIDATE_XMIT
 	select SOCK_RX_QUEUE_MAPPING
 	default n
@@ -37,14 +38,3 @@ config TLS_TOE
 	which is incompatible with the Linux networking stack semantics.
 
 	If unsure, say N.
-
-config TLS_STATS
-	bool "Transport Layer Security statistics"
-	depends on TLS
-	default n
-	help
-	  Enable TLS statistics in procfs. This allows users to access the TLS
-	  statistics from userspace. This is disabled in GKI to allow enabling
-	  TLS without breaking the KMI.
-
-	  If unsure, say N for GKI and Y for non-GKI.

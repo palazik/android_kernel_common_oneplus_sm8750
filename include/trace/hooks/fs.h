@@ -8,17 +8,7 @@
 #define _TRACE_HOOK_FS_H
 
 #include <trace/hooks/vendor_hooks.h>
-
-DECLARE_RESTRICTED_HOOK(android_rvh_ksys_umount,
-		TP_PROTO(char __user *name, int flags),
-		TP_ARGS(name, flags), 1);
-DECLARE_HOOK(android_vh_f2fs_file_open,
-	TP_PROTO(struct inode *inode, struct file *filp),
-	TP_ARGS(inode, filp));
-
-DECLARE_HOOK(android_vh_f2fs_ioc_set_pin_file,
-	TP_PROTO(struct inode *inode, bool has_blkzoned, bool *allow_pin_big_file),
-	TP_ARGS(inode, has_blkzoned, allow_pin_big_file));
+struct va_format;
 
 DECLARE_RESTRICTED_HOOK(android_rvh_f2fs_down_read,
 	TP_PROTO(wait_queue_head_t *read_waiters, struct rw_semaphore *rwsem, bool *skip),
@@ -32,9 +22,59 @@ DECLARE_HOOK(android_vh_f2fs_restore_priority,
 	TP_PROTO(struct task_struct *p, int saved_prio),
 	TP_ARGS(p, saved_prio));
 
+DECLARE_HOOK(android_vh_f2fs_printk,
+	TP_PROTO(unsigned long s_flag, struct va_format *vaf, int level, bool limit_rate),
+	TP_ARGS(s_flag, vaf, level, limit_rate));
+
+DECLARE_HOOK(android_vh_f2fs_create,
+	TP_PROTO(struct inode *inode, struct dentry *dentry),
+	TP_ARGS(inode, dentry));
+
+DECLARE_HOOK(android_vh_f2fs_set_bio_flag,
+	TP_PROTO(struct folio *folio, struct bio *bio),
+	TP_ARGS(folio, bio));
+
 DECLARE_HOOK(android_vh_put_super,
 	TP_PROTO(struct super_block *sb),
 	TP_ARGS(sb));
+
+DECLARE_HOOK(android_vh_wb_dirty_limits,
+	TP_PROTO(unsigned long *thresh, struct bdi_writeback *wb),
+	TP_ARGS(thresh, wb));
+
+DECLARE_HOOK(android_vh_evict,
+	TP_PROTO(struct inode *inode),
+	TP_ARGS(inode));
+
+DECLARE_HOOK(android_vh_inode_io_list_del,
+	TP_PROTO(struct inode *inode, struct bdi_writeback *wb),
+	TP_ARGS(inode, wb));
+
+DECLARE_HOOK(android_vh_redirty_tail_locked,
+	TP_PROTO(struct list_head **target_list, struct inode *inode,
+		 struct bdi_writeback *wb),
+	TP_ARGS(target_list, inode, wb));
+
+DECLARE_HOOK(android_vh_queue_io,
+	TP_PROTO(struct bdi_writeback *wb, unsigned int for_kupdate,
+		 unsigned long dirtied_before, int *moved),
+	TP_ARGS(wb, for_kupdate, dirtied_before, moved));
+
+DECLARE_HOOK(android_vh_mark_inode_dirty,
+	TP_PROTO(struct inode *inode, struct bdi_writeback *wb, struct list_head **dirty_list),
+	TP_ARGS(inode, wb, dirty_list));
+
+DECLARE_HOOK(android_vh_vfs_fsync_range,
+	TP_PROTO(struct inode *inode, unsigned long *cut_off),
+	TP_ARGS(inode, cut_off));
+
+DECLARE_RESTRICTED_HOOK(android_rvh_do_fcntl,
+	TP_PROTO(struct file *filp, unsigned int cmd, unsigned long arg, long *err),
+	TP_ARGS(filp, cmd, arg, err), 1);
+
+DECLARE_HOOK(android_vh_f2fs_file_open,
+	TP_PROTO(struct inode *inode, struct file *filp),
+	TP_ARGS(inode, filp));
 
 DECLARE_HOOK(android_vh_ep_create_wakeup_source,
 	TP_PROTO(char *name, int len),
@@ -43,10 +83,6 @@ DECLARE_HOOK(android_vh_ep_create_wakeup_source,
 DECLARE_HOOK(android_vh_timerfd_create,
 	TP_PROTO(char *name, int len),
 	TP_ARGS(name, len));
-
-DECLARE_HOOK(android_vh_f2fs_set_bio_flag,
-	TP_PROTO(struct folio *folio, struct bio *bio),
-	TP_ARGS(folio, bio));
 #endif /* _TRACE_HOOK_FS_H */
 
 /* This part must be outside protection */

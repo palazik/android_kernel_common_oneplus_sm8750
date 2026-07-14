@@ -421,6 +421,7 @@ static void exfat_set_entry_type(struct exfat_dentry *ep, unsigned int type)
 static void exfat_init_stream_entry(struct exfat_dentry *ep,
 		unsigned int start_clu, unsigned long long size)
 {
+	memset(ep, 0, sizeof(*ep));
 	exfat_set_entry_type(ep, TYPE_STREAM);
 	if (size == 0)
 		ep->dentry.stream.flags = ALLOC_FAT_CHAIN;
@@ -458,6 +459,7 @@ void exfat_init_dir_entry(struct exfat_entry_set_cache *es,
 	struct exfat_dentry *ep;
 
 	ep = exfat_get_dentry_cached(es, ES_IDX_FILE);
+	memset(ep, 0, sizeof(*ep));
 	exfat_set_entry_type(ep, type);
 	exfat_set_entry_time(sbi, ts,
 			&ep->dentry.file.create_tz,
@@ -477,41 +479,6 @@ void exfat_init_dir_entry(struct exfat_entry_set_cache *es,
 
 	ep = exfat_get_dentry_cached(es, ES_IDX_STREAM);
 	exfat_init_stream_entry(ep, start_clu, size);
-}
-
-int exfat_update_dir_chksum(struct inode *inode, struct exfat_chain *p_dir,
-		int entry)
-{
-	struct super_block *sb = inode->i_sb;
-	int ret = 0;
-	int i, num_entries;
-	u16 chksum;
-	struct exfat_dentry *ep, *fep;
-	struct buffer_head *fbh, *bh;
-
-	fep = exfat_get_dentry(sb, p_dir, entry, &fbh);
-	if (!fep)
-		return -EIO;
-
-	num_entries = fep->dentry.file.num_ext + 1;
-	chksum = exfat_calc_chksum16(fep, DENTRY_SIZE, 0, CS_DIR_ENTRY);
-
-	for (i = 1; i < num_entries; i++) {
-		ep = exfat_get_dentry(sb, p_dir, entry + i, &bh);
-		if (!ep) {
-			ret = -EIO;
-			goto release_fbh;
-		}
-		chksum = exfat_calc_chksum16(ep, DENTRY_SIZE, chksum,
-				CS_DEFAULT);
-		brelse(bh);
-	}
-
-	fep->dentry.file.checksum = cpu_to_le16(chksum);
-	exfat_update_bh(fbh, IS_DIRSYNC(inode));
-release_fbh:
-	brelse(fbh);
-	return ret;
 }
 
 static void exfat_free_benign_secondary_clusters(struct inode *inode,
@@ -553,7 +520,7 @@ void exfat_init_ext_entry(struct exfat_entry_set_cache *es, int num_entries,
 		uniname += EXFAT_FILE_NAME_LEN;
 	}
 
-	exfat_update_dir_chksum_with_entry_set(es);
+	exfat_update_dir_chksum(es);
 }
 
 void exfat_remove_entries(struct inode *inode, struct exfat_entry_set_cache *es,
@@ -575,7 +542,7 @@ void exfat_remove_entries(struct inode *inode, struct exfat_entry_set_cache *es,
 		es->modified = true;
 }
 
-void exfat_update_dir_chksum_with_entry_set(struct exfat_entry_set_cache *es)
+void exfat_update_dir_chksum(struct exfat_entry_set_cache *es)
 {
 	int chksum_type = CS_DIR_ENTRY, i;
 	unsigned short chksum = 0;
@@ -1245,27 +1212,6 @@ found:
 	hint_stat->clu = clu.dir;
 	hint_stat->eidx = dentry + 1;
 	return dentry - num_ext;
-}
-
-int exfat_count_ext_entries(struct super_block *sb, struct exfat_chain *p_dir,
-		int entry, struct exfat_dentry *ep)
-{
-	int i, count = 0;
-	unsigned int type;
-	struct exfat_dentry *ext_ep;
-	struct buffer_head *bh;
-
-	for (i = 0, entry++; i < ep->dentry.file.num_ext; i++, entry++) {
-		ext_ep = exfat_get_dentry(sb, p_dir, entry, &bh);
-		if (!ext_ep)
-			return -EIO;
-
-		type = exfat_get_entry_type(ext_ep);
-		brelse(bh);
-		if (type & TYPE_CRITICAL_SEC || type & TYPE_BENIGN_SEC)
-			count++;
-	}
-	return count;
 }
 
 int exfat_count_dir_entries(struct super_block *sb, struct exfat_chain *p_dir)

@@ -22,7 +22,7 @@
  * PAGE_SHIFT determines the page size
  */
 
-#define PAGE_SHIFT	12
+#define PAGE_SHIFT	CONFIG_PAGE_SHIFT
 #define PAGE_SIZE	(__XTENSA_UL_CONST(1) << PAGE_SHIFT)
 #define PAGE_MASK	(~(PAGE_SIZE-1))
 
@@ -195,7 +195,6 @@ static inline unsigned long ___pa(unsigned long va)
 #define virt_to_page(kaddr)	pfn_to_page(__pa(kaddr) >> PAGE_SHIFT)
 #define page_to_virt(page)	__va(page_to_pfn(page) << PAGE_SHIFT)
 #define virt_addr_valid(kaddr)	pfn_valid(__pa(kaddr) >> PAGE_SHIFT)
-#define page_to_phys(page)	(page_to_pfn(page) << PAGE_SHIFT)
 
 #endif /* __ASSEMBLY__ */
 

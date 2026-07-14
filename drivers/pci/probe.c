@@ -9,6 +9,8 @@
 #include <linux/pci.h>
 #include <linux/msi.h>
 #include <linux/of_pci.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/pci_hotplug.h>
 #include <linux/slab.h>
 #include <linux/module.h>
@@ -95,7 +97,7 @@ static void release_pcibus_dev(struct device *dev)
 	kfree(pci_bus);
 }
 
-static struct class pcibus_class = {
+static const struct class pcibus_class = {
 	.name		= "pci_bus",
 	.dev_release	= &release_pcibus_dev,
 	.dev_groups	= pcibus_groups,
@@ -821,8 +823,8 @@ static void pci_set_bus_speed(struct pci_bus *bus)
 		}
 
 		bus->max_bus_speed = max;
-		bus->cur_bus_speed = pcix_bus_speed[
-			(status & PCI_X_SSTATUS_FREQ) >> 6];
+		bus->cur_bus_speed =
+			pcix_bus_speed[FIELD_GET(PCI_X_SSTATUS_FREQ, status)];
 
 		return;
 	}
@@ -1063,7 +1065,7 @@ unregister:
 	device_del(&bridge->dev);
 free:
 #ifdef CONFIG_PCI_DOMAINS_GENERIC
-	pci_bus_release_domain_nr(bus, parent);
+	pci_bus_release_domain_nr(parent, bus->domain_nr);
 #endif
 	if (bus_registered)
 		put_device(&bus->dev);
@@ -1212,15 +1214,17 @@ struct pci_bus *pci_add_new_bus(struct pci_bus *parent, struct pci_dev *dev,
 }
 EXPORT_SYMBOL(pci_add_new_bus);
 
-static void pci_enable_crs(struct pci_dev *pdev)
+static void pci_enable_rrs_sv(struct pci_dev *pdev)
 {
 	u16 root_cap = 0;
 
-	/* Enable CRS Software Visibility if supported */
+	/* Enable Configuration RRS Software Visibility if supported */
 	pcie_capability_read_word(pdev, PCI_EXP_RTCAP, &root_cap);
-	if (root_cap & PCI_EXP_RTCAP_CRSVIS)
+	if (root_cap & PCI_EXP_RTCAP_RRS_SV) {
 		pcie_capability_set_word(pdev, PCI_EXP_RTCTL,
-					 PCI_EXP_RTCTL_CRSSVE);
+					 PCI_EXP_RTCTL_RRS_SVE);
+		pdev->config_rrs_sv = 1;
+	}
 }
 
 static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
@@ -1252,8 +1256,8 @@ static bool pci_ea_fixed_busnrs(struct pci_dev *dev, u8 *sec, u8 *sub)
 
 	offset = ea + PCI_EA_FIRST_ENT;
 	pci_read_config_dword(dev, offset, &dw);
-	ea_sec =  dw & PCI_EA_SEC_BUS_MASK;
-	ea_sub = (dw & PCI_EA_SUB_BUS_MASK) >> PCI_EA_SUB_BUS_SHIFT;
+	ea_sec = FIELD_GET(PCI_EA_SEC_BUS_MASK, dw);
+	ea_sub = FIELD_GET(PCI_EA_SUB_BUS_MASK, dw);
 	if (ea_sec  == 0 || ea_sub < ea_sec)
 		return false;
 
@@ -1334,8 +1338,6 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
 	pci_read_config_word(dev, PCI_BRIDGE_CONTROL, &bctl);
 	pci_write_config_word(dev, PCI_BRIDGE_CONTROL,
 			      bctl & ~PCI_BRIDGE_CTL_MASTER_ABORT);
-
-	pci_enable_crs(dev);
 
 	if ((secondary || subordinate) && !pcibios_assign_all_busses() &&
 	    !is_cardbus && !broken) {
@@ -1505,6 +1507,9 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
 	}
 
 out:
+	/* Clear errors in the Secondary Status Register */
+	pci_write_config_word(dev, PCI_SEC_STATUS, 0xffff);
+
 	pci_write_config_word(dev, PCI_BRIDGE_CONTROL, bctl);
 
 	pm_runtime_put(&dev->dev);
@@ -1574,6 +1579,11 @@ void set_pcie_port_type(struct pci_dev *pdev)
 	pdev->pcie_cap = pos;
 	pci_read_config_word(pdev, pos + PCI_EXP_FLAGS, &reg16);
 	pdev->pcie_flags_reg = reg16;
+
+	type = pci_pcie_type(pdev);
+	if (type == PCI_EXP_TYPE_ROOT_PORT)
+		pci_enable_rrs_sv(pdev);
+
 	pci_read_config_dword(pdev, pos + PCI_EXP_DEVCAP, &pdev->devcap);
 	pdev->pcie_mpss = FIELD_GET(PCI_EXP_DEVCAP_PAYLOAD, pdev->devcap);
 
@@ -1590,7 +1600,6 @@ void set_pcie_port_type(struct pci_dev *pdev)
 	 * correctly so detect impossible configurations here and correct
 	 * the port type accordingly.
 	 */
-	type = pci_pcie_type(pdev);
 	if (type == PCI_EXP_TYPE_DOWNSTREAM) {
 		/*
 		 * If pdev claims to be downstream port but the parent
@@ -1622,7 +1631,7 @@ void set_pcie_hotplug_bridge(struct pci_dev *pdev)
 
 	pcie_capability_read_dword(pdev, PCI_EXP_SLTCAP, &reg32);
 	if (reg32 & PCI_EXP_SLTCAP_HPC)
-		pdev->is_hotplug_bridge = 1;
+		pdev->is_hotplug_bridge = pdev->is_pciehp = 1;
 }
 
 static void set_pcie_thunderbolt(struct pci_dev *dev)
@@ -1635,7 +1644,7 @@ static void set_pcie_thunderbolt(struct pci_dev *dev)
 		dev->is_thunderbolt = 1;
 }
 
-static void set_pcie_untrusted(struct pci_dev *dev)
+static void pci_set_requires_dma_protection(struct pci_dev *dev)
 {
 	struct pci_dev *parent = pci_upstream_bridge(dev);
 
@@ -1645,14 +1654,14 @@ static void set_pcie_untrusted(struct pci_dev *dev)
 	 * If the upstream bridge is untrusted we treat this device as
 	 * untrusted as well.
 	 */
-	if (parent->untrusted) {
-		dev->untrusted = true;
+	if (parent->requires_dma_protection) {
+		dev->requires_dma_protection = true;
 		return;
 	}
 
 	if (arch_pci_dev_is_removable(dev)) {
 		pci_dbg(dev, "marking as untrusted\n");
-		dev->untrusted = true;
+		dev->requires_dma_protection = true;
 	}
 }
 
@@ -1868,6 +1877,43 @@ static void early_dump_pci_device(struct pci_dev *pdev)
 		       value, 256, false);
 }
 
+static const char *pci_type_str(struct pci_dev *dev)
+{
+	static const char * const str[] = {
+		"PCIe Endpoint",
+		"PCIe Legacy Endpoint",
+		"PCIe unknown",
+		"PCIe unknown",
+		"PCIe Root Port",
+		"PCIe Switch Upstream Port",
+		"PCIe Switch Downstream Port",
+		"PCIe to PCI/PCI-X bridge",
+		"PCI/PCI-X to PCIe bridge",
+		"PCIe Root Complex Integrated Endpoint",
+		"PCIe Root Complex Event Collector",
+	};
+	int type;
+
+	if (pci_is_pcie(dev)) {
+		type = pci_pcie_type(dev);
+		if (type < ARRAY_SIZE(str))
+			return str[type];
+
+		return "PCIe unknown";
+	}
+
+	switch (dev->hdr_type) {
+	case PCI_HEADER_TYPE_NORMAL:
+		return "conventional PCI endpoint";
+	case PCI_HEADER_TYPE_BRIDGE:
+		return "conventional PCI bridge";
+	case PCI_HEADER_TYPE_CARDBUS:
+		return "CardBus bridge";
+	default:
+		return "conventional PCI";
+	}
+}
+
 /**
  * pci_setup_device - Fill in class and map information of a device
  * @dev: the device structure to fill
@@ -1928,7 +1974,10 @@ int pci_setup_device(struct pci_dev *dev)
 	/* Need to have dev->cfg_size ready */
 	set_pcie_thunderbolt(dev);
 
-	set_pcie_untrusted(dev);
+	pci_set_requires_dma_protection(dev);
+
+	if (pci_is_pcie(dev))
+		dev->supported_speeds = pcie_get_supported_speeds(dev);
 
 	/* "Unknown power state" */
 	dev->current_state = PCI_UNKNOWN;
@@ -1938,8 +1987,9 @@ int pci_setup_device(struct pci_dev *dev)
 
 	pci_set_removable(dev);
 
-	pci_info(dev, "[%04x:%04x] type %02x class %#08x\n",
-		 dev->vendor, dev->device, dev->hdr_type, dev->class);
+	pci_info(dev, "[%04x:%04x] type %02x class %#08x %s\n",
+		 dev->vendor, dev->device, dev->hdr_type, dev->class,
+		 pci_type_str(dev));
 
 	/* Device class may be changed after fixup */
 	class = dev->class >> 8;
@@ -2331,6 +2381,10 @@ static void pci_release_dev(struct device *dev)
 	kfree(pci_dev);
 }
 
+static const struct device_type pci_dev_type = {
+	.groups = pci_dev_attr_groups,
+};
+
 struct pci_dev *pci_alloc_dev(struct pci_bus *bus)
 {
 	struct pci_dev *dev;
@@ -2356,28 +2410,23 @@ struct pci_dev *pci_alloc_dev(struct pci_bus *bus)
 }
 EXPORT_SYMBOL(pci_alloc_dev);
 
-static bool pci_bus_crs_vendor_id(u32 l)
-{
-	return (l & 0xffff) == PCI_VENDOR_ID_PCI_SIG;
-}
-
-static bool pci_bus_wait_crs(struct pci_bus *bus, int devfn, u32 *l,
+static bool pci_bus_wait_rrs(struct pci_bus *bus, int devfn, u32 *l,
 			     int timeout)
 {
 	int delay = 1;
 
-	if (!pci_bus_crs_vendor_id(*l))
-		return true;	/* not a CRS completion */
+	if (!pci_bus_rrs_vendor_id(*l))
+		return true;	/* not a Configuration RRS completion */
 
 	if (!timeout)
-		return false;	/* CRS, but caller doesn't want to wait */
+		return false;	/* RRS, but caller doesn't want to wait */
 
 	/*
 	 * We got the reserved Vendor ID that indicates a completion with
-	 * Configuration Request Retry Status (CRS).  Retry until we get a
+	 * Configuration Request Retry Status (RRS).  Retry until we get a
 	 * valid Vendor ID or we time out.
 	 */
-	while (pci_bus_crs_vendor_id(*l)) {
+	while (pci_bus_rrs_vendor_id(*l)) {
 		if (delay > timeout) {
 			pr_warn("pci %04x:%02x:%02x.%d: not ready after %dms; giving up\n",
 				pci_domain_nr(bus), bus->number,
@@ -2416,8 +2465,8 @@ bool pci_bus_generic_read_dev_vendor_id(struct pci_bus *bus, int devfn, u32 *l,
 	    *l == 0x0000ffff || *l == 0xffff0000)
 		return false;
 
-	if (pci_bus_crs_vendor_id(*l))
-		return pci_bus_wait_crs(bus, devfn, l, timeout);
+	if (pci_bus_rrs_vendor_id(*l))
+		return pci_bus_wait_rrs(bus, devfn, l, timeout);
 
 	return true;
 }
@@ -2441,6 +2490,52 @@ bool pci_bus_read_dev_vendor_id(struct pci_bus *bus, int devfn, u32 *l,
 }
 EXPORT_SYMBOL(pci_bus_read_dev_vendor_id);
 
+static struct platform_device *pci_pwrctrl_create_device(struct pci_bus *bus, int devfn)
+{
+	struct pci_host_bridge *host = pci_find_host_bridge(bus);
+	struct platform_device *pdev;
+	struct device_node *np;
+
+	if (brcm_pcie_pwrctrl_quirk(dev_of_node(&bus->dev)))
+		return NULL;
+
+	np = of_pci_find_child_device(dev_of_node(&bus->dev), devfn);
+	if (!np)
+		return NULL;
+
+	pdev = of_find_device_by_node(np);
+	if (pdev) {
+		put_device(&pdev->dev);
+		goto err_put_of_node;
+	}
+
+	/*
+	 * First check whether the pwrctrl device really needs to be created or
+	 * not. This is decided based on at least one of the power supplies
+	 * being defined in the devicetree node of the device.
+	 */
+	if (!of_pci_supply_present(np)) {
+		pr_debug("PCI/pwrctrl: Skipping OF node: %s\n", np->name);
+		goto err_put_of_node;
+	}
+
+	/* Now create the pwrctrl device */
+	pdev = of_platform_device_create(np, NULL, &host->dev);
+	if (!pdev) {
+		pr_err("PCI/pwrctrl: Failed to create pwrctrl device for node: %s\n", np->name);
+		goto err_put_of_node;
+	}
+
+	of_node_put(np);
+
+	return pdev;
+
+err_put_of_node:
+	of_node_put(np);
+
+	return NULL;
+}
+
 /*
  * Read the config data for a PCI device, sanity-check it,
  * and fill in the dev structure.
@@ -2449,6 +2544,15 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 {
 	struct pci_dev *dev;
 	u32 l;
+
+	/*
+	 * Create pwrctrl device (if required) for the PCI device to handle the
+	 * power state. If the pwrctrl device is created, then skip scanning
+	 * further as the pwrctrl core will rescan the bus after powering on
+	 * the device.
+	 */
+	if (pci_pwrctrl_create_device(bus, devfn))
+		return NULL;
 
 	if (!pci_bus_read_dev_vendor_id(bus, devfn, &l, 60*1000))
 		return NULL;
@@ -2606,6 +2710,8 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
 	dev->match_driver = false;
 	ret = device_add(&dev->dev);
 	WARN_ON(ret < 0);
+
+	pci_npem_create(dev);
 }
 
 struct pci_dev *pci_scan_single_device(struct pci_bus *bus, int devfn)
@@ -3096,7 +3202,9 @@ int pci_host_probe(struct pci_host_bridge *bridge)
 	struct pci_bus *bus, *child;
 	int ret;
 
+	pci_lock_rescan_remove();
 	ret = pci_scan_root_bus_bridge(bridge);
+	pci_unlock_rescan_remove();
 	if (ret < 0) {
 		dev_err(bridge->dev.parent, "Scanning root bridge failed");
 		return ret;
@@ -3117,7 +3225,9 @@ int pci_host_probe(struct pci_host_bridge *bridge)
 	list_for_each_entry(child, &bus->children, node)
 		pcie_bus_configure_settings(child);
 
+	pci_lock_rescan_remove();
 	pci_bus_add_devices(bus);
+	pci_unlock_rescan_remove();
 
 	/*
 	 * Ensure pm_runtime_enable() is called for the controller drivers

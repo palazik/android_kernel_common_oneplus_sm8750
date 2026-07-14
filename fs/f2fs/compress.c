@@ -1143,6 +1143,7 @@ retry:
 		f2fs_compress_ctx_add_page(cc, page_folio(page));
 
 		if (!PageUptodate(page)) {
+			f2fs_handle_page_eio(sbi, page_folio(page), DATA);
 release_and_retry:
 			f2fs_put_rpages(cc);
 			f2fs_unlock_rpages(cc, i + 1);
@@ -2027,7 +2028,7 @@ void f2fs_invalidate_compress_pages(struct f2fs_sb_info *sbi, nid_t ino)
 				continue;
 			}
 
-			generic_error_remove_page(mapping, &folio->page);
+			generic_error_remove_folio(mapping, folio);
 			folio_unlock(folio);
 		}
 		folio_batch_release(&fbatch);

@@ -34,13 +34,18 @@
 #include <linux/shmem_fs.h>
 #include <linux/mmu_notifier.h>
 #include <trace/hooks/mm.h>
+#include <trace/hooks/madvise.h>
 
 #include <asm/tlb.h>
 
 #include "internal.h"
 #include "swap.h"
 
-#include <trace/hooks/madvise.h>
+/*
+ * Maximum number of attempts we make to install guard pages before we give up
+ * and return -ERESTARTNOINTR to have userspace try again.
+ */
+#define MAX_MADVISE_GUARD_RETRIES 3
 
 struct madvise_walk_private {
 	struct mmu_gather *tlb;
@@ -137,7 +142,6 @@ static int madvise_update_vma(struct vm_area_struct *vma,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	int error;
-	pgoff_t pgoff;
 	VMA_ITERATOR(vmi, mm, start);
 
 	if (new_flags == vma->vm_flags && anon_vma_name_eq(anon_vma_name(vma), anon_name)) {
@@ -145,30 +149,13 @@ static int madvise_update_vma(struct vm_area_struct *vma,
 		return 0;
 	}
 
-	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
-	*prev = vma_merge(&vmi, mm, *prev, start, end, new_flags,
-			  vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
-			  vma->vm_userfaultfd_ctx, anon_name);
-	if (*prev) {
-		vma = *prev;
-		goto success;
-	}
+	vma = vma_modify_flags_name(&vmi, *prev, vma, start, end, new_flags,
+				    anon_name);
+	if (IS_ERR(vma))
+		return PTR_ERR(vma);
 
 	*prev = vma;
 
-	if (start != vma->vm_start) {
-		error = split_vma(&vmi, vma, start, 1);
-		if (error)
-			return error;
-	}
-
-	if (end != vma->vm_end) {
-		error = split_vma(&vmi, vma, end, 0);
-		if (error)
-			return error;
-	}
-
-success:
 	/* vm_flags is protected by the mmap_lock held in write mode. */
 	vma_start_write(vma);
 	vm_flags_reset(vma, new_flags);
@@ -176,7 +163,6 @@ success:
 		error = replace_anon_vma_name(vma, anon_name);
 		if (error)
 			return error;
-		trace_android_vh_replace_anon_vma_name(vma, anon_name);
 	}
 
 	return 0;
@@ -195,7 +181,7 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 	for (addr = start; addr < end; addr += PAGE_SIZE) {
 		pte_t pte;
 		swp_entry_t entry;
-		struct page *page;
+		struct folio *folio;
 
 		if (!ptep++) {
 			ptep = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
@@ -214,10 +200,10 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 		ptep = NULL;
 		trace_android_vh_madvise_swapin_walk_pmd_entry(entry);
 
-		page = read_swap_cache_async(entry, GFP_HIGHUSER_MOVABLE,
+		folio = read_swap_cache_async(entry, GFP_HIGHUSER_MOVABLE,
 					     vma, addr, &splug);
-		if (page)
-			put_page(page);
+		if (folio)
+			folio_put(folio);
 	}
 
 	if (ptep)
@@ -239,17 +225,17 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 {
 	XA_STATE(xas, &mapping->i_pages, linear_page_index(vma, start));
 	pgoff_t end_index = linear_page_index(vma, end) - 1;
-	struct page *page;
+	struct folio *folio;
 	struct swap_iocb *splug = NULL;
 
 	rcu_read_lock();
-	xas_for_each(&xas, page, end_index) {
+	xas_for_each(&xas, folio, end_index) {
 		unsigned long addr;
 		swp_entry_t entry;
 
-		if (!xa_is_value(page))
+		if (!xa_is_value(folio))
 			continue;
-		entry = radix_to_swp_entry(page);
+		entry = radix_to_swp_entry(folio);
 		/* There might be swapin error entries in shmem mapping. */
 		if (non_swap_entry(entry))
 			continue;
@@ -259,10 +245,10 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 		xas_pause(&xas);
 		rcu_read_unlock();
 
-		page = read_swap_cache_async(entry, mapping_gfp_mask(mapping),
+		folio = read_swap_cache_async(entry, mapping_gfp_mask(mapping),
 					     vma, addr, &splug);
-		if (page)
-			put_page(page);
+		if (folio)
+			folio_put(folio);
 
 		rcu_read_lock();
 	}
@@ -363,9 +349,9 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 	struct folio *folio = NULL;
 	LIST_HEAD(folio_list);
 	bool pageout_anon_only_filter;
+	unsigned int batch_count = 0;
 	bool abort_madvise = false;
 	int nr;
-	swp_entry_t entry;
 	int ret = 0;
 
 	trace_android_vh_madvise_cold_or_pageout_abort(vma, &abort_madvise);
@@ -399,7 +385,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 			goto huge_unlock;
 		}
 
-		folio = pfn_folio(pmd_pfn(orig_pmd));
+		folio = pmd_folio(orig_pmd);
 
 		/* Do not interfere with other mappings of this folio */
 		if (folio_likely_mapped_shared(folio))
@@ -417,7 +403,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 			err = split_folio(folio);
 			folio_unlock(folio);
 			folio_put(folio);
-			if (err >= 0)
+			if (!err)
 				goto regular_folio;
 			return 0;
 		}
@@ -446,13 +432,14 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 huge_unlock:
 		spin_unlock(ptl);
 		if (pageout)
-			__reclaim_pages(&folio_list, true, private->private);
+			__reclaim_pages(&folio_list, private->private);
 		return 0;
 	}
 
 regular_folio:
 #endif
 	tlb_change_page_size(tlb, PAGE_SIZE);
+restart:
 	start_pte = pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
 	if (!start_pte)
 		return 0;
@@ -463,16 +450,21 @@ regular_folio:
 		nr = 1;
 		ptent = ptep_get(pte);
 
+		if (++batch_count == SWAP_CLUSTER_MAX) {
+			batch_count = 0;
+			if (need_resched()) {
+				arch_leave_lazy_mmu_mode();
+				pte_unmap_unlock(start_pte, ptl);
+				cond_resched();
+				goto restart;
+			}
+		}
+
 		if (pte_none(ptent))
 			continue;
 
-		if (!pte_present(ptent)) {
-			entry = pte_to_swp_entry(ptent);
-			if (!non_swap_entry(entry))
-				trace_android_vh_madvise_pageout_swap_entry(entry,
-					swp_swapcount(entry), NULL);
+		if (!pte_present(ptent))
 			continue;
-		}
 
 		folio = vm_normal_folio(vma, addr, ptent);
 		if (!folio || folio_is_zone_device(folio))
@@ -524,8 +516,9 @@ regular_folio:
 					pte_offset_map_lock(mm, pmd, addr, &ptl);
 				if (!start_pte)
 					break;
+				flush_tlb_batched_pending(mm);
 				arch_enter_lazy_mmu_mode();
-				if (err >= 0)
+				if (!err)
 					nr = 0;
 				continue;
 			}
@@ -576,7 +569,7 @@ regular_folio:
 		pte_unmap_unlock(start_pte, ptl);
 	}
 	if (pageout)
-		__reclaim_pages(&folio_list, true, private->private);
+		__reclaim_pages(&folio_list, private->private);
 	cond_resched();
 
 	return 0;
@@ -644,7 +637,7 @@ static int madvise_pageout_page_range(struct mmu_gather *tlb,
 
 	trace_android_rvh_madvise_pageout_end(walk_private.private, &folio_list);
 	if (!list_empty(&folio_list))
-		reclaim_pages(&folio_list, true);
+		reclaim_pages(&folio_list);
 
 	return ret;
 }
@@ -773,8 +766,9 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 				start_pte = pte;
 				if (!start_pte)
 					break;
+				flush_tlb_batched_pending(mm);
 				arch_enter_lazy_mmu_mode();
-				if (err >= 0)
+				if (!err)
 					nr = 0;
 				continue;
 			}
@@ -815,11 +809,8 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 		folio_mark_lazyfree(folio);
 	}
 
-	if (nr_swap) {
-		if (current->mm == mm)
-			sync_mm_rss(mm);
+	if (nr_swap)
 		add_mm_counter(mm, MM_SWAPENTS, nr_swap);
-	}
 	if (start_pte) {
 		arch_leave_lazy_mmu_mode();
 		pte_unmap_unlock(start_pte, ptl);
@@ -891,9 +882,14 @@ static int madvise_free_single_vma(struct vm_area_struct *vma,
 static long madvise_dontneed_single_vma(struct vm_area_struct *vma,
 					unsigned long start, unsigned long end)
 {
+	struct zap_details details = {
+		.zap_flags = ZAP_FLAG_RECLAIM_PT,
+		.even_cows = true,
+	};
+
 	madvise_vma_pad_pages(vma, start, end);
 
-	zap_page_range_single(vma, start, end - start, NULL);
+	zap_page_range_single(vma, start, end - start, &details);
 	return 0;
 }
 
@@ -991,17 +987,12 @@ static long madvise_dontneed_free(struct vm_area_struct *vma,
 		return -EINVAL;
 }
 
-static long madvise_populate(struct vm_area_struct *vma,
-			     struct vm_area_struct **prev,
-			     unsigned long start, unsigned long end,
-			     int behavior)
+static long madvise_populate(struct mm_struct *mm, unsigned long start,
+		unsigned long end, int behavior)
 {
 	const bool write = behavior == MADV_POPULATE_WRITE;
-	struct mm_struct *mm = vma->vm_mm;
 	int locked = 1;
 	long pages;
-
-	*prev = vma;
 
 	while (start < end) {
 		/* Populate (prefault) page tables readable/writable. */
@@ -1009,8 +1000,6 @@ static long madvise_populate(struct vm_area_struct *vma,
 		if (!locked) {
 			mmap_read_lock(mm);
 			locked = 1;
-			*prev = NULL;
-			vma = NULL;
 		}
 		if (pages < 0) {
 			switch (pages) {
@@ -1084,6 +1073,208 @@ static long madvise_remove(struct vm_area_struct *vma,
 	return error;
 }
 
+static bool is_valid_guard_vma(struct vm_area_struct *vma, bool allow_locked)
+{
+	vm_flags_t disallowed = VM_SPECIAL | VM_HUGETLB;
+
+	/*
+	 * A user could lock after setting a guard range but that's fine, as
+	 * they'd not be able to fault in. The issue arises when we try to zap
+	 * existing locked VMAs. We don't want to do that.
+	 */
+	if (!allow_locked)
+		disallowed |= VM_LOCKED;
+
+	return !(vma->vm_flags & disallowed);
+}
+
+static bool is_guard_pte_marker(pte_t ptent)
+{
+	return is_pte_marker(ptent) &&
+		is_guard_swp_entry(pte_to_swp_entry(ptent));
+}
+
+static int guard_install_pud_entry(pud_t *pud, unsigned long addr,
+				   unsigned long next, struct mm_walk *walk)
+{
+	pud_t pudval = pudp_get(pud);
+
+	/* If huge return >0 so we abort the operation + zap. */
+	return pud_trans_huge(pudval) || pud_devmap(pudval);
+}
+
+static int guard_install_pmd_entry(pmd_t *pmd, unsigned long addr,
+				   unsigned long next, struct mm_walk *walk)
+{
+	pmd_t pmdval = pmdp_get(pmd);
+
+	/* If huge return >0 so we abort the operation + zap. */
+	return pmd_trans_huge(pmdval) || pmd_devmap(pmdval);
+}
+
+static int guard_install_pte_entry(pte_t *pte, unsigned long addr,
+				   unsigned long next, struct mm_walk *walk)
+{
+	pte_t pteval = ptep_get(pte);
+	unsigned long *nr_pages = (unsigned long *)walk->private;
+
+	/* If there is already a guard page marker, we have nothing to do. */
+	if (is_guard_pte_marker(pteval)) {
+		(*nr_pages)++;
+
+		return 0;
+	}
+
+	/* If populated return >0 so we abort the operation + zap. */
+	return 1;
+}
+
+static int guard_install_set_pte(unsigned long addr, unsigned long next,
+				 pte_t *ptep, struct mm_walk *walk)
+{
+	unsigned long *nr_pages = (unsigned long *)walk->private;
+
+	/* Simply install a PTE marker, this causes segfault on access. */
+	*ptep = make_pte_marker(PTE_MARKER_GUARD);
+	(*nr_pages)++;
+
+	return 0;
+}
+
+static const struct mm_walk_ops guard_install_walk_ops = {
+	.pud_entry		= guard_install_pud_entry,
+	.pmd_entry		= guard_install_pmd_entry,
+	.pte_entry		= guard_install_pte_entry,
+	.install_pte		= guard_install_set_pte,
+	.walk_lock		= PGWALK_RDLOCK,
+};
+
+static long madvise_guard_install(struct vm_area_struct *vma,
+				 struct vm_area_struct **prev,
+				 unsigned long start, unsigned long end)
+{
+	long err;
+	int i;
+
+	*prev = vma;
+	if (!is_valid_guard_vma(vma, /* allow_locked = */false))
+		return -EINVAL;
+
+	/*
+	 * If we install guard markers, then the range is no longer
+	 * empty from a page table perspective and therefore it's
+	 * appropriate to have an anon_vma.
+	 *
+	 * This ensures that on fork, we copy page tables correctly.
+	 */
+	err = anon_vma_prepare(vma);
+	if (err)
+		return err;
+
+	/*
+	 * Optimistically try to install the guard marker pages first. If any
+	 * non-guard pages are encountered, give up and zap the range before
+	 * trying again.
+	 *
+	 * We try a few times before giving up and releasing back to userland to
+	 * loop around, releasing locks in the process to avoid contention. This
+	 * would only happen if there was a great many racing page faults.
+	 *
+	 * In most cases we should simply install the guard markers immediately
+	 * with no zap or looping.
+	 */
+	for (i = 0; i < MAX_MADVISE_GUARD_RETRIES; i++) {
+		unsigned long nr_pages = 0;
+
+		/* Returns < 0 on error, == 0 if success, > 0 if zap needed. */
+		err = walk_page_range_mm(vma->vm_mm, start, end,
+					 &guard_install_walk_ops, &nr_pages);
+		if (err < 0)
+			return err;
+
+		if (err == 0) {
+			unsigned long nr_expected_pages = PHYS_PFN(end - start);
+
+			VM_WARN_ON(nr_pages != nr_expected_pages);
+			return 0;
+		}
+
+		/*
+		 * OK some of the range have non-guard pages mapped, zap
+		 * them. This leaves existing guard pages in place.
+		 */
+		zap_page_range_single(vma, start, end - start, NULL);
+	}
+
+	/*
+	 * We were unable to install the guard pages due to being raced by page
+	 * faults. This should not happen ordinarily. We return to userspace and
+	 * immediately retry, relieving lock contention.
+	 */
+	return restart_syscall();
+}
+
+static int guard_remove_pud_entry(pud_t *pud, unsigned long addr,
+				  unsigned long next, struct mm_walk *walk)
+{
+	pud_t pudval = pudp_get(pud);
+
+	/* If huge, cannot have guard pages present, so no-op - skip. */
+	if (pud_trans_huge(pudval) || pud_devmap(pudval))
+		walk->action = ACTION_CONTINUE;
+
+	return 0;
+}
+
+static int guard_remove_pmd_entry(pmd_t *pmd, unsigned long addr,
+				  unsigned long next, struct mm_walk *walk)
+{
+	pmd_t pmdval = pmdp_get(pmd);
+
+	/* If huge, cannot have guard pages present, so no-op - skip. */
+	if (pmd_trans_huge(pmdval) || pmd_devmap(pmdval))
+		walk->action = ACTION_CONTINUE;
+
+	return 0;
+}
+
+static int guard_remove_pte_entry(pte_t *pte, unsigned long addr,
+				  unsigned long next, struct mm_walk *walk)
+{
+	pte_t ptent = ptep_get(pte);
+
+	if (is_guard_pte_marker(ptent)) {
+		/* Simply clear the PTE marker. */
+		pte_clear_not_present_full(walk->mm, addr, pte, false);
+		update_mmu_cache(walk->vma, addr, pte);
+	}
+
+	return 0;
+}
+
+static const struct mm_walk_ops guard_remove_walk_ops = {
+	.pud_entry		= guard_remove_pud_entry,
+	.pmd_entry		= guard_remove_pmd_entry,
+	.pte_entry		= guard_remove_pte_entry,
+	.walk_lock		= PGWALK_RDLOCK,
+};
+
+static long madvise_guard_remove(struct vm_area_struct *vma,
+				 struct vm_area_struct **prev,
+				 unsigned long start, unsigned long end)
+{
+	*prev = vma;
+	/*
+	 * We're ok with removing guards in mlock()'d ranges, as this is a
+	 * non-destructive action.
+	 */
+	if (!is_valid_guard_vma(vma, /* allow_locked = */true))
+		return -EINVAL;
+
+	return walk_page_range(vma->vm_mm, start, end,
+			       &guard_remove_walk_ops, NULL);
+}
+
 /*
  * Apply an madvise behavior to a region of a vma.  madvise_update_vma
  * will handle splitting a vm area into separate areas, each area with its own
@@ -1116,9 +1307,6 @@ static int madvise_vma_behavior(struct vm_area_struct *vma,
 	case MADV_DONTNEED:
 	case MADV_DONTNEED_LOCKED:
 		return madvise_dontneed_free(vma, prev, start, end, arg);
-	case MADV_POPULATE_READ:
-	case MADV_POPULATE_WRITE:
-		return madvise_populate(vma, prev, start, end, behavior);
 	case MADV_NORMAL:
 		new_flags = new_flags & ~VM_RAND_READ & ~VM_SEQ_READ;
 		break;
@@ -1143,13 +1331,16 @@ static int madvise_vma_behavior(struct vm_area_struct *vma,
 		new_flags |= VM_WIPEONFORK;
 		break;
 	case MADV_KEEPONFORK:
+		if (vma->vm_flags & VM_DROPPABLE)
+			return -EINVAL;
 		new_flags &= ~VM_WIPEONFORK;
 		break;
 	case MADV_DONTDUMP:
 		new_flags |= VM_DONTDUMP;
 		break;
 	case MADV_DODUMP:
-		if (!is_vm_hugetlb_page(vma) && new_flags & VM_SPECIAL)
+		if ((!is_vm_hugetlb_page(vma) && new_flags & VM_SPECIAL) ||
+		    (vma->vm_flags & VM_DROPPABLE))
 			return -EINVAL;
 		new_flags &= ~VM_DONTDUMP;
 		break;
@@ -1167,6 +1358,10 @@ static int madvise_vma_behavior(struct vm_area_struct *vma,
 		break;
 	case MADV_COLLAPSE:
 		return madvise_collapse(vma, prev, start, end);
+	case MADV_GUARD_INSTALL:
+		return madvise_guard_install(vma, prev, start, end);
+	case MADV_GUARD_REMOVE:
+		return madvise_guard_remove(vma, prev, start, end);
 	}
 
 	anon_name = anon_vma_name(vma);
@@ -1222,7 +1417,7 @@ static int madvise_inject_error(int behavior,
 		} else {
 			pr_info("Injecting memory failure for pfn %#lx at process virtual address %#lx\n",
 				 pfn, start);
-			ret = memory_failure(pfn, MF_COUNT_INCREASED | MF_SW_SIMULATED);
+			ret = memory_failure(pfn, MF_ACTION_REQUIRED | MF_COUNT_INCREASED | MF_SW_SIMULATED);
 			if (ret == -EOPNOTSUPP)
 				ret = 0;
 		}
@@ -1266,6 +1461,8 @@ madvise_behavior_valid(int behavior)
 	case MADV_DODUMP:
 	case MADV_WIPEONFORK:
 	case MADV_KEEPONFORK:
+	case MADV_GUARD_INSTALL:
+	case MADV_GUARD_REMOVE:
 #ifdef CONFIG_MEMORY_FAILURE
 	case MADV_SOFT_OFFLINE:
 	case MADV_HWPOISON:
@@ -1357,6 +1554,7 @@ int madvise_walk_vmas(struct mm_struct *mm, unsigned long start,
 	if (madv_behavior && madv_behavior->lock_mode == MADVISE_VMA_READ_LOCK) {
 		vma = try_vma_read_lock(mm, madv_behavior, start, end);
 		if (vma) {
+			prev = vma;
 			error = visit(vma, &prev, start, end, arg);
 			vma_end_read(vma);
 			return error;
@@ -1420,7 +1618,6 @@ static int madvise_vma_anon_name(struct vm_area_struct *vma,
 	if (vma->vm_file && !vma_is_anon_shmem(vma))
 		return -EBADF;
 
-	trace_android_vh_update_vma_flags(vma);
 	error = madvise_update_vma(vma, prev, start, end, vma->vm_flags,
 				   anon_name);
 
@@ -1498,6 +1695,8 @@ static enum madvise_lock_mode get_lock_mode(struct madvise_behavior *madv_behavi
 	case MADV_POPULATE_READ:
 	case MADV_POPULATE_WRITE:
 	case MADV_COLLAPSE:
+	case MADV_GUARD_INSTALL:
+	case MADV_GUARD_REMOVE:
 		return MADVISE_MMAP_READ_LOCK;
 	case MADV_DONTNEED:
 	case MADV_DONTNEED_LOCKED:
@@ -1644,8 +1843,8 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 	int error;
 	size_t len;
 	struct blk_plug plug;
-	bool bypass = false;
 	struct madvise_behavior madv_behavior = {.behavior = behavior};
+	bool bypass = false;
 
 	if (!madvise_behavior_valid(behavior))
 		return -EINVAL;
@@ -1665,6 +1864,11 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 	if (end == start)
 		return 0;
 
+	trace_android_vh_mm_do_madvise_bypass(mm, start, len, behavior,
+					      &error, &bypass);
+	if (bypass)
+		return error;
+
 	error = madvise_lock(mm, &madv_behavior);
 	if (error)
 		return error;
@@ -1679,17 +1883,20 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 	}
 #endif
 
-	trace_android_vh_mm_do_madvise_bypass(mm, start, len, behavior,
-					      &error, &bypass);
-	if (bypass)
-		return error;
-
 	start = get_untagged_addr(mm, start);
 	end = start + len;
 
 	blk_start_plug(&plug);
-	error = madvise_walk_vmas(mm, start, end, &madv_behavior,
-			&madv_behavior, madvise_vma_behavior);
+	switch (behavior) {
+	case MADV_POPULATE_READ:
+	case MADV_POPULATE_WRITE:
+		error = madvise_populate(mm, start, end, behavior);
+		break;
+	default:
+		error = madvise_walk_vmas(mm, start, end, &madv_behavior,
+					  &madv_behavior, madvise_vma_behavior);
+		break;
+	}
 	blk_finish_plug(&plug);
 
 	madvise_unlock(mm, &madv_behavior);
@@ -1699,14 +1906,6 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 
 SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 {
-	bool bypass = false;
-	int ret;
-
-	trace_android_rvh_do_madvise_bypass(current->mm, start,
-			len_in, behavior, &ret, &bypass);
-	if (bypass)
-		return ret;
-
 	return do_madvise(current->mm, start, len_in, behavior);
 }
 
@@ -1774,6 +1973,23 @@ SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,
 			break;
 		ret = do_madvise(mm, (unsigned long)iter_iov_addr(&iter),
 					iter_iov_len(&iter), behavior);
+		/*
+		 * An madvise operation is attempting to restart the syscall,
+		 * but we cannot proceed as it would not be correct to repeat
+		 * the operation in aggregate, and would be surprising to the
+		 * user.
+		 *
+		 * As we have already dropped locks, it is safe to just loop and
+		 * try again. We check for fatal signals in case we need exit
+		 * early anyway.
+		 */
+		if (ret == -ERESTARTNOINTR) {
+			if (fatal_signal_pending(current)) {
+				ret = -EINTR;
+				break;
+			}
+			continue;
+		}
 		if (ret < 0)
 			break;
 		iov_iter_advance(&iter, iter_iov_len(&iter));

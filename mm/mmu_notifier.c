@@ -19,6 +19,8 @@
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 
+#include "vma.h"
+
 /* global SRCU for all MMs */
 DEFINE_STATIC_SRCU(srcu);
 
@@ -424,23 +426,6 @@ int __mmu_notifier_test_young(struct mm_struct *mm,
 	return young;
 }
 
-void __mmu_notifier_change_pte(struct mm_struct *mm, unsigned long address,
-			       pte_t pte)
-{
-	struct mmu_notifier *subscription;
-	int id;
-
-	id = srcu_read_lock(&srcu);
-	hlist_for_each_entry_rcu(subscription,
-				 &mm->notifier_subscriptions->list, hlist,
-				 srcu_read_lock_held(&srcu)) {
-		if (subscription->ops->change_pte)
-			subscription->ops->change_pte(subscription, mm, address,
-						      pte);
-	}
-	srcu_read_unlock(&srcu, id);
-}
-
 static int mn_itree_invalidate(struct mmu_notifier_subscriptions *subscriptions,
 			       const struct mmu_notifier_range *range)
 {
@@ -548,6 +533,7 @@ int __mmu_notifier_invalidate_range_start(struct mmu_notifier_range *range)
 		return mn_hlist_invalidate_range_start(subscriptions, range);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(__mmu_notifier_invalidate_range_start);
 
 static void
 mn_hlist_invalidate_end(struct mmu_notifier_subscriptions *subscriptions,
@@ -584,6 +570,7 @@ void __mmu_notifier_invalidate_range_end(struct mmu_notifier_range *range)
 		mn_hlist_invalidate_end(subscriptions, range);
 	lock_map_release(&__mmu_notifier_invalidate_range_start_map);
 }
+EXPORT_SYMBOL_GPL(__mmu_notifier_invalidate_range_end);
 
 void __mmu_notifier_arch_invalidate_secondary_tlbs(struct mm_struct *mm,
 					unsigned long start, unsigned long end)
@@ -602,6 +589,7 @@ void __mmu_notifier_arch_invalidate_secondary_tlbs(struct mm_struct *mm,
 	}
 	srcu_read_unlock(&srcu, id);
 }
+EXPORT_SYMBOL_GPL(__mmu_notifier_arch_invalidate_secondary_tlbs);
 
 /*
  * Same as mmu_notifier_register but here the caller must hold the mmap_lock in

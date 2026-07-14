@@ -8,7 +8,7 @@
  */
 
 /*
- * This allows printing both to /proc/sched_debug and
+ * This allows printing both to /sys/kernel/debug/sched/debug and
  * to the console
  */
 #define SEQ_printf(m, x...)			\
@@ -335,7 +335,163 @@ static const struct file_operations sched_debug_fops = {
 	.release	= seq_release,
 };
 
+enum dl_param {
+	DL_RUNTIME = 0,
+	DL_PERIOD,
+};
+
+static unsigned long fair_server_period_max = (1UL << 22) * NSEC_PER_USEC; /* ~4 seconds */
+static unsigned long fair_server_period_min = (100) * NSEC_PER_USEC;     /* 100 us */
+
+static ssize_t sched_fair_server_write(struct file *filp, const char __user *ubuf,
+				       size_t cnt, loff_t *ppos, enum dl_param param)
+{
+	long cpu = (long) ((struct seq_file *) filp->private_data)->private;
+	struct rq *rq = cpu_rq(cpu);
+	u64 runtime, period;
+	int retval = 0;
+	size_t err;
+	u64 value;
+
+	err = kstrtoull_from_user(ubuf, cnt, 10, &value);
+	if (err)
+		return err;
+
+	scoped_guard (rq_lock_irqsave, rq) {
+		runtime  = rq->fair_server.dl_runtime;
+		period = rq->fair_server.dl_period;
+
+		switch (param) {
+		case DL_RUNTIME:
+			if (runtime == value)
+				break;
+			runtime = value;
+			break;
+		case DL_PERIOD:
+			if (value == period)
+				break;
+			period = value;
+			break;
+		}
+
+		if (runtime > period ||
+		    period > fair_server_period_max ||
+		    period < fair_server_period_min) {
+			return  -EINVAL;
+		}
+
+		update_rq_clock(rq);
+		dl_server_stop(&rq->fair_server);
+
+		retval = dl_server_apply_params(&rq->fair_server, runtime, period, 0);
+
+		if (!runtime)
+			printk_deferred("Fair server disabled in CPU %d, system may crash due to starvation.\n",
+					cpu_of(rq));
+
+		if (rq->cfs.h_nr_queued)
+			dl_server_start(&rq->fair_server);
+
+		if (retval < 0)
+			return retval;
+	}
+
+	*ppos += cnt;
+	return cnt;
+}
+
+static size_t sched_fair_server_show(struct seq_file *m, void *v, enum dl_param param)
+{
+	unsigned long cpu = (unsigned long) m->private;
+	struct rq *rq = cpu_rq(cpu);
+	u64 value;
+
+	switch (param) {
+	case DL_RUNTIME:
+		value = rq->fair_server.dl_runtime;
+		break;
+	case DL_PERIOD:
+		value = rq->fair_server.dl_period;
+		break;
+	}
+
+	seq_printf(m, "%llu\n", value);
+	return 0;
+
+}
+
+static ssize_t
+sched_fair_server_runtime_write(struct file *filp, const char __user *ubuf,
+				size_t cnt, loff_t *ppos)
+{
+	return sched_fair_server_write(filp, ubuf, cnt, ppos, DL_RUNTIME);
+}
+
+static int sched_fair_server_runtime_show(struct seq_file *m, void *v)
+{
+	return sched_fair_server_show(m, v, DL_RUNTIME);
+}
+
+static int sched_fair_server_runtime_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, sched_fair_server_runtime_show, inode->i_private);
+}
+
+static const struct file_operations fair_server_runtime_fops = {
+	.open		= sched_fair_server_runtime_open,
+	.write		= sched_fair_server_runtime_write,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static ssize_t
+sched_fair_server_period_write(struct file *filp, const char __user *ubuf,
+			       size_t cnt, loff_t *ppos)
+{
+	return sched_fair_server_write(filp, ubuf, cnt, ppos, DL_PERIOD);
+}
+
+static int sched_fair_server_period_show(struct seq_file *m, void *v)
+{
+	return sched_fair_server_show(m, v, DL_PERIOD);
+}
+
+static int sched_fair_server_period_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, sched_fair_server_period_show, inode->i_private);
+}
+
+static const struct file_operations fair_server_period_fops = {
+	.open		= sched_fair_server_period_open,
+	.write		= sched_fair_server_period_write,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static struct dentry *debugfs_sched;
+
+static void debugfs_fair_server_init(void)
+{
+	struct dentry *d_fair;
+	unsigned long cpu;
+
+	d_fair = debugfs_create_dir("fair_server", debugfs_sched);
+	if (!d_fair)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct dentry *d_cpu;
+		char buf[32];
+
+		snprintf(buf, sizeof(buf), "cpu%lu", cpu);
+		d_cpu = debugfs_create_dir(buf, d_fair);
+
+		debugfs_create_file("runtime", 0644, d_cpu, (void *) cpu, &fair_server_runtime_fops);
+		debugfs_create_file("period", 0644, d_cpu, (void *) cpu, &fair_server_period_fops);
+	}
+}
 
 static __init int sched_init_debug(void)
 {
@@ -376,9 +532,8 @@ static __init int sched_init_debug(void)
 
 	debugfs_create_file("debug", 0444, debugfs_sched, NULL, &sched_debug_fops);
 
-#ifdef CONFIG_HMBIRD_SCHED
-	debugfs_create_file("hmbird", 0444, debugfs_sched, NULL, &sched_hmbird_fops);
-#endif
+	debugfs_fair_server_init();
+
 	return 0;
 }
 late_initcall(sched_init_debug);
@@ -430,6 +585,7 @@ static void register_sd(struct sched_domain *sd, struct dentry *parent)
 
 	debugfs_create_file("flags", 0444, parent, &sd->flags, &sd_flags_fops);
 	debugfs_create_file("groups_flags", 0444, parent, &sd->groups->flags, &sd_flags_fops);
+	debugfs_create_u32("level", 0444, parent, (u32 *)&sd->level);
 }
 
 void update_sched_domain_debugfs(void)
@@ -584,27 +740,27 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
 	else
 		SEQ_printf(m, " %c", task_state_to_char(p));
 
-	SEQ_printf(m, "%15s %5d %9Ld.%06ld %c %9Ld.%06ld %9Ld.%06ld %9Ld.%06ld %9Ld %5d ",
+	SEQ_printf(m, " %15s %5d %9Ld.%06ld   %c   %9Ld.%06ld %c %9Ld.%06ld %9Ld.%06ld %9Ld   %5d ",
 		p->comm, task_pid_nr(p),
 		SPLIT_NS(p->se.vruntime),
 		entity_eligible(cfs_rq_of(&p->se), &p->se) ? 'E' : 'N',
 		SPLIT_NS(p->se.deadline),
+		p->se.custom_slice ? 'S' : ' ',
 		SPLIT_NS(p->se.slice),
 		SPLIT_NS(p->se.sum_exec_runtime),
 		(long long)(p->nvcsw + p->nivcsw),
 		p->prio);
 
-	SEQ_printf(m, "%9lld.%06ld %9lld.%06ld %9lld.%06ld %9lld.%06ld",
+	SEQ_printf(m, "%9lld.%06ld %9lld.%06ld %9lld.%06ld",
 		SPLIT_NS(schedstat_val_or_zero(p->stats.wait_sum)),
-		SPLIT_NS(p->se.sum_exec_runtime),
 		SPLIT_NS(schedstat_val_or_zero(p->stats.sum_sleep_runtime)),
 		SPLIT_NS(schedstat_val_or_zero(p->stats.sum_block_runtime)));
 
 #ifdef CONFIG_NUMA_BALANCING
-	SEQ_printf(m, " %d %d", task_node(p), task_numa_group_id(p));
+	SEQ_printf(m, "   %d      %d", task_node(p), task_numa_group_id(p));
 #endif
 #ifdef CONFIG_CGROUP_SCHED
-	SEQ_printf_task_group_path(m, task_group(p), " %s")
+	SEQ_printf_task_group_path(m, task_group(p), "        %s")
 #endif
 
 	SEQ_printf(m, "\n");
@@ -616,10 +772,26 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 
 	SEQ_printf(m, "\n");
 	SEQ_printf(m, "runnable tasks:\n");
-	SEQ_printf(m, " S            task   PID         tree-key  switches  prio"
-		   "     wait-time             sum-exec        sum-sleep\n");
+	SEQ_printf(m, " S            task   PID       vruntime   eligible    "
+		   "deadline             slice          sum-exec      switches  "
+		   "prio         wait-time        sum-sleep       sum-block"
+#ifdef CONFIG_NUMA_BALANCING
+		   "  node   group-id"
+#endif
+#ifdef CONFIG_CGROUP_SCHED
+		   "  group-path"
+#endif
+		   "\n");
 	SEQ_printf(m, "-------------------------------------------------------"
-		   "------------------------------------------------------\n");
+		   "------------------------------------------------------"
+		   "------------------------------------------------------"
+#ifdef CONFIG_NUMA_BALANCING
+		   "--------------"
+#endif
+#ifdef CONFIG_CGROUP_SCHED
+		   "--------------"
+#endif
+		   "\n");
 
 	rcu_read_lock();
 	for_each_process_thread(g, p) {
@@ -633,7 +805,8 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 
 void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 {
-	s64 left_vruntime = -1, min_vruntime, right_vruntime = -1, left_deadline = -1, spread;
+	s64 left_vruntime = -1, zero_vruntime, right_vruntime = -1, left_deadline = -1, spread;
+	u64 avruntime;
 	struct sched_entity *last, *first, *root;
 	struct rq *rq = cpu_rq(cpu);
 	unsigned long flags;
@@ -645,8 +818,6 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 	SEQ_printf(m, "\n");
 	SEQ_printf(m, "cfs_rq[%d]:\n", cpu);
 #endif
-	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "exec_clock",
-			SPLIT_NS(cfs_rq->exec_clock));
 
 	raw_spin_rq_lock_irqsave(rq, flags);
 	root = __pick_root_entity(cfs_rq);
@@ -658,25 +829,26 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 	last = __pick_last_entity(cfs_rq);
 	if (last)
 		right_vruntime = last->vruntime;
-	min_vruntime = cfs_rq->min_vruntime;
+	zero_vruntime = cfs_rq->zero_vruntime;
+	avruntime = avg_vruntime(cfs_rq);
 	raw_spin_rq_unlock_irqrestore(rq, flags);
 
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "left_deadline",
 			SPLIT_NS(left_deadline));
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "left_vruntime",
 			SPLIT_NS(left_vruntime));
-	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "min_vruntime",
-			SPLIT_NS(min_vruntime));
+	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "zero_vruntime",
+			SPLIT_NS(zero_vruntime));
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "avg_vruntime",
-			SPLIT_NS(avg_vruntime(cfs_rq)));
+			SPLIT_NS(avruntime));
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "right_vruntime",
 			SPLIT_NS(right_vruntime));
 	spread = right_vruntime - left_vruntime;
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "spread", SPLIT_NS(spread));
-	SEQ_printf(m, "  .%-30s: %d\n", "nr_spread_over",
-			cfs_rq->nr_spread_over);
 	SEQ_printf(m, "  .%-30s: %d\n", "nr_running", cfs_rq->nr_running);
-	SEQ_printf(m, "  .%-30s: %d\n", "h_nr_running", cfs_rq->h_nr_running);
+	SEQ_printf(m, "  .%-30s: %d\n", "h_nr_runnable", cfs_rq->h_nr_runnable);
+	SEQ_printf(m, "  .%-30s: %d\n", "h_nr_queued", cfs_rq->h_nr_queued);
+	SEQ_printf(m, "  .%-30s: %d\n", "h_nr_delayed", cfs_rq->h_nr_delayed);
 	SEQ_printf(m, "  .%-30s: %d\n", "idle_nr_running",
 			cfs_rq->idle_nr_running);
 	SEQ_printf(m, "  .%-30s: %d\n", "idle_h_nr_running",
@@ -734,12 +906,12 @@ void print_rt_rq(struct seq_file *m, int cpu, struct rt_rq *rt_rq)
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", #x, SPLIT_NS(rt_rq->x))
 
 	PU(rt_nr_running);
-#ifdef CONFIG_SMP
-	PU(rt_nr_migratory);
-#endif
+
+#ifdef CONFIG_RT_GROUP_SCHED
 	P(rt_throttled);
 	PN(rt_time);
 	PN(rt_runtime);
+#endif
 
 #undef PN
 #undef PU
@@ -758,7 +930,6 @@ void print_dl_rq(struct seq_file *m, int cpu, struct dl_rq *dl_rq)
 
 	PU(dl_nr_running);
 #ifdef CONFIG_SMP
-	PU(dl_nr_migratory);
 	dl_bw = &cpu_rq(cpu)->rd->dl_bw;
 #else
 	dl_bw = &dl_rq->dl_bw;
@@ -1101,10 +1272,8 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 	} else if (fair_policy(p->policy)) {
 		P(se.slice);
 	}
-#ifdef CONFIG_HMBIRD_SCHED
-	__PS("hmbird.enabled", p->sched_class == &hmbird_sched_class);
-	__PS("sched_prop", get_hmbird_ts(p)->sched_prop);
-	__PS("top_task_prop", get_hmbird_ts(p)->top_task_prop);
+#ifdef CONFIG_SCHED_CLASS_EXT
+	__PS("ext.enabled", task_on_scx(p));
 #endif
 #undef PN_SCHEDSTAT
 #undef P_SCHEDSTAT

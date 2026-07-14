@@ -10,7 +10,7 @@
 #include "oplock.h"
 
 #include "smb_common.h"
-#include "smbstatus.h"
+#include "../common/smb2status.h"
 #include "connection.h"
 #include "mgmt/user_session.h"
 #include "mgmt/share_config.h"
@@ -34,7 +34,7 @@ static struct oplock_info *alloc_opinfo(struct ksmbd_work *work,
 	struct ksmbd_session *sess = work->sess;
 	struct oplock_info *opinfo;
 
-	opinfo = kzalloc(sizeof(struct oplock_info), GFP_KERNEL);
+	opinfo = kzalloc(sizeof(struct oplock_info), KSMBD_DEFAULT_GFP);
 	if (!opinfo)
 		return NULL;
 
@@ -86,7 +86,7 @@ static struct lease_table *alloc_lease_table(struct oplock_info *opinfo)
 {
 	struct lease_table *lb;
 
-	lb = kmalloc(sizeof(struct lease_table), GFP_KERNEL);
+	lb = kmalloc(sizeof(struct lease_table), KSMBD_DEFAULT_GFP);
 	if (!lb)
 		return NULL;
 
@@ -101,7 +101,7 @@ static int alloc_lease(struct oplock_info *opinfo, struct lease_ctx_info *lctx)
 {
 	struct lease *lease;
 
-	lease = kmalloc(sizeof(struct lease), GFP_KERNEL);
+	lease = kmalloc(sizeof(struct lease), KSMBD_DEFAULT_GFP);
 	if (!lease)
 		return -ENOMEM;
 
@@ -484,12 +484,8 @@ static inline int compare_guid_key(struct oplock_info *opinfo,
 				   const char *guid1, const char *key1)
 {
 	const char *guid2, *key2;
-	struct ksmbd_conn *conn;
 
-	conn = READ_ONCE(opinfo->conn);
-	if (!conn)
-		return 0;
-	guid2 = conn->ClientGUID;
+	guid2 = opinfo->conn->ClientGUID;
 	key2 = opinfo->o_lease->lease_key;
 	if (!memcmp(guid1, guid2, SMB2_CLIENT_GUID_SIZE) &&
 	    !memcmp(key1, key2, SMB2_LEASE_KEY_SIZE))
@@ -722,7 +718,7 @@ static int smb2_oplock_break_noti(struct oplock_info *opinfo)
 	if (!work)
 		return -ENOMEM;
 
-	br_info = kmalloc(sizeof(struct oplock_break_info), GFP_KERNEL);
+	br_info = kmalloc(sizeof(struct oplock_break_info), KSMBD_DEFAULT_GFP);
 	if (!br_info) {
 		ksmbd_free_work_struct(work);
 		return -ENOMEM;
@@ -812,7 +808,7 @@ out:
 /**
  * smb2_lease_break_noti() - break lease when a new client request
  *			write lease
- * @opinfo:		conains lease state information
+ * @opinfo:		contains lease state information
  *
  * Return:	0 on success, otherwise error
  */
@@ -827,7 +823,7 @@ static int smb2_lease_break_noti(struct oplock_info *opinfo)
 	if (!work)
 		return -ENOMEM;
 
-	br_info = kmalloc(sizeof(struct lease_break_info), GFP_KERNEL);
+	br_info = kmalloc(sizeof(struct lease_break_info), KSMBD_DEFAULT_GFP);
 	if (!br_info) {
 		ksmbd_free_work_struct(work);
 		return -ENOMEM;
@@ -1513,7 +1509,7 @@ void create_lease_buf(u8 *rbuf, struct lease *lease)
 }
 
 /**
- * parse_lease_state() - parse lease context containted in file open request
+ * parse_lease_state() - parse lease context contained in file open request
  * @open_req:	buffer containing smb2 file open(create) request
  *
  * Return: allocated lease context object on success, otherwise NULL
@@ -1528,7 +1524,7 @@ struct lease_ctx_info *parse_lease_state(void *open_req)
 	if (IS_ERR_OR_NULL(cc))
 		return NULL;
 
-	lreq = kzalloc(sizeof(struct lease_ctx_info), GFP_KERNEL);
+	lreq = kzalloc(sizeof(struct lease_ctx_info), KSMBD_DEFAULT_GFP);
 	if (!lreq)
 		return NULL;
 
@@ -1845,7 +1841,6 @@ int smb2_check_durable_oplock(struct ksmbd_conn *conn,
 			      struct ksmbd_share_config *share,
 			      struct ksmbd_file *fp,
 			      struct lease_ctx_info *lctx,
-			      struct ksmbd_user *user,
 			      char *name)
 {
 	struct oplock_info *opinfo = opinfo_get(fp);
@@ -1853,12 +1848,6 @@ int smb2_check_durable_oplock(struct ksmbd_conn *conn,
 
 	if (!opinfo)
 		return 0;
-
-	if (ksmbd_vfs_compare_durable_owner(fp, user) == false) {
-		ksmbd_debug(SMB, "Durable handle reconnect failed: owner mismatch\n");
-		ret = -EBADF;
-		goto out;
-	}
 
 	if (opinfo->is_lease == false) {
 		if (lctx) {

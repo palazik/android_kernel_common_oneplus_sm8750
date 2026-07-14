@@ -348,7 +348,7 @@ static int qoriq_tmu_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int __maybe_unused qoriq_tmu_suspend(struct device *dev)
+static int qoriq_tmu_suspend(struct device *dev)
 {
 	struct qoriq_tmu_data *data = dev_get_drvdata(dev);
 	int ret;
@@ -368,7 +368,7 @@ static int __maybe_unused qoriq_tmu_suspend(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused qoriq_tmu_resume(struct device *dev)
+static int qoriq_tmu_resume(struct device *dev)
 {
 	int ret;
 	struct qoriq_tmu_data *data = dev_get_drvdata(dev);
@@ -387,8 +387,8 @@ static int __maybe_unused qoriq_tmu_resume(struct device *dev)
 	return regmap_update_bits(data->regmap, REGS_TMR, TMR_ME, TMR_ME);
 }
 
-static SIMPLE_DEV_PM_OPS(qoriq_tmu_pm_ops,
-			 qoriq_tmu_suspend, qoriq_tmu_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(qoriq_tmu_pm_ops,
+				qoriq_tmu_suspend, qoriq_tmu_resume);
 
 static const struct of_device_id qoriq_tmu_match[] = {
 	{ .compatible = "fsl,qoriq-tmu", },
@@ -400,7 +400,7 @@ MODULE_DEVICE_TABLE(of, qoriq_tmu_match);
 static struct platform_driver qoriq_tmu = {
 	.driver	= {
 		.name		= "qoriq_thermal",
-		.pm		= &qoriq_tmu_pm_ops,
+		.pm		= pm_sleep_ptr(&qoriq_tmu_pm_ops),
 		.of_match_table	= qoriq_tmu_match,
 	},
 	.probe	= qoriq_tmu_probe,

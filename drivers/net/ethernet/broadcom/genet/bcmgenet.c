@@ -37,7 +37,7 @@
 #include <linux/phy.h>
 #include <linux/platform_data/bcmgenet.h>
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include "bcmgenet.h"
 
@@ -1299,8 +1299,7 @@ static void bcmgenet_get_ethtool_stats(struct net_device *dev,
 	}
 }
 
-void bcmgenet_eee_enable_set(struct net_device *dev, bool enable,
-			     bool tx_lpi_enabled)
+void bcmgenet_eee_enable_set(struct net_device *dev, bool enable)
 {
 	struct bcmgenet_priv *priv = netdev_priv(dev);
 	u32 off = priv->hw_params->tbuf_offset + TBUF_ENERGY_CTRL;
@@ -1320,33 +1319,31 @@ void bcmgenet_eee_enable_set(struct net_device *dev, bool enable,
 
 	/* Enable EEE and switch to a 27Mhz clock automatically */
 	reg = bcmgenet_readl(priv->base + off);
-	if (tx_lpi_enabled)
+	if (enable)
 		reg |= TBUF_EEE_EN | TBUF_PM_EN;
 	else
 		reg &= ~(TBUF_EEE_EN | TBUF_PM_EN);
 	bcmgenet_writel(reg, priv->base + off);
 
-	/* RBUF EEE/PM can break the RX path on GENET. Keep it disabled. */
+	/* Do the same for thing for RBUF */
 	reg = bcmgenet_rbuf_readl(priv, RBUF_ENERGY_CTRL);
-	if (reg & (RBUF_EEE_EN | RBUF_PM_EN)) {
+	if (enable)
+		reg |= RBUF_EEE_EN | RBUF_PM_EN;
+	else
 		reg &= ~(RBUF_EEE_EN | RBUF_PM_EN);
-		bcmgenet_rbuf_writel(priv, reg, RBUF_ENERGY_CTRL);
-	}
+	bcmgenet_rbuf_writel(priv, reg, RBUF_ENERGY_CTRL);
 
 	if (!enable && priv->clk_eee_enabled) {
 		clk_disable_unprepare(priv->clk_eee);
 		priv->clk_eee_enabled = false;
 	}
 
-	priv->eee.eee_enabled = enable;
-	priv->eee.eee_active = enable;
-	priv->eee.tx_lpi_enabled = tx_lpi_enabled;
 }
 
-static int bcmgenet_get_eee(struct net_device *dev, struct ethtool_eee *e)
+static int bcmgenet_get_eee(struct net_device *dev, struct ethtool_keee *e)
 {
 	struct bcmgenet_priv *priv = netdev_priv(dev);
-	struct ethtool_eee *p = &priv->eee;
+	int ret;
 
 	if (GENET_IS_V1(priv))
 		return -EOPNOTSUPP;
@@ -1354,18 +1351,21 @@ static int bcmgenet_get_eee(struct net_device *dev, struct ethtool_eee *e)
 	if (!dev->phydev)
 		return -ENODEV;
 
-	e->eee_enabled = p->eee_enabled;
-	e->eee_active = p->eee_active;
-	e->tx_lpi_enabled = p->tx_lpi_enabled;
+	ret = phy_ethtool_get_eee(dev->phydev, e);
+	if (ret)
+		return ret;
+
+	/* tx_lpi_timer is maintained by the MAC hardware register; the
+	 * PHY-level eee_cfg timer is not set for GENET.
+	 */
 	e->tx_lpi_timer = bcmgenet_umac_readl(priv, UMAC_EEE_LPI_TIMER);
 
-	return phy_ethtool_get_eee(dev->phydev, e);
+	return 0;
 }
 
-static int bcmgenet_set_eee(struct net_device *dev, struct ethtool_eee *e)
+static int bcmgenet_set_eee(struct net_device *dev, struct ethtool_keee *e)
 {
 	struct bcmgenet_priv *priv = netdev_priv(dev);
-	struct ethtool_eee *p = &priv->eee;
 
 	if (GENET_IS_V1(priv))
 		return -EOPNOTSUPP;
@@ -1373,15 +1373,7 @@ static int bcmgenet_set_eee(struct net_device *dev, struct ethtool_eee *e)
 	if (!dev->phydev)
 		return -ENODEV;
 
-	p->eee_enabled = e->eee_enabled;
-
-	if (!p->eee_enabled) {
-		bcmgenet_eee_enable_set(dev, false, false);
-	} else {
-		p->eee_active = phy_init_eee(dev->phydev, false) >= 0;
-		bcmgenet_umac_writel(priv, e->tx_lpi_timer, UMAC_EEE_LPI_TIMER);
-		bcmgenet_eee_enable_set(dev, p->eee_active, e->tx_lpi_enabled);
-	}
+	bcmgenet_umac_writel(priv, e->tx_lpi_timer, UMAC_EEE_LPI_TIMER);
 
 	return phy_ethtool_set_eee(dev->phydev, e);
 }
@@ -1941,7 +1933,6 @@ static unsigned int bcmgenet_tx_reclaim(struct net_device *dev,
 		drop = (ring->prod_index - ring->c_index) & DMA_C_INDEX_MASK;
 		released += drop;
 		ring->prod_index = ring->c_index & DMA_C_INDEX_MASK;
-		ring->free_bds += drop;
 		while (drop--) {
 			cb_ptr = bcmgenet_put_txcb(priv, ring);
 			skb = cb_ptr->skb;
@@ -1953,7 +1944,6 @@ static unsigned int bcmgenet_tx_reclaim(struct net_device *dev,
 		}
 		if (skb)
 			dev_consume_skb_any(skb);
-		netdev_tx_reset_queue(netdev_get_tx_queue(dev, ring->index));
 		bcmgenet_tdma_ring_writel(priv, ring->index,
 					  ring->prod_index, TDMA_PROD_INDEX);
 		wr_ptr = ring->write_ptr * WORDS_PER_BD(priv);
@@ -4085,12 +4075,6 @@ static int bcmgenet_probe(struct platform_device *pdev)
 	for (i = 0; i <= priv->hw_params->rx_queues; i++)
 		priv->rx_rings[i].rx_max_coalesced_frames = 1;
 
-	/* Initialize u64 stats seq counter for 32bit machines */
-	for (i = 0; i <= priv->hw_params->rx_queues; i++)
-		u64_stats_init(&priv->rx_rings[i].stats64.syncp);
-	for (i = 0; i <= priv->hw_params->tx_queues; i++)
-		u64_stats_init(&priv->tx_rings[i].stats64.syncp);
-
 	/* libphy will determine the link state */
 	netif_carrier_off(dev);
 
@@ -4112,7 +4096,7 @@ err:
 	return err;
 }
 
-static int bcmgenet_remove(struct platform_device *pdev)
+static void bcmgenet_remove(struct platform_device *pdev)
 {
 	struct bcmgenet_priv *priv = dev_to_priv(&pdev->dev);
 
@@ -4120,8 +4104,6 @@ static int bcmgenet_remove(struct platform_device *pdev)
 	unregister_netdev(priv->dev);
 	bcmgenet_mii_exit(priv->dev);
 	free_netdev(priv->dev);
-
-	return 0;
 }
 
 static void bcmgenet_shutdown(struct platform_device *pdev)
@@ -4299,7 +4281,7 @@ MODULE_DEVICE_TABLE(acpi, genet_acpi_match);
 
 static struct platform_driver bcmgenet_driver = {
 	.probe	= bcmgenet_probe,
-	.remove	= bcmgenet_remove,
+	.remove_new = bcmgenet_remove,
 	.shutdown = bcmgenet_shutdown,
 	.driver	= {
 		.name	= "bcmgenet",

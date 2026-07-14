@@ -213,11 +213,25 @@ static inline bool userfaultfd_armed(struct vm_area_struct *vma)
 }
 
 static inline bool vma_can_userfault(struct vm_area_struct *vma,
-				     unsigned long vm_flags)
+				     unsigned long vm_flags,
+				     bool wp_async)
 {
+	vm_flags &= __VM_UFFD_FLAGS;
+
+	if (vm_flags & VM_DROPPABLE)
+		return false;
+
 	if ((vm_flags & VM_UFFD_MINOR) &&
 	    (!is_vm_hugetlb_page(vma) && !vma_is_shmem(vma)))
 		return false;
+
+	/*
+	 * If wp async enabled, and WP is the only mode enabled, allow any
+	 * memory type.
+	 */
+	if (wp_async && (vm_flags == VM_UFFD_WP))
+		return true;
+
 #ifndef CONFIG_PTE_MARKER_UFFD_WP
 	/*
 	 * If user requested uffd-wp but not enabled pte markers for
@@ -227,8 +241,17 @@ static inline bool vma_can_userfault(struct vm_area_struct *vma,
 	if ((vm_flags & VM_UFFD_WP) && !vma_is_anonymous(vma))
 		return false;
 #endif
+
+	/* By default, allow any of anon|shmem|hugetlb */
 	return vma_is_anonymous(vma) || is_vm_hugetlb_page(vma) ||
 	    vma_is_shmem(vma);
+}
+
+static inline bool vma_has_uffd_without_event_remap(struct vm_area_struct *vma)
+{
+	struct userfaultfd_ctx *uffd_ctx = vma->vm_userfaultfd_ctx.ctx;
+
+	return uffd_ctx && (uffd_ctx->features & UFFD_FEATURE_EVENT_REMAP) == 0;
 }
 
 extern int dup_userfaultfd(struct vm_area_struct *, struct list_head *);
@@ -250,6 +273,26 @@ extern int userfaultfd_unmap_prep(struct vm_area_struct *vma,
 extern void userfaultfd_unmap_complete(struct mm_struct *mm,
 				       struct list_head *uf);
 extern bool userfaultfd_wp_unpopulated(struct vm_area_struct *vma);
+extern bool userfaultfd_wp_async(struct vm_area_struct *vma);
+
+void userfaultfd_reset_ctx(struct vm_area_struct *vma);
+
+struct vm_area_struct *userfaultfd_clear_vma(struct vma_iterator *vmi,
+					     struct vm_area_struct *prev,
+					     struct vm_area_struct *vma,
+					     unsigned long start,
+					     unsigned long end);
+
+int userfaultfd_register_range(struct userfaultfd_ctx *ctx,
+			       struct vm_area_struct *vma,
+			       unsigned long vm_flags,
+			       unsigned long start, unsigned long end,
+			       bool wp_async);
+
+void userfaultfd_release_new(struct userfaultfd_ctx *ctx);
+
+void userfaultfd_release_all(struct mm_struct *mm,
+			     struct userfaultfd_ctx *ctx);
 
 #else /* CONFIG_USERFAULTFD */
 
@@ -258,6 +301,13 @@ static inline vm_fault_t handle_userfault(struct vm_fault *vmf,
 				unsigned long reason)
 {
 	return VM_FAULT_SIGBUS;
+}
+
+static inline long uffd_wp_range(struct vm_area_struct *vma,
+				 unsigned long start, unsigned long len,
+				 bool enable_wp)
+{
+	return false;
 }
 
 static inline bool is_mergeable_vm_userfaultfd_ctx(struct vm_area_struct *vma,
@@ -350,6 +400,16 @@ static inline bool uffd_disable_fault_around(struct vm_area_struct *vma)
 }
 
 static inline bool userfaultfd_wp_unpopulated(struct vm_area_struct *vma)
+{
+	return false;
+}
+
+static inline bool userfaultfd_wp_async(struct vm_area_struct *vma)
+{
+	return false;
+}
+
+static inline bool vma_has_uffd_without_event_remap(struct vm_area_struct *vma)
 {
 	return false;
 }

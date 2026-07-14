@@ -1,26 +1,48 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
-#ifndef _UAPI_TRACE_MMAP_H_
-#define _UAPI_TRACE_MMAP_H_
+#ifndef _TRACE_MMAP_H_
+#define _TRACE_MMAP_H_
 
 #include <linux/types.h>
 
-struct ring_buffer_meta {
-	unsigned long	entries;
-	unsigned long	overrun;
-	unsigned long	read;
-
-	unsigned long	pages_touched;
-	unsigned long	pages_lost;
-	unsigned long	pages_read;
-
+/**
+ * struct trace_buffer_meta - Ring-buffer Meta-page description
+ * @meta_page_size:	Size of this meta-page.
+ * @meta_struct_len:	Size of this structure.
+ * @subbuf_size:	Size of each sub-buffer.
+ * @nr_subbufs:		Number of subbfs in the ring-buffer, including the reader.
+ * @reader.lost_events:	Number of events lost at the time of the reader swap.
+ * @reader.id:		subbuf ID of the current reader. ID range [0 : @nr_subbufs - 1]
+ * @reader.read:	Number of bytes read on the reader subbuf.
+ * @flags:		Placeholder for now, 0 until new features are supported.
+ * @entries:		Number of entries in the ring-buffer.
+ * @overrun:		Number of entries lost in the ring-buffer.
+ * @read:		Number of entries that have been read.
+ * @Reserved1:		Internal use only.
+ * @Reserved2:		Internal use only.
+ */
+struct trace_buffer_meta {
 	__u32		meta_page_size;
-	__u32		nr_data_pages;	/* Number of pages in the ring-buffer */
+	__u32		meta_struct_len;
 
-	struct reader_page {
-		__u32	id;		/* Reader page ID from 0 to nr_data_pages - 1 */
-		__u32	read;		/* Number of bytes read on the reader page */
-		unsigned long	lost_events; /* Events lost at the time of the reader swap */
-	} reader_page;
+	__u32		subbuf_size;
+	__u32		nr_subbufs;
+
+	struct {
+		__u64	lost_events;
+		__u32	id;
+		__u32	read;
+	} reader;
+
+	__u64	flags;
+
+	__u64	entries;
+	__u64	overrun;
+	__u64	read;
+
+	__u64	Reserved1;
+	__u64	Reserved2;
 };
 
-#endif /* _UAPI_TRACE_MMAP_H_ */
+#define TRACE_MMAP_IOCTL_GET_READER		_IO('R', 0x20)
+
+#endif /* _TRACE_MMAP_H_ */

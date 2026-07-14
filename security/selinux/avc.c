@@ -30,14 +30,13 @@
 #include "avc.h"
 #include "avc_ss.h"
 #include "classmap.h"
-#include "hash.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/avc.h>
 
-#define AVC_CACHE_SLOTS		(1 << CONFIG_SECURITY_SELINUX_AVC_HASH_BITS)
-#define AVC_DEF_CACHE_THRESHOLD	AVC_CACHE_SLOTS
-#define AVC_CACHE_RECLAIM	16
+#define AVC_CACHE_SLOTS			512
+#define AVC_DEF_CACHE_THRESHOLD		512
+#define AVC_CACHE_RECLAIM		16
 
 #ifdef CONFIG_SECURITY_SELINUX_AVC_STATS
 #define avc_cache_stats_incr(field)	this_cpu_inc(avc_cache_stats.field)
@@ -128,7 +127,7 @@ static struct kmem_cache *avc_xperms_cachep __ro_after_init;
 
 static inline u32 avc_hash(u32 ssid, u32 tsid, u16 tclass)
 {
-	return av_hash(ssid, tsid, (u32)tclass, (u32)(AVC_CACHE_SLOTS - 1));
+	return (ssid ^ (tsid<<2) ^ (tclass<<4)) & (AVC_CACHE_SLOTS - 1);
 }
 
 /**
@@ -138,18 +137,10 @@ static inline u32 avc_hash(u32 ssid, u32 tsid, u16 tclass)
  */
 void __init avc_init(void)
 {
-	avc_node_cachep = kmem_cache_create("avc_node", sizeof(struct avc_node),
-					0, SLAB_PANIC, NULL);
-	avc_xperms_cachep = kmem_cache_create("avc_xperms_node",
-					sizeof(struct avc_xperms_node),
-					0, SLAB_PANIC, NULL);
-	avc_xperms_decision_cachep = kmem_cache_create(
-					"avc_xperms_decision_node",
-					sizeof(struct avc_xperms_decision_node),
-					0, SLAB_PANIC, NULL);
-	avc_xperms_data_cachep = kmem_cache_create("avc_xperms_data",
-					sizeof(struct extended_perms_data),
-					0, SLAB_PANIC, NULL);
+	avc_node_cachep = KMEM_CACHE(avc_node, SLAB_PANIC);
+	avc_xperms_cachep = KMEM_CACHE(avc_xperms_node, SLAB_PANIC);
+	avc_xperms_decision_cachep = KMEM_CACHE(avc_xperms_decision_node, SLAB_PANIC);
+	avc_xperms_data_cachep = KMEM_CACHE(extended_perms_data, SLAB_PANIC);
 }
 
 int avc_get_hash_stats(char *page)
@@ -400,7 +391,7 @@ static inline u32 avc_xperms_audit_required(u32 requested,
 		audited = denied & avd->auditdeny;
 		if (audited && xpd) {
 			if (avc_xperms_has_perm(xpd, perm, XPERMS_DONTAUDIT))
-				audited &= ~requested;
+				audited = 0;
 		}
 	} else if (result) {
 		audited = denied = requested;
@@ -408,7 +399,7 @@ static inline u32 avc_xperms_audit_required(u32 requested,
 		audited = requested & avd->auditallow;
 		if (audited && xpd) {
 			if (!avc_xperms_has_perm(xpd, perm, XPERMS_AUDITALLOW))
-				audited &= ~requested;
+				audited = 0;
 		}
 	}
 

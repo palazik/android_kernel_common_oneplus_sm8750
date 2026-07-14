@@ -223,6 +223,10 @@ struct snd_usb_platform_ops {
 	void (*resume_cb)(struct usb_interface *intf);
 };
 
+struct snd_usb_stream *
+snd_usb_find_suppported_substream(int card_idx, struct snd_pcm_hw_params *params,
+				  int direction);
+
 int snd_usb_register_platform_ops(struct snd_usb_platform_ops *ops);
 int snd_usb_unregister_platform_ops(void);
 #endif /* __USBAUDIO_CARD_H */

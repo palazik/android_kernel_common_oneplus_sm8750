@@ -18,11 +18,15 @@
  * VMALLOC range.
  *
  * VMALLOC_START: beginning of the kernel vmalloc space
- * VMALLOC_END: extends to the available space below vmemmap, PCI I/O space
- *	and fixed mappings
+ * VMALLOC_END: extends to the available space below vmemmap
  */
 #define VMALLOC_START		(MODULES_END)
-#define VMALLOC_END		(VMEMMAP_START - SZ_256M)
+#if VA_BITS == VA_BITS_MIN
+#define VMALLOC_END		(VMEMMAP_START - SZ_8M)
+#else
+#define VMEMMAP_UNUSED_NPAGES	((_PAGE_OFFSET(vabits_actual) - PAGE_OFFSET) >> PAGE_SHIFT)
+#define VMALLOC_END		(VMEMMAP_START + VMEMMAP_UNUSED_NPAGES * sizeof(struct page) - SZ_8M)
+#endif
 
 #define vmemmap			((struct page *)VMEMMAP_START - (memstart_addr >> PAGE_SHIFT))
 
@@ -30,6 +34,7 @@
 
 #include <asm/cmpxchg.h>
 #include <asm/fixmap.h>
+#include <asm/por.h>
 #include <linux/mmdebug.h>
 #include <linux/mm_types.h>
 #include <linux/sched.h>
@@ -70,15 +75,16 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
 #ifdef CONFIG_ARM64_PA_BITS_52
 static inline phys_addr_t __pte_to_phys(pte_t pte)
 {
+	pte_val(pte) &= ~PTE_MAYBE_SHARED;
 	return (pte_val(pte) & PTE_ADDR_LOW) |
 		((pte_val(pte) & PTE_ADDR_HIGH) << PTE_ADDR_HIGH_SHIFT);
 }
 static inline pteval_t __phys_to_pte_val(phys_addr_t phys)
 {
-	return (phys | (phys >> PTE_ADDR_HIGH_SHIFT)) & PTE_ADDR_MASK;
+	return (phys | (phys >> PTE_ADDR_HIGH_SHIFT)) & PHYS_TO_PTE_ADDR_MASK;
 }
 #else
-#define __pte_to_phys(pte)	(pte_val(pte) & PTE_ADDR_MASK)
+#define __pte_to_phys(pte)	(pte_val(pte) & PTE_ADDR_LOW)
 #define __phys_to_pte_val(phys)	(phys)
 #endif
 
@@ -87,14 +93,12 @@ static inline pteval_t __phys_to_pte_val(phys_addr_t phys)
 	__pte(__phys_to_pte_val((phys_addr_t)(pfn) << PAGE_SHIFT) | pgprot_val(prot))
 
 #define pte_none(pte)		(!pte_val(pte))
-#define __pte_clear(mm, addr, ptep) \
-				__set_pte(ptep, __pte(0))
 #define pte_page(pte)		(pfn_to_page(pte_pfn(pte)))
 
 /*
  * The following only work if pte_present(). Undefined behaviour otherwise.
  */
-#define pte_present(pte)	(!!(pte_val(pte) & (PTE_VALID | PTE_PROT_NONE)))
+#define pte_present(pte)	(pte_valid(pte) || pte_present_invalid(pte))
 #define pte_young(pte)		(!!(pte_val(pte) & PTE_AF))
 #define pte_special(pte)	(!!(pte_val(pte) & PTE_SPECIAL))
 #define pte_write(pte)		(!!(pte_val(pte) & PTE_WRITE))
@@ -121,6 +125,8 @@ static inline pteval_t __phys_to_pte_val(phys_addr_t phys)
 #define pte_dirty(pte)		(pte_sw_dirty(pte) || pte_hw_dirty(pte))
 
 #define pte_valid(pte)		(!!(pte_val(pte) & PTE_VALID))
+#define pte_present_invalid(pte) \
+	((pte_val(pte) & (PTE_VALID | PTE_PRESENT_INVALID)) == PTE_PRESENT_INVALID)
 /*
  * Execute-only user mappings do not have the PTE_USER bit set. All valid
  * kernel mappings have the PTE_UXN bit set.
@@ -142,6 +148,24 @@ static inline pteval_t __phys_to_pte_val(phys_addr_t phys)
 #define pte_accessible(mm, pte)	\
 	(mm_tlb_flush_pending(mm) ? pte_present(pte) : pte_valid(pte))
 
+static inline bool por_el0_allows_pkey(u8 pkey, bool write, bool execute)
+{
+	u64 por;
+
+	if (!system_supports_poe())
+		return true;
+
+	por = read_sysreg_s(SYS_POR_EL0);
+
+	if (write)
+		return por_elx_allows_write(por, pkey);
+
+	if (execute)
+		return por_elx_allows_exec(por, pkey);
+
+	return por_elx_allows_read(por, pkey);
+}
+
 /*
  * p??_access_permitted() is true for valid user mappings (PTE_USER
  * bit set, subject to the write permission check). For execute-only
@@ -149,8 +173,11 @@ static inline pteval_t __phys_to_pte_val(phys_addr_t phys)
  * not set) must return false. PROT_NONE mappings do not have the
  * PTE_VALID bit set.
  */
-#define pte_access_permitted(pte, write) \
+#define pte_access_permitted_no_overlay(pte, write) \
 	(((pte_val(pte) & (PTE_VALID | PTE_USER)) == (PTE_VALID | PTE_USER)) && (!(write) || pte_write(pte)))
+#define pte_access_permitted(pte, write) \
+	(pte_access_permitted_no_overlay(pte, write) && \
+	por_el0_allows_pkey(FIELD_GET(PTE_PO_IDX_MASK, pte_val(pte)), write, false))
 #define pmd_access_permitted(pmd, write) \
 	(pte_access_permitted(pmd_pte(pmd), (write)))
 #define pud_access_permitted(pud, write) \
@@ -251,6 +278,13 @@ static inline pte_t pte_mkpresent(pte_t pte)
 	return set_pte_bit(pte, __pgprot(PTE_VALID));
 }
 
+static inline pte_t pte_mkinvalid(pte_t pte)
+{
+	pte = set_pte_bit(pte, __pgprot(PTE_PRESENT_INVALID));
+	pte = clear_pte_bit(pte, __pgprot(PTE_VALID));
+	return pte;
+}
+
 static inline pmd_t pmd_mkcont(pmd_t pmd)
 {
 	return __pmd(pmd_val(pmd) | PMD_SECT_CONT);
@@ -261,14 +295,31 @@ static inline pte_t pte_mkdevmap(pte_t pte)
 	return set_pte_bit(pte, __pgprot(PTE_DEVMAP | PTE_SPECIAL));
 }
 
-static inline void set_pte_nosync(pte_t *ptep, pte_t pte)
+#ifdef CONFIG_HAVE_ARCH_USERFAULTFD_WP
+static inline int pte_uffd_wp(pte_t pte)
+{
+	return !!(pte_val(pte) & PTE_UFFD_WP);
+}
+
+static inline pte_t pte_mkuffd_wp(pte_t pte)
+{
+	return pte_wrprotect(set_pte_bit(pte, __pgprot(PTE_UFFD_WP)));
+}
+
+static inline pte_t pte_clear_uffd_wp(pte_t pte)
+{
+	return clear_pte_bit(pte, __pgprot(PTE_UFFD_WP));
+}
+#endif /* CONFIG_HAVE_ARCH_USERFAULTFD_WP */
+
+static inline void __set_pte_nosync(pte_t *ptep, pte_t pte)
 {
 	WRITE_ONCE(*ptep, pte);
 }
 
 static inline void __set_pte(pte_t *ptep, pte_t pte)
 {
-	set_pte_nosync(ptep, pte);
+	__set_pte_nosync(ptep, pte);
 
 	/*
 	 * Only if the new pte is valid and kernel, otherwise TLB maintenance
@@ -343,10 +394,11 @@ static inline void __sync_cache_and_tags(pte_t pte, unsigned int nr_pages)
 	/*
 	 * If the PTE would provide user space access to the tags associated
 	 * with it then ensure that the MTE tags are synchronised.  Although
-	 * pte_access_permitted() returns false for exec only mappings, they
-	 * don't expose tags (instruction fetches don't check tags).
+	 * pte_access_permitted_no_overlay() returns false for exec only
+	 * mappings, they don't expose tags (instruction fetches don't check
+	 * tags).
 	 */
-	if (system_supports_mte() && pte_access_permitted(pte, false) &&
+	if (system_supports_mte() && pte_access_permitted_no_overlay(pte, false) &&
 	    !pte_special(pte) && pte_tagged(pte))
 		mte_sync_tags(pte, nr_pages);
 }
@@ -354,6 +406,7 @@ static inline void __sync_cache_and_tags(pte_t pte, unsigned int nr_pages)
 /*
  * Select all bits except the pfn
  */
+#define pte_pgprot pte_pgprot
 static inline pgprot_t pte_pgprot(pte_t pte)
 {
 	unsigned long pfn = pte_pfn(pte);
@@ -458,13 +511,39 @@ static inline pte_t pte_swp_clear_exclusive(pte_t pte)
 	return clear_pte_bit(pte, __pgprot(PTE_SWP_EXCLUSIVE));
 }
 
+#ifdef CONFIG_HAVE_ARCH_USERFAULTFD_WP
+static inline pte_t pte_swp_mkuffd_wp(pte_t pte)
+{
+	return set_pte_bit(pte, __pgprot(PTE_SWP_UFFD_WP));
+}
+
+static inline int pte_swp_uffd_wp(pte_t pte)
+{
+	return !!(pte_val(pte) & PTE_SWP_UFFD_WP);
+}
+
+static inline pte_t pte_swp_clear_uffd_wp(pte_t pte)
+{
+	return clear_pte_bit(pte, __pgprot(PTE_SWP_UFFD_WP));
+}
+#endif /* CONFIG_HAVE_ARCH_USERFAULTFD_WP */
+
 #ifdef CONFIG_NUMA_BALANCING
 /*
  * See the comment in include/linux/pgtable.h
  */
 static inline int pte_protnone(pte_t pte)
 {
-	return (pte_val(pte) & (PTE_VALID | PTE_PROT_NONE)) == PTE_PROT_NONE;
+	/*
+	 * pte_present_invalid() tells us that the pte is invalid from HW
+	 * perspective but present from SW perspective, so the fields are to be
+	 * interpretted as per the HW layout. The second 2 checks are the unique
+	 * encoding that we use for PROT_NONE. It is insufficient to only use
+	 * the first check because we share the same encoding scheme with pmds
+	 * which support pmd_mkinvalid(), so can be present-invalid without
+	 * being PROT_NONE.
+	 */
+	return pte_present_invalid(pte) && !pte_user(pte) && !pte_user_exec(pte);
 }
 
 static inline int pmd_protnone(pmd_t pmd)
@@ -473,24 +552,7 @@ static inline int pmd_protnone(pmd_t pmd)
 }
 #endif
 
-#define pmd_present_invalid(pmd)     (!!(pmd_val(pmd) & PMD_PRESENT_INVALID))
-
-static inline int pmd_present(pmd_t pmd)
-{
-	return pte_present(pmd_pte(pmd)) || pmd_present_invalid(pmd);
-}
-
-/*
- * THP definitions.
- */
-
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-static inline int pmd_trans_huge(pmd_t pmd)
-{
-	return pmd_val(pmd) && pmd_present(pmd) && !(pmd_val(pmd) & PMD_TABLE_BIT);
-}
-#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
-
+#define pmd_present(pmd)	pte_present(pmd_pte(pmd))
 #define pmd_dirty(pmd)		pte_dirty(pmd_pte(pmd))
 #define pmd_young(pmd)		pte_young(pmd_pte(pmd))
 #define pmd_valid(pmd)		pte_valid(pmd_pte(pmd))
@@ -503,16 +565,16 @@ static inline int pmd_trans_huge(pmd_t pmd)
 #define pmd_mkclean(pmd)	pte_pmd(pte_mkclean(pmd_pte(pmd)))
 #define pmd_mkdirty(pmd)	pte_pmd(pte_mkdirty(pmd_pte(pmd)))
 #define pmd_mkyoung(pmd)	pte_pmd(pte_mkyoung(pmd_pte(pmd)))
-
-static inline pmd_t pmd_mkinvalid(pmd_t pmd)
-{
-	pmd = set_pmd_bit(pmd, __pgprot(PMD_PRESENT_INVALID));
-	pmd = clear_pmd_bit(pmd, __pgprot(PMD_SECT_VALID));
-
-	return pmd;
-}
-
-#define pmd_thp_or_huge(pmd)	(pmd_huge(pmd) || pmd_trans_huge(pmd))
+#define pmd_mkinvalid(pmd)	pte_pmd(pte_mkinvalid(pmd_pte(pmd)))
+#ifdef CONFIG_HAVE_ARCH_USERFAULTFD_WP
+#define pmd_uffd_wp(pmd)	pte_uffd_wp(pmd_pte(pmd))
+#define pmd_mkuffd_wp(pmd)	pte_pmd(pte_mkuffd_wp(pmd_pte(pmd)))
+#define pmd_clear_uffd_wp(pmd)	pte_pmd(pte_clear_uffd_wp(pmd_pte(pmd)))
+#define pmd_swp_uffd_wp(pmd)	pte_swp_uffd_wp(pmd_pte(pmd))
+#define pmd_swp_mkuffd_wp(pmd)	pte_pmd(pte_swp_mkuffd_wp(pmd_pte(pmd)))
+#define pmd_swp_clear_uffd_wp(pmd) \
+				pte_pmd(pte_swp_clear_uffd_wp(pmd_pte(pmd)))
+#endif /* CONFIG_HAVE_ARCH_USERFAULTFD_WP */
 
 #define pmd_write(pmd)		pte_write(pmd_pte(pmd))
 
@@ -525,6 +587,14 @@ static inline pmd_t pmd_mkdevmap(pmd_t pmd)
 {
 	return pte_pmd(set_pte_bit(pmd_pte(pmd), __pgprot(PTE_DEVMAP)));
 }
+
+#ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
+#define pmd_special(pte)	(!!((pmd_val(pte) & PTE_SPECIAL)))
+static inline pmd_t pmd_mkspecial(pmd_t pmd)
+{
+	return set_pmd_bit(pmd, __pgprot(PTE_SPECIAL));
+}
+#endif
 
 #define __pmd_to_phys(pmd)	__pte_to_phys(pmd_pte(pmd))
 #define __phys_to_pmd_val(phys)	__phys_to_pte_val(phys)
@@ -542,6 +612,27 @@ static inline pmd_t pmd_mkdevmap(pmd_t pmd)
 #define __phys_to_pud_val(phys)	__phys_to_pte_val(phys)
 #define pud_pfn(pud)		((__pud_to_phys(pud) & PUD_MASK) >> PAGE_SHIFT)
 #define pfn_pud(pfn,prot)	__pud(__phys_to_pud_val((phys_addr_t)(pfn) << PAGE_SHIFT) | pgprot_val(prot))
+
+#ifdef CONFIG_ARCH_SUPPORTS_PUD_PFNMAP
+#define pud_special(pte)	pte_special(pud_pte(pud))
+#define pud_mkspecial(pte)	pte_pud(pte_mkspecial(pud_pte(pud)))
+#endif
+
+#define pmd_pgprot pmd_pgprot
+static inline pgprot_t pmd_pgprot(pmd_t pmd)
+{
+	unsigned long pfn = pmd_pfn(pmd);
+
+	return __pgprot(pmd_val(pfn_pmd(pfn, __pgprot(0))) ^ pmd_val(pmd));
+}
+
+#define pud_pgprot pud_pgprot
+static inline pgprot_t pud_pgprot(pud_t pud)
+{
+	unsigned long pfn = pud_pfn(pud);
+
+	return __pgprot(pud_val(pfn_pud(pfn, __pgprot(0))) ^ pud_val(pud));
+}
 
 static inline void __set_pte_at(struct mm_struct *mm,
 				unsigned long __always_unused addr,
@@ -621,6 +712,18 @@ extern pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
 #define pmd_leaf_size(pmd)	(pmd_cont(pmd) ? CONT_PMD_SIZE : PMD_SIZE)
 #define pte_leaf_size(pte)	(pte_cont(pte) ? CONT_PTE_SIZE : PAGE_SIZE)
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+static inline int pmd_trans_huge(pmd_t pmd)
+{
+	/*
+	 * If pmd is present-invalid, pmd_table() won't detect it
+	 * as a table, so force the valid bit for the comparison.
+	 */
+	return pmd_val(pmd) && pmd_present(pmd) &&
+	       !pmd_table(__pmd(pmd_val(pmd) | PTE_VALID));
+}
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+
 #if defined(CONFIG_ARM64_64K_PAGES) || CONFIG_PGTABLE_LEVELS < 3
 static inline bool pud_sect(pud_t pud) { return false; }
 static inline bool pud_table(pud_t pud) { return true; }
@@ -631,12 +734,12 @@ static inline bool pud_table(pud_t pud) { return true; }
 				 PUD_TYPE_TABLE)
 #endif
 
-extern pgd_t init_pg_dir[PTRS_PER_PGD];
+extern pgd_t init_pg_dir[];
 extern pgd_t init_pg_end[];
-extern pgd_t swapper_pg_dir[PTRS_PER_PGD];
-extern pgd_t idmap_pg_dir[PTRS_PER_PGD];
-extern pgd_t tramp_pg_dir[PTRS_PER_PGD];
-extern pgd_t reserved_pg_dir[PTRS_PER_PGD];
+extern pgd_t swapper_pg_dir[];
+extern pgd_t idmap_pg_dir[];
+extern pgd_t tramp_pg_dir[];
+extern pgd_t reserved_pg_dir[];
 
 extern void set_swapper_pgd(pgd_t *pgdp, pgd_t pgd);
 
@@ -705,19 +808,23 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
 #define pud_bad(pud)		((pud_val(pud) & PUD_TYPE_MASK) != \
 				 PUD_TYPE_TABLE)
 #define pud_present(pud)	pte_present(pud_pte(pud))
+#ifndef __PAGETABLE_PMD_FOLDED
 #define pud_leaf(pud)		(pud_present(pud) && !pud_table(pud))
+#else
+#define pud_leaf(pud)		false
+#endif
 #define pud_valid(pud)		pte_valid(pud_pte(pud))
 #define pud_user(pud)		pte_user(pud_pte(pud))
 #define pud_user_exec(pud)	pte_user_exec(pud_pte(pud))
 
+static inline bool pgtable_l4_enabled(void);
+
 static inline void set_pud(pud_t *pudp, pud_t pud)
 {
-#ifdef __PAGETABLE_PUD_FOLDED
-	if (in_swapper_pgdir(pudp)) {
+	if (!pgtable_l4_enabled() && in_swapper_pgdir(pudp)) {
 		set_swapper_pgd((pgd_t *)pudp, __pgd(pud_val(pud)));
 		return;
 	}
-#endif /* __PAGETABLE_PUD_FOLDED */
 
 	WRITE_ONCE(*pudp, pud);
 
@@ -756,6 +863,7 @@ static inline pmd_t *pud_pgtable(pud_t pud)
 
 #else
 
+#define pud_valid(pud)		false
 #define pud_page_paddr(pud)	({ BUILD_BUG(); 0; })
 #define pud_user_exec(pud)	pud_user(pud) /* Always 0 with folding */
 
@@ -770,12 +878,27 @@ static inline pmd_t *pud_pgtable(pud_t pud)
 
 #if CONFIG_PGTABLE_LEVELS > 3
 
+static __always_inline bool pgtable_l4_enabled(void)
+{
+	if (CONFIG_PGTABLE_LEVELS > 4 || !IS_ENABLED(CONFIG_ARM64_LPA2))
+		return true;
+	if (!alternative_has_cap_likely(ARM64_ALWAYS_BOOT))
+		return vabits_actual == VA_BITS;
+	return alternative_has_cap_unlikely(ARM64_HAS_VA52);
+}
+
+static inline bool mm_pud_folded(const struct mm_struct *mm)
+{
+	return !pgtable_l4_enabled();
+}
+#define mm_pud_folded  mm_pud_folded
+
 #define pud_ERROR(e)	\
 	pr_err("%s:%d: bad pud %016llx.\n", __FILE__, __LINE__, pud_val(e))
 
-#define p4d_none(p4d)		(!p4d_val(p4d))
-#define p4d_bad(p4d)		(!(p4d_val(p4d) & 2))
-#define p4d_present(p4d)	(p4d_val(p4d))
+#define p4d_none(p4d)		(pgtable_l4_enabled() && !p4d_val(p4d))
+#define p4d_bad(p4d)		(pgtable_l4_enabled() && !(p4d_val(p4d) & 2))
+#define p4d_present(p4d)	(!p4d_none(p4d))
 
 static inline void set_p4d(p4d_t *p4dp, p4d_t p4d)
 {
@@ -791,7 +914,8 @@ static inline void set_p4d(p4d_t *p4dp, p4d_t p4d)
 
 static inline void p4d_clear(p4d_t *p4dp)
 {
-	set_p4d(p4dp, __p4d(0));
+	if (pgtable_l4_enabled())
+		set_p4d(p4dp, __p4d(0));
 }
 
 static inline phys_addr_t p4d_page_paddr(p4d_t p4d)
@@ -799,27 +923,75 @@ static inline phys_addr_t p4d_page_paddr(p4d_t p4d)
 	return __p4d_to_phys(p4d);
 }
 
+#define pud_index(addr)		(((addr) >> PUD_SHIFT) & (PTRS_PER_PUD - 1))
+
+static inline pud_t *p4d_to_folded_pud(p4d_t *p4dp, unsigned long addr)
+{
+	return (pud_t *)PTR_ALIGN_DOWN(p4dp, PAGE_SIZE) + pud_index(addr);
+}
+
 static inline pud_t *p4d_pgtable(p4d_t p4d)
 {
 	return (pud_t *)__va(p4d_page_paddr(p4d));
 }
 
-/* Find an entry in the first-level page table. */
-#define pud_offset_phys(dir, addr)	(p4d_page_paddr(READ_ONCE(*(dir))) + pud_index(addr) * sizeof(pud_t))
+static inline phys_addr_t pud_offset_phys(p4d_t *p4dp, unsigned long addr)
+{
+	BUG_ON(!pgtable_l4_enabled());
 
-#define pud_set_fixmap(addr)		((pud_t *)set_fixmap_offset(FIX_PUD, addr))
-#define pud_set_fixmap_offset(p4d, addr)	pud_set_fixmap(pud_offset_phys(p4d, addr))
-#define pud_clear_fixmap()		clear_fixmap(FIX_PUD)
+	return p4d_page_paddr(READ_ONCE(*p4dp)) + pud_index(addr) * sizeof(pud_t);
+}
+
+static inline
+pud_t *pud_offset_lockless(p4d_t *p4dp, p4d_t p4d, unsigned long addr)
+{
+	if (!pgtable_l4_enabled())
+		return p4d_to_folded_pud(p4dp, addr);
+	return (pud_t *)__va(p4d_page_paddr(p4d)) + pud_index(addr);
+}
+#define pud_offset_lockless pud_offset_lockless
+
+static inline pud_t *pud_offset(p4d_t *p4dp, unsigned long addr)
+{
+	return pud_offset_lockless(p4dp, READ_ONCE(*p4dp), addr);
+}
+#define pud_offset	pud_offset
+
+static inline pud_t *pud_set_fixmap(unsigned long addr)
+{
+	if (!pgtable_l4_enabled())
+		return NULL;
+	return (pud_t *)set_fixmap_offset(FIX_PUD, addr);
+}
+
+static inline pud_t *pud_set_fixmap_offset(p4d_t *p4dp, unsigned long addr)
+{
+	if (!pgtable_l4_enabled())
+		return p4d_to_folded_pud(p4dp, addr);
+	return pud_set_fixmap(pud_offset_phys(p4dp, addr));
+}
+
+static inline void pud_clear_fixmap(void)
+{
+	if (pgtable_l4_enabled())
+		clear_fixmap(FIX_PUD);
+}
+
+/* use ONLY for statically allocated translation tables */
+static inline pud_t *pud_offset_kimg(p4d_t *p4dp, u64 addr)
+{
+	if (!pgtable_l4_enabled())
+		return p4d_to_folded_pud(p4dp, addr);
+	return (pud_t *)__phys_to_kimg(pud_offset_phys(p4dp, addr));
+}
 
 #define p4d_page(p4d)		pfn_to_page(__phys_to_pfn(__p4d_to_phys(p4d)))
 
-/* use ONLY for statically allocated translation tables */
-#define pud_offset_kimg(dir,addr)	((pud_t *)__phys_to_kimg(pud_offset_phys((dir), (addr))))
-
 #else
 
+static inline bool pgtable_l4_enabled(void) { return false; }
+
 #define p4d_page_paddr(p4d)	({ BUILD_BUG(); 0;})
-#define pgd_page_paddr(pgd)	({ BUILD_BUG(); 0;})
 
 /* Match pud_offset folding in <asm/generic/pgtable-nopud.h> */
 #define pud_set_fixmap(addr)		NULL
@@ -829,6 +1001,146 @@ static inline pud_t *p4d_pgtable(p4d_t p4d)
 #define pud_offset_kimg(dir,addr)	((pud_t *)dir)
 
 #endif  /* CONFIG_PGTABLE_LEVELS > 3 */
+
+#if CONFIG_PGTABLE_LEVELS > 4
+
+static __always_inline bool pgtable_l5_enabled(void)
+{
+	if (!alternative_has_cap_likely(ARM64_ALWAYS_BOOT))
+		return vabits_actual == VA_BITS;
+	return alternative_has_cap_unlikely(ARM64_HAS_VA52);
+}
+
+static inline bool mm_p4d_folded(const struct mm_struct *mm)
+{
+	return !pgtable_l5_enabled();
+}
+#define mm_p4d_folded  mm_p4d_folded
+
+#define p4d_ERROR(e)	\
+	pr_err("%s:%d: bad p4d %016llx.\n", __FILE__, __LINE__, p4d_val(e))
+
+#define pgd_none(pgd)		(pgtable_l5_enabled() && !pgd_val(pgd))
+#define pgd_bad(pgd)		(pgtable_l5_enabled() && !(pgd_val(pgd) & 2))
+#define pgd_present(pgd)	(!pgd_none(pgd))
+
+static inline void set_pgd(pgd_t *pgdp, pgd_t pgd)
+{
+	if (in_swapper_pgdir(pgdp)) {
+		set_swapper_pgd(pgdp, __pgd(pgd_val(pgd)));
+		return;
+	}
+
+	WRITE_ONCE(*pgdp, pgd);
+	dsb(ishst);
+	isb();
+}
+
+static inline void pgd_clear(pgd_t *pgdp)
+{
+	if (pgtable_l5_enabled())
+		set_pgd(pgdp, __pgd(0));
+}
+
+static inline phys_addr_t pgd_page_paddr(pgd_t pgd)
+{
+	return __pgd_to_phys(pgd);
+}
+
+#define p4d_index(addr)		(((addr) >> P4D_SHIFT) & (PTRS_PER_P4D - 1))
+
+static inline p4d_t *pgd_to_folded_p4d(pgd_t *pgdp, unsigned long addr)
+{
+	return (p4d_t *)PTR_ALIGN_DOWN(pgdp, PAGE_SIZE) + p4d_index(addr);
+}
+
+static inline phys_addr_t p4d_offset_phys(pgd_t *pgdp, unsigned long addr)
+{
+	BUG_ON(!pgtable_l5_enabled());
+
+	return pgd_page_paddr(READ_ONCE(*pgdp)) + p4d_index(addr) * sizeof(p4d_t);
+}
+
+static inline
+p4d_t *p4d_offset_lockless(pgd_t *pgdp, pgd_t pgd, unsigned long addr)
+{
+	if (!pgtable_l5_enabled())
+		return pgd_to_folded_p4d(pgdp, addr);
+	return (p4d_t *)__va(pgd_page_paddr(pgd)) + p4d_index(addr);
+}
+#define p4d_offset_lockless p4d_offset_lockless
+
+static inline p4d_t *p4d_offset(pgd_t *pgdp, unsigned long addr)
+{
+	return p4d_offset_lockless(pgdp, READ_ONCE(*pgdp), addr);
+}
+
+static inline p4d_t *p4d_set_fixmap(unsigned long addr)
+{
+	if (!pgtable_l5_enabled())
+		return NULL;
+	return (p4d_t *)set_fixmap_offset(FIX_P4D, addr);
+}
+
+static inline p4d_t *p4d_set_fixmap_offset(pgd_t *pgdp, unsigned long addr)
+{
+	if (!pgtable_l5_enabled())
+		return pgd_to_folded_p4d(pgdp, addr);
+	return p4d_set_fixmap(p4d_offset_phys(pgdp, addr));
+}
+
+static inline void p4d_clear_fixmap(void)
+{
+	if (pgtable_l5_enabled())
+		clear_fixmap(FIX_P4D);
+}
+
+/* use ONLY for statically allocated translation tables */
+static inline p4d_t *p4d_offset_kimg(pgd_t *pgdp, u64 addr)
+{
+	if (!pgtable_l5_enabled())
+		return pgd_to_folded_p4d(pgdp, addr);
+	return (p4d_t *)__phys_to_kimg(p4d_offset_phys(pgdp, addr));
+}
+
+#define pgd_page(pgd)		pfn_to_page(__phys_to_pfn(__pgd_to_phys(pgd)))
+
+#else
+
+static inline bool pgtable_l5_enabled(void) { return false; }
+
+#define p4d_index(addr)		(((addr) >> P4D_SHIFT) & (PTRS_PER_P4D - 1))
+
+/* Match p4d_offset folding in <asm/generic/pgtable-nop4d.h> */
+#define p4d_set_fixmap(addr)		NULL
+#define p4d_set_fixmap_offset(p4dp, addr)	((p4d_t *)p4dp)
+#define p4d_clear_fixmap()
+
+#define p4d_offset_kimg(dir,addr)	((p4d_t *)dir)
+
+static inline
+p4d_t *p4d_offset_lockless_folded(pgd_t *pgdp, pgd_t pgd, unsigned long addr)
+{
+	/*
+	 * With runtime folding of the pud, pud_offset_lockless() passes
+	 * the 'pgd_t *' we return here to p4d_to_folded_pud(), which
+	 * will offset the pointer assuming that it points into
+	 * a page-table page. However, the fast GUP path passes us a
+	 * pgd_t allocated on the stack and so we must use the original
+	 * pointer in 'pgdp' to construct the p4d pointer instead of
+	 * using the generic p4d_offset_lockless() implementation.
+	 *
+	 * Note: reusing the original pointer means that we may
+	 * dereference the same (live) page-table entry multiple times.
+	 * This is safe because it is still only loaded once in the
+	 * context of each level and the CPU guarantees same-address
+	 * read-after-read ordering.
+	 */
+	return p4d_offset(pgdp, addr);
+}
+#define p4d_offset_lockless p4d_offset_lockless_folded
+
+#endif  /* CONFIG_PGTABLE_LEVELS > 4 */
 
 #define pgd_ERROR(e)	\
 	pr_err("%s:%d: bad pgd %016llx.\n", __FILE__, __LINE__, pgd_val(e))
@@ -843,8 +1155,9 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 	 * in MAIR_EL1. The mask below has to include PTE_ATTRINDX_MASK.
 	 */
 	const pteval_t mask = PTE_USER | PTE_PXN | PTE_UXN | PTE_RDONLY |
-			      PTE_PROT_NONE | PTE_VALID | PTE_WRITE | PTE_GP |
-			      PTE_ATTRINDX_MASK;
+			      PTE_PRESENT_INVALID | PTE_VALID | PTE_WRITE |
+			      PTE_GP | PTE_ATTRINDX_MASK | PTE_PO_IDX_MASK;
+
 	/* preserve the hardware dirty information */
 	if (pte_hw_dirty(pte))
 		pte = set_pte_bit(pte, __pgprot(PTE_DIRTY));
@@ -892,23 +1205,30 @@ static inline int pgd_devmap(pgd_t pgd)
 #ifdef CONFIG_PAGE_TABLE_CHECK
 static inline bool pte_user_accessible_page(pte_t pte)
 {
-	return pte_present(pte) && (pte_user(pte) || pte_user_exec(pte));
+	return pte_valid(pte) && (pte_user(pte) || pte_user_exec(pte));
 }
 
 static inline bool pmd_user_accessible_page(pmd_t pmd)
 {
-	return pmd_leaf(pmd) && !pmd_present_invalid(pmd) && (pmd_user(pmd) || pmd_user_exec(pmd));
+	return pmd_valid(pmd) && !pmd_table(pmd) && (pmd_user(pmd) || pmd_user_exec(pmd));
 }
 
 static inline bool pud_user_accessible_page(pud_t pud)
 {
-	return pud_leaf(pud) && (pud_user(pud) || pud_user_exec(pud));
+	return pud_valid(pud) && !pud_table(pud) && (pud_user(pud) || pud_user_exec(pud));
 }
 #endif
 
 /*
  * Atomic pte/pmd modifications.
  */
+
+static inline void __pte_clear(struct mm_struct *mm,
+			       unsigned long addr, pte_t *ptep)
+{
+	__set_pte(ptep, __pte(0));
+}
+
 static inline int __ptep_test_and_clear_young(struct vm_area_struct *vma,
 					      unsigned long address,
 					      pte_t *ptep)
@@ -1104,15 +1424,16 @@ static inline pmd_t pmdp_establish(struct vm_area_struct *vma,
  * Encode and decode a swap entry:
  *	bits 0-1:	present (must be zero)
  *	bits 2:		remember PG_anon_exclusive
- *	bits 3-7:	swap type
- *	bits 8-57:	swap offset
- *	bit  58:	PTE_PROT_NONE (must be zero)
+ *	bit  3:		remember uffd-wp state
+ *	bits 6-10:	swap type
+ *	bit  11:	PTE_PRESENT_INVALID (must be zero)
+ *	bits 12-61:	swap offset
  */
-#define __SWP_TYPE_SHIFT	3
+#define __SWP_TYPE_SHIFT	6
 #define __SWP_TYPE_BITS		5
-#define __SWP_OFFSET_BITS	50
 #define __SWP_TYPE_MASK		((1 << __SWP_TYPE_BITS) - 1)
-#define __SWP_OFFSET_SHIFT	(__SWP_TYPE_BITS + __SWP_TYPE_SHIFT)
+#define __SWP_OFFSET_SHIFT	12
+#define __SWP_OFFSET_BITS	50
 #define __SWP_OFFSET_MASK	((1UL << __SWP_OFFSET_BITS) - 1)
 
 #define __swp_type(x)		(((x).val >> __SWP_TYPE_SHIFT) & __SWP_TYPE_MASK)
@@ -1193,6 +1514,14 @@ static inline void update_mmu_cache_range(struct vm_fault *vmf,
  * benefit from prefaulting mappings as 'old' to start with.
  */
 #define arch_wants_old_prefaulted_pte	cpu_has_hw_af
+
+/*
+ * Request exec memory is read into pagecache in at least 64K folios. This size
+ * can be contpte-mapped when 4K base pages are in use (16 pages into 1 iTLB
+ * entry), and HPA can coalesce it (4 pages into 1 TLB entry) when 16K base
+ * pages are in use.
+ */
+#define exec_folio_order() ilog2(SZ_64K >> PAGE_SHIFT)
 
 static inline bool pud_sect_supported(void)
 {

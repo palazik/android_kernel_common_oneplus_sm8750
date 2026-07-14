@@ -3,6 +3,7 @@
 #define TRACE_SYSTEM fsnotify
 
 #ifdef CREATE_TRACE_POINTS
+#undef TRACE_INCLUDE_PATH
 #define TRACE_INCLUDE_PATH trace/hooks
 #define UNDEF_TRACE_INCLUDE_PATH
 #endif

@@ -3,7 +3,7 @@
 #define _LINUX_MODULE_SYMBOL_H
 
 /* This ignores the intensely annoying "mapping symbols" found in ELF files. */
-static inline int is_mapping_symbol(const char *str)
+static inline bool is_mapping_symbol(const char *str)
 {
 	if (!strncmp("__kvm_nvhe_", str, 11))
 		str += 11;

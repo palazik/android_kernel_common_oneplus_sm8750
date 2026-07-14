@@ -7,6 +7,7 @@
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/pci.h>
+#include <linux/platform_device.h>
 
 #include "arm-smmu-v3.h"
 #include "../../dma-iommu.h"
@@ -54,47 +55,60 @@ static void parse_driver_options(struct arm_smmu_device *smmu)
 	} while (arm_smmu_options[++i].opt);
 }
 
-static int arm_smmu_device_dt_probe(struct platform_device *pdev,
-				    struct arm_smmu_device *smmu,
-				    bool *bypass)
-{
-	struct device *dev = &pdev->dev;
-	u32 cells;
-
-	*bypass = true;
-	if (of_property_read_u32(dev->of_node, "#iommu-cells", &cells))
-		dev_err(dev, "missing #iommu-cells property\n");
-	else if (cells != 1)
-		dev_err(dev, "invalid #iommu-cells value (%d)\n", cells);
-	else
-		*bypass = false;
-
-	parse_driver_options(smmu);
-
-	if (of_dma_is_coherent(dev->of_node))
-		smmu->features |= ARM_SMMU_FEAT_COHERENCY;
-
-	return 0;
-}
-
 #ifdef CONFIG_ACPI
-static void acpi_smmu_get_options(u32 model, struct arm_smmu_device *smmu)
+#ifdef CONFIG_TEGRA241_CMDQV
+static void acpi_smmu_dsdt_probe_tegra241_cmdqv(struct acpi_iort_node *node,
+						struct arm_smmu_device *smmu)
 {
-	switch (model) {
+	const char *uid = kasprintf(GFP_KERNEL, "%u", node->identifier);
+	struct acpi_device *adev;
+
+	/* Look for an NVDA200C node whose _UID matches the SMMU node ID */
+	adev = acpi_dev_get_first_match_dev("NVDA200C", uid, -1);
+	if (adev) {
+		/* Tegra241 CMDQV driver is responsible for put_device() */
+		smmu->impl_dev = &adev->dev;
+		smmu->options |= ARM_SMMU_OPT_TEGRA241_CMDQV;
+		dev_info(smmu->dev, "found companion CMDQV device: %s\n",
+			 dev_name(smmu->impl_dev));
+	}
+	kfree(uid);
+}
+#else
+static void acpi_smmu_dsdt_probe_tegra241_cmdqv(struct acpi_iort_node *node,
+						struct arm_smmu_device *smmu)
+{
+}
+#endif
+
+static int acpi_smmu_iort_probe_model(struct acpi_iort_node *node,
+				      struct arm_smmu_device *smmu)
+{
+	struct acpi_iort_smmu_v3 *iort_smmu =
+		(struct acpi_iort_smmu_v3 *)node->node_data;
+
+	switch (iort_smmu->model) {
 	case ACPI_IORT_SMMU_V3_CAVIUM_CN99XX:
 		smmu->options |= ARM_SMMU_OPT_PAGE0_REGS_ONLY;
 		break;
 	case ACPI_IORT_SMMU_V3_HISILICON_HI161X:
 		smmu->options |= ARM_SMMU_OPT_SKIP_PREFETCH;
 		break;
+	case ACPI_IORT_SMMU_V3_GENERIC:
+		/*
+		 * Tegra241 implementation stores its SMMU options and impl_dev
+		 * in DSDT. Thus, go through the ACPI tables unconditionally.
+		 */
+		acpi_smmu_dsdt_probe_tegra241_cmdqv(node, smmu);
+		break;
 	}
 
 	dev_notice(smmu->dev, "option mask 0x%x\n", smmu->options);
+	return 0;
 }
 
 static int arm_smmu_device_acpi_probe(struct platform_device *pdev,
-				      struct arm_smmu_device *smmu,
-				      bool *bypass)
+				      struct arm_smmu_device *smmu)
 {
 	struct acpi_iort_smmu_v3 *iort_smmu;
 	struct device *dev = smmu->dev;
@@ -105,39 +119,57 @@ static int arm_smmu_device_acpi_probe(struct platform_device *pdev,
 	/* Retrieve SMMUv3 specific data */
 	iort_smmu = (struct acpi_iort_smmu_v3 *)node->node_data;
 
-	acpi_smmu_get_options(iort_smmu->model, smmu);
-
 	if (iort_smmu->flags & ACPI_IORT_SMMU_V3_COHACC_OVERRIDE)
 		smmu->features |= ARM_SMMU_FEAT_COHERENCY;
 
-	*bypass = false;
-	return 0;
-}
+	switch (FIELD_GET(ACPI_IORT_SMMU_V3_HTTU_OVERRIDE, iort_smmu->flags)) {
+	case IDR0_HTTU_ACCESS_DIRTY:
+		smmu->features |= ARM_SMMU_FEAT_HD;
+		fallthrough;
+	case IDR0_HTTU_ACCESS:
+		smmu->features |= ARM_SMMU_FEAT_HA;
+	}
 
+	return acpi_smmu_iort_probe_model(node, smmu);
+}
 #else
 static inline int arm_smmu_device_acpi_probe(struct platform_device *pdev,
-					     struct arm_smmu_device *smmu,
-					     bool *bypass)
+					     struct arm_smmu_device *smmu)
 {
 	return -ENODEV;
 }
 #endif
 
-int arm_smmu_fw_probe(struct platform_device *pdev,
-		      struct arm_smmu_device *smmu, bool *bypass)
+static int arm_smmu_device_dt_probe(struct platform_device *pdev,
+				    struct arm_smmu_device *smmu)
 {
-	if (smmu->dev->of_node)
-		return arm_smmu_device_dt_probe(pdev, smmu, bypass);
+	struct device *dev = &pdev->dev;
+	u32 cells;
+	int ret = -EINVAL;
+
+	if (of_property_read_u32(dev->of_node, "#iommu-cells", &cells))
+		dev_err(dev, "missing #iommu-cells property\n");
+	else if (cells != 1)
+		dev_err(dev, "invalid #iommu-cells value (%d)\n", cells);
 	else
-		return arm_smmu_device_acpi_probe(pdev, smmu, bypass);
+		ret = 0;
+
+	parse_driver_options(smmu);
+
+	if (of_dma_is_coherent(dev->of_node))
+		smmu->features |= ARM_SMMU_FEAT_COHERENCY;
+
+	return ret;
 }
 
-#ifdef CONFIG_ARM_SMMU_V3_SVA
-bool __weak arm_smmu_sva_supported(struct arm_smmu_device *smmu)
+int arm_smmu_fw_probe(struct platform_device *pdev,
+		      struct arm_smmu_device *smmu)
 {
-	return false;
+	if (smmu->dev->of_node)
+		return arm_smmu_device_dt_probe(pdev, smmu);
+	else
+		return arm_smmu_device_acpi_probe(pdev, smmu);
 }
-#endif
 
 #define IIDR_IMPLEMENTER_ARM		0x43b
 #define IIDR_PRODUCTID_ARM_MMU_600	0x483
@@ -177,11 +209,32 @@ static void arm_smmu_device_iidr_probe(struct arm_smmu_device *smmu)
 	}
 }
 
+static void arm_smmu_get_httu(struct arm_smmu_device *smmu, u32 reg)
+{
+	u32 fw_features = smmu->features & (ARM_SMMU_FEAT_HA | ARM_SMMU_FEAT_HD);
+	u32 hw_features = 0;
+
+	switch (FIELD_GET(IDR0_HTTU, reg)) {
+	case IDR0_HTTU_ACCESS_DIRTY:
+		hw_features |= ARM_SMMU_FEAT_HD;
+		fallthrough;
+	case IDR0_HTTU_ACCESS:
+		hw_features |= ARM_SMMU_FEAT_HA;
+	}
+
+	if (smmu->dev->of_node)
+		smmu->features |= hw_features;
+	else if (hw_features != fw_features)
+		/* ACPI IORT sets the HTTU bits */
+		dev_warn(smmu->dev,
+			 "IDR0.HTTU features(0x%x) overridden by FW configuration (0x%x)\n",
+			  hw_features, fw_features);
+}
+
 int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 {
 	u32 reg;
 	bool coherent = smmu->features & ARM_SMMU_FEAT_COHERENCY;
-	u8 split = smmu->strtab_cfg.split;
 
 	/* IDR0 */
 	reg = readl_relaxed(smmu->base + ARM_SMMU_IDR0);
@@ -238,6 +291,8 @@ int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 			smmu->features |= ARM_SMMU_FEAT_E2H;
 	}
 
+	arm_smmu_get_httu(smmu, reg);
+
 	/*
 	 * The coherency feature as set by FW is used in preference to the ID
 	 * register, but warn on mismatch.
@@ -288,6 +343,9 @@ int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 		return -ENXIO;
 	}
 
+	if (reg & IDR1_ATTR_TYPES_OVR)
+		smmu->features |= ARM_SMMU_FEAT_ATTR_TYPES_OVR;
+
 	/* Queue sizes, capped to ensure natural alignment */
 	smmu->cmdq.q.llq.max_n_shift = min_t(u32, CMDQ_MAX_SZ_SHIFT,
 					     FIELD_GET(IDR1_CMDQS, reg));
@@ -313,15 +371,11 @@ int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 	smmu->sid_bits = FIELD_GET(IDR1_SIDSIZE, reg);
 	smmu->iommu.max_pasids = 1UL << smmu->ssid_bits;
 
-	if ((split != 6) && (split != 8) && (split != 10)) {
-		dev_err(smmu->dev, "configured split not supported %d\n", split);
-		return -EINVAL;
-	}
 	/*
 	 * If the SMMU supports fewer bits than would fill a single L2 stream
 	 * table, use a linear table instead.
 	 */
-	if (smmu->sid_bits <= smmu->strtab_cfg.split)
+	if (smmu->sid_bits <= STRTAB_SPLIT)
 		smmu->features &= ~ARM_SMMU_FEAT_2_LVL_STRTAB;
 
 	/* IDR3 */
@@ -389,9 +443,6 @@ int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 
 	arm_smmu_device_iidr_probe(smmu);
 
-	if (arm_smmu_sva_supported(smmu))
-		smmu->features |= ARM_SMMU_FEAT_SVA;
-
 	dev_info(smmu->dev, "ias %lu-bit, oas %lu-bit (features 0x%08x)\n",
 		 smmu->ias, smmu->oas, smmu->features);
 	return 0;
@@ -440,29 +491,13 @@ int arm_smmu_device_disable(struct arm_smmu_device *smmu)
 	return ret;
 }
 
-bool arm_smmu_capable(struct device *dev, enum iommu_cap cap)
-{
-	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
-
-	switch (cap) {
-	case IOMMU_CAP_CACHE_COHERENCY:
-		/* Assume that a coherent TCU implies coherent TBUs */
-		return master->smmu->features & ARM_SMMU_FEAT_COHERENCY;
-	case IOMMU_CAP_NOEXEC:
-	case IOMMU_CAP_DEFERRED_FLUSH:
-		return true;
-	default:
-		return false;
-	}
-}
-
 struct iommu_group *arm_smmu_device_group(struct device *dev)
 {
 	struct iommu_group *group;
 
 	/*
 	 * We don't support devices sharing stream IDs other than PCI RID
-	 * aliases, since the necessary ID-to-device lookup becomes rather
+	pick f473c7c1b189 fixup drv splt * aliases, since the necessary ID-to-device lookup becomes rather
 	 * impractical given a potential sparse 32-bit stream ID space.
 	 */
 	if (dev_is_pci(dev))
@@ -473,12 +508,14 @@ struct iommu_group *arm_smmu_device_group(struct device *dev)
 	return group;
 }
 
-int arm_smmu_of_xlate(struct device *dev, struct of_phandle_args *args)
+int arm_smmu_of_xlate(struct device *dev, const struct of_phandle_args *args)
 {
 	return iommu_fwspec_add_ids(dev, args->args, 1);
 }
 
-void arm_smmu_get_resv_regions(struct device *dev, struct list_head *head)
+
+void arm_smmu_get_resv_regions(struct device *dev,
+			       struct list_head *head)
 {
 	struct iommu_resv_region *region;
 	int prot = IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO;
@@ -494,17 +531,15 @@ void arm_smmu_get_resv_regions(struct device *dev, struct list_head *head)
 }
 
 int arm_smmu_init_one_queue(struct arm_smmu_device *smmu,
-				   struct arm_smmu_queue *q,
-				   void __iomem *page,
-				   unsigned long prod_off,
-				   unsigned long cons_off,
-				   size_t dwords, const char *name)
+			    struct arm_smmu_queue *q, void __iomem *page,
+			    unsigned long prod_off, unsigned long cons_off,
+			    size_t dwords, const char *name)
 {
 	size_t qsz;
 
 	do {
-		qsz = PAGE_ALIGN(((1 << q->llq.max_n_shift) * dwords) << 3);
-		q->base = dmam_alloc_coherent(smmu->dev, qsz, &q->base_dma,
+		qsz = ((1 << q->llq.max_n_shift) * dwords) << 3;
+		q->base = dmam_alloc_coherent(smmu->dev, PAGE_ALIGN(qsz), &q->base_dma,
 					      GFP_KERNEL);
 		if (q->base || qsz < PAGE_SIZE)
 			break;
@@ -537,131 +572,104 @@ int arm_smmu_init_one_queue(struct arm_smmu_device *smmu,
 }
 
 /* Stream table initialization functions */
-void arm_smmu_write_strtab_l1_desc(__le64 *dst,
-				   struct arm_smmu_strtab_l1_desc *desc)
-{
-	u64 val = 0;
-
-	val |= FIELD_PREP(STRTAB_L1_DESC_SPAN, desc->span);
-	val |= desc->l2ptr_dma & STRTAB_L1_DESC_L2PTR_MASK;
-
-	/* See comment in arm_smmu_write_ctx_desc() */
-	WRITE_ONCE(*dst, cpu_to_le64(val));
-}
-
-
-static int arm_smmu_init_l1_strtab(struct arm_smmu_device *smmu)
-{
-	unsigned int i;
-	struct arm_smmu_strtab_cfg *cfg = &smmu->strtab_cfg;
-	void *strtab = smmu->strtab_cfg.strtab;
-
-	cfg->l1_desc = devm_kcalloc(smmu->dev, cfg->num_l1_ents,
-				    sizeof(*cfg->l1_desc), GFP_KERNEL);
-	if (!cfg->l1_desc)
-		return -ENOMEM;
-
-	for (i = 0; i < cfg->num_l1_ents; ++i) {
-		arm_smmu_write_strtab_l1_desc(strtab, &cfg->l1_desc[i]);
-		strtab += STRTAB_L1_DESC_DWORDS << 3;
-	}
-
-	return 0;
-}
-
 static int arm_smmu_init_strtab_2lvl(struct arm_smmu_device *smmu)
 {
-	void *strtab;
-	u64 reg;
-	u32 size, l1size;
+	u32 l1size;
 	struct arm_smmu_strtab_cfg *cfg = &smmu->strtab_cfg;
+	unsigned int last_sid_idx =
+		arm_smmu_strtab_l1_idx((1ULL << smmu->sid_bits) - 1);
 
 	/* Calculate the L1 size, capped to the SIDSIZE. */
-	size = STRTAB_L1_SZ_SHIFT - (ilog2(STRTAB_L1_DESC_DWORDS) + 3);
-	size = min(size, smmu->sid_bits - smmu->strtab_cfg.split);
-	cfg->num_l1_ents = 1 << size;
-
-	size += smmu->strtab_cfg.split;
-	if (size < smmu->sid_bits)
+	cfg->l2.num_l1_ents = min(last_sid_idx + 1, STRTAB_MAX_L1_ENTRIES);
+	if (cfg->l2.num_l1_ents <= last_sid_idx)
 		dev_warn(smmu->dev,
 			 "2-level strtab only covers %u/%u bits of SID\n",
-			 size, smmu->sid_bits);
+			 ilog2(cfg->l2.num_l1_ents * STRTAB_NUM_L2_STES),
+			 smmu->sid_bits);
 
-	l1size = cfg->num_l1_ents * (STRTAB_L1_DESC_DWORDS << 3);
-	l1size = PAGE_ALIGN(l1size);
-	strtab = dmam_alloc_coherent(smmu->dev, l1size, &cfg->strtab_dma,
-				     GFP_KERNEL);
-	if (!strtab) {
+	l1size = cfg->l2.num_l1_ents * sizeof(struct arm_smmu_strtab_l1);
+	cfg->l2.l1tab = dmam_alloc_coherent(smmu->dev, PAGE_ALIGN(l1size), &cfg->l2.l1_dma,
+					    GFP_KERNEL);
+	if (!cfg->l2.l1tab) {
 		dev_err(smmu->dev,
 			"failed to allocate l1 stream table (%u bytes)\n",
 			l1size);
 		return -ENOMEM;
 	}
-	cfg->strtab = strtab;
 
-	/* Configure strtab_base_cfg for 2 levels */
-	reg  = FIELD_PREP(STRTAB_BASE_CFG_FMT, STRTAB_BASE_CFG_FMT_2LVL);
-	reg |= FIELD_PREP(STRTAB_BASE_CFG_LOG2SIZE, size);
-	reg |= FIELD_PREP(STRTAB_BASE_CFG_SPLIT, smmu->strtab_cfg.split);
-	cfg->strtab_base_cfg = reg;
+	cfg->l2.l2ptrs = devm_kcalloc(smmu->dev, cfg->l2.num_l1_ents,
+				      sizeof(*cfg->l2.l2ptrs), GFP_KERNEL);
+	if (!cfg->l2.l2ptrs)
+		return -ENOMEM;
 
-	return arm_smmu_init_l1_strtab(smmu);
+	return 0;
 }
 
 static int arm_smmu_init_strtab_linear(struct arm_smmu_device *smmu)
 {
-	void *strtab;
-	u64 reg;
 	u32 size;
 	struct arm_smmu_strtab_cfg *cfg = &smmu->strtab_cfg;
 
-	size = (1 << smmu->sid_bits) * (STRTAB_STE_DWORDS << 3);
-	strtab = dmam_alloc_coherent(smmu->dev, size, &cfg->strtab_dma,
-				     GFP_KERNEL);
-	if (!strtab) {
+	size = (1 << smmu->sid_bits) * sizeof(struct arm_smmu_ste);
+	cfg->linear.table = dmam_alloc_coherent(smmu->dev, PAGE_ALIGN(size),
+						&cfg->linear.ste_dma,
+						GFP_KERNEL);
+	if (!cfg->linear.table) {
 		dev_err(smmu->dev,
 			"failed to allocate linear stream table (%u bytes)\n",
 			size);
 		return -ENOMEM;
 	}
-	cfg->strtab = strtab;
-	cfg->num_l1_ents = 1 << smmu->sid_bits;
-
-	/* Configure strtab_base_cfg for a linear table covering all SIDs */
-	reg  = FIELD_PREP(STRTAB_BASE_CFG_FMT, STRTAB_BASE_CFG_FMT_LINEAR);
-	reg |= FIELD_PREP(STRTAB_BASE_CFG_LOG2SIZE, smmu->sid_bits);
-	cfg->strtab_base_cfg = reg;
+	cfg->linear.num_ents = 1 << smmu->sid_bits;
 
 	return 0;
 }
 
 int arm_smmu_init_strtab(struct arm_smmu_device *smmu)
 {
-	u64 reg;
 	int ret;
 
 	if (smmu->features & ARM_SMMU_FEAT_2_LVL_STRTAB)
 		ret = arm_smmu_init_strtab_2lvl(smmu);
 	else
 		ret = arm_smmu_init_strtab_linear(smmu);
-
 	if (ret)
 		return ret;
-
-	/* Set the strtab base address */
-	reg  = smmu->strtab_cfg.strtab_dma & STRTAB_BASE_ADDR_MASK;
-	reg |= STRTAB_BASE_RA;
-	smmu->strtab_cfg.strtab_base = reg;
 
 	ida_init(&smmu->vmid_map);
 
 	return 0;
 }
 
+void arm_smmu_write_strtab(struct arm_smmu_device *smmu)
+{
+	struct arm_smmu_strtab_cfg *cfg = &smmu->strtab_cfg;
+	dma_addr_t dma;
+	u32 reg;
+
+	if (smmu->features & ARM_SMMU_FEAT_2_LVL_STRTAB) {
+		reg = FIELD_PREP(STRTAB_BASE_CFG_FMT,
+				 STRTAB_BASE_CFG_FMT_2LVL) |
+		      FIELD_PREP(STRTAB_BASE_CFG_LOG2SIZE,
+				 ilog2(cfg->l2.num_l1_ents) + STRTAB_SPLIT) |
+		      FIELD_PREP(STRTAB_BASE_CFG_SPLIT, STRTAB_SPLIT);
+		dma = cfg->l2.l1_dma;
+	} else {
+		reg = FIELD_PREP(STRTAB_BASE_CFG_FMT,
+				 STRTAB_BASE_CFG_FMT_LINEAR) |
+		      FIELD_PREP(STRTAB_BASE_CFG_LOG2SIZE, smmu->sid_bits);
+		dma = cfg->linear.ste_dma;
+	}
+	writeq_relaxed((dma & STRTAB_BASE_ADDR_MASK) | STRTAB_BASE_RA,
+		       smmu->base + ARM_SMMU_STRTAB_BASE);
+	writel_relaxed(reg, smmu->base + ARM_SMMU_STRTAB_BASE_CFG);
+}
+
 static void arm_smmu_free_msis(void *data)
 {
 	struct device *dev = data;
-	platform_msi_domain_free_irqs(dev);
+
+	platform_device_msi_free_irqs_all(dev);
 }
 
 static void arm_smmu_write_msi_msg(struct msi_desc *desc, struct msi_msg *msg)
@@ -702,7 +710,7 @@ static void arm_smmu_setup_msis(struct arm_smmu_device *smmu)
 	}
 
 	/* Allocate MSIs for evtq, gerror and priq. Ignore cmdq */
-	ret = platform_msi_domain_alloc_irqs(dev, nvec, arm_smmu_write_msi_msg);
+	ret = platform_device_msi_init_and_alloc_irqs(dev, nvec, arm_smmu_write_msi_msg);
 	if (ret) {
 		dev_warn(dev, "failed to allocate MSIs - falling back to wired irqs\n");
 		return;
@@ -713,7 +721,7 @@ static void arm_smmu_setup_msis(struct arm_smmu_device *smmu)
 	smmu->priq.q.irq = msi_get_virq(dev, PRIQ_MSI_INDEX);
 
 	/* Add callback to free MSIs on teardown */
-	devm_add_action(dev, arm_smmu_free_msis, dev);
+	devm_add_action_or_reset(dev, arm_smmu_free_msis, dev);
 }
 
 void arm_smmu_setup_unique_irqs(struct arm_smmu_device *smmu,

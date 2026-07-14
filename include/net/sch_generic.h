@@ -20,6 +20,7 @@
 #include <net/gen_stats.h>
 #include <net/rtnetlink.h>
 #include <net/flow_offload.h>
+#include <linux/xarray.h>
 
 struct Qdisc_ops;
 struct qdisc_walker;
@@ -117,6 +118,7 @@ struct Qdisc {
 	struct qdisc_skb_head	q;
 	struct gnet_stats_basic_sync bstats;
 	struct gnet_stats_queue	qstats;
+	int                     owner;
 	unsigned long		state;
 	unsigned long		state2; /* must be written under qdisc spinlock */
 	struct Qdisc            *next_sched;
@@ -127,6 +129,7 @@ struct Qdisc {
 
 	struct rcu_head		rcu;
 	netdevice_tracker	dev_tracker;
+	struct lock_class_key	root_lock_key;
 
 	ANDROID_KABI_RESERVE(1);
 
@@ -241,12 +244,7 @@ static inline bool qdisc_may_bulk(const struct Qdisc *qdisc)
 
 static inline int qdisc_avail_bulklimit(const struct netdev_queue *txq)
 {
-#ifdef CONFIG_BQL
-	/* Non-BQL migrated drivers will return 0, too. */
-	return dql_avail(&txq->dql);
-#else
-	return 0;
-#endif
+	return netdev_queue_dql_avail(txq);
 }
 
 struct Qdisc_class_ops {
@@ -332,7 +330,6 @@ struct Qdisc_ops {
 	ANDROID_KABI_RESERVE(1);
 };
 
-
 struct tcf_result {
 	union {
 		struct {
@@ -340,7 +337,6 @@ struct tcf_result {
 			u32		classid;
 		};
 		const struct tcf_proto *goto_tp;
-
 	};
 };
 
@@ -436,6 +432,8 @@ struct tcf_proto {
 	 */
 	spinlock_t		lock;
 	bool			deleting;
+	bool			counted;
+	bool			usesw;
 	refcount_t		refcnt;
 	struct rcu_head		rcu;
 	struct hlist_node	destroy_ht_node;
@@ -470,6 +468,7 @@ struct tcf_chain {
 };
 
 struct tcf_block {
+	struct xarray ports; /* datapath accessible */
 	/* Lock protects tcf_block and lifetime-management data of chains
 	 * attached to the block (refcnt, action_refcnt, explicitly_created).
 	 */
@@ -484,6 +483,7 @@ struct tcf_block {
 	struct flow_block flow_block;
 	struct list_head owner_list;
 	bool keep_dst;
+	atomic_t useswcnt;
 	atomic_t offloadcnt; /* Number of oddloaded filters */
 	unsigned int nooffloaddevcnt; /* Number of devs unable to do offload */
 	unsigned int lockeddevcnt; /* Number of devs that require rtnl lock. */
@@ -495,6 +495,8 @@ struct tcf_block {
 	DECLARE_HASHTABLE(proto_destroy_ht, 7);
 	struct mutex proto_destroy_lock; /* Lock for proto_destroy hashtable. */
 };
+
+struct tcf_block *tcf_block_lookup(struct net *net, u32 block_index);
 
 static inline bool lockdep_tcf_chain_is_locked(struct tcf_chain *chain)
 {
@@ -599,6 +601,7 @@ static inline void sch_tree_unlock(struct Qdisc *q)
 extern struct Qdisc noop_qdisc;
 extern struct Qdisc_ops noop_qdisc_ops;
 extern struct Qdisc_ops pfifo_fast_ops;
+extern const u8 sch_default_prio2band[TC_PRIO_MAX + 1];
 extern struct Qdisc_ops mq_qdisc_ops;
 extern struct Qdisc_ops noqueue_qdisc_ops;
 extern const struct Qdisc_ops *default_qdisc_ops;
@@ -844,6 +847,14 @@ static inline bool qdisc_tx_changing(const struct net_device *dev)
 			return true;
 	}
 	return false;
+}
+
+/* "noqueue" qdisc identified by not having any enqueue, see noqueue_init() */
+static inline bool qdisc_txq_has_no_queue(const struct netdev_queue *txq)
+{
+	struct Qdisc *qdisc = rcu_access_pointer(txq->qdisc);
+
+	return qdisc->enqueue == NULL;
 }
 
 /* Is the device using the noop qdisc on all queues?  */
@@ -1099,6 +1110,37 @@ static inline struct sk_buff *qdisc_dequeue_head(struct Qdisc *sch)
 	}
 
 	return skb;
+}
+
+struct tc_skb_cb {
+	struct qdisc_skb_cb qdisc_cb;
+	u32 drop_reason;
+
+	u16 zone; /* Only valid if post_ct = true */
+	u16 mru;
+	u8 post_ct:1;
+	u8 post_ct_snat:1;
+	u8 post_ct_dnat:1;
+};
+
+static inline struct tc_skb_cb *tc_skb_cb(const struct sk_buff *skb)
+{
+	struct tc_skb_cb *cb = (struct tc_skb_cb *)skb->cb;
+
+	BUILD_BUG_ON(sizeof(*cb) > sizeof_field(struct sk_buff, cb));
+	return cb;
+}
+
+static inline enum skb_drop_reason
+tcf_get_drop_reason(const struct sk_buff *skb)
+{
+	return tc_skb_cb(skb)->drop_reason;
+}
+
+static inline void tcf_set_drop_reason(const struct sk_buff *skb,
+				       enum skb_drop_reason reason)
+{
+	tc_skb_cb(skb)->drop_reason = reason;
 }
 
 /* Instead of calling kfree_skb() while root qdisc lock is held,

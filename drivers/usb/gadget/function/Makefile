@@ -47,7 +47,6 @@ ifneq ($(CONFIG_TRACING),)
 endif
 obj-$(CONFIG_USB_F_UVC)		+= usb_f_uvc.o
 usb_f_midi-y			:= f_midi.o
-usb_f_midi-$(CONFIG_ANDROID_USB_F_MIDI_INFO) += android_f_midi_info.o
 obj-$(CONFIG_USB_F_MIDI)	+= usb_f_midi.o
 usb_f_midi2-y			:= f_midi2.o
 obj-$(CONFIG_USB_F_MIDI2)	+= usb_f_midi2.o

@@ -41,24 +41,6 @@ struct poll_table_struct;
 
 /* define the enumeration of all cgroup subsystems */
 #define SUBSYS(_x) _x ## _cgrp_id,
-
-#define CSS_COUNTERS_SIZE (CGROUP_SUBSYS_COUNT * sizeof(atomic_t))
-
-/*
- * This should just use max(), but max() doesn't work in struct definitions.
- *
- * Originally, the space was reserved for per cgroup subsystem counters, where each counter was
- * the size of an atomic_t variable. However, it was later reused to fit a struct rcu_head
- * which is why the calculation considers the size of struct rcu_head.
- *
- * This macro is provided to ANDROID_BACKPORT_USE_ARRAY() which needs to reserve at least
- * enough memory to accommodate struct rcu_head. However, if we only reserve CSS_COUNTERS_SIZE,
- * that may not be enough space on kernels with a small amount of cgroup subsystems enabled. So,
- * we take the max between the two values to use in ANDROID_BACKPORT_USE_ARRAY().
- */
-#define CGROUP_ROOT_BACKPORT_PADDING_SIZE \
-	(CSS_COUNTERS_SIZE > sizeof(struct rcu_head) ? CSS_COUNTERS_SIZE : sizeof(struct rcu_head))
-
 enum cgroup_subsys_id {
 #include <linux/cgroup_subsys.h>
 	CGROUP_SUBSYS_COUNT,
@@ -90,9 +72,6 @@ enum {
 
 	/* Cgroup is frozen. */
 	CGRP_FROZEN,
-
-	/* Control group has to be killed. */
-	CGRP_KILL,
 };
 
 /* cgroup_root->flags */
@@ -134,6 +113,16 @@ enum {
 	 * Enable recursive subtree protection
 	 */
 	CGRP_ROOT_MEMORY_RECURSIVE_PROT = (1 << 18),
+
+	/*
+	 * Enable hugetlb accounting for the memory controller.
+	 */
+	CGRP_ROOT_MEMORY_HUGETLB_ACCOUNTING = (1 << 19),
+
+	/*
+	 * Enable legacy local pids.events.
+	 */
+	CGRP_ROOT_PIDS_LOCAL_EVENTS = (1 << 20),
 };
 
 /* cftype->flags */
@@ -181,7 +170,11 @@ struct cgroup_subsys_state {
 	/* reference count - access via css_[try]get() and css_put() */
 	struct percpu_ref refcnt;
 
-	/* siblings list anchored at the parent's ->children */
+	/*
+	 * siblings list anchored at the parent's ->children
+	 *
+	 * linkage is protected by cgroup_mutex or RCU
+	 */
 	struct list_head sibling;
 	struct list_head children;
 
@@ -219,6 +212,16 @@ struct cgroup_subsys_state {
 	 * fields of the containing structure.
 	 */
 	struct cgroup_subsys_state *parent;
+
+	/*
+	 * Keep track of total numbers of visible descendant CSSes.
+	 * The total number of dying CSSes is tracked in
+	 * css->cgroup->nr_dying_subsys[ssid].
+	 * Protected by cgroup_mutex.
+	 */
+	int nr_descendants;
+
+	ANDROID_BACKPORT_RESERVE(1);
 };
 
 /*
@@ -316,6 +319,8 @@ struct css_set {
 
 	/* For RCU-protected deletion */
 	struct rcu_head rcu_head;
+
+	ANDROID_BACKPORT_RESERVE(1);
 };
 
 struct cgroup_base_stat {
@@ -324,6 +329,7 @@ struct cgroup_base_stat {
 #ifdef CONFIG_SCHED_CORE
 	u64 forceidle_sum;
 #endif
+	u64 ntime;
 };
 
 /*
@@ -411,15 +417,8 @@ struct cgroup_freezer_state {
 
 /**
  * struct cgroup_kmi_ext_info is meant to hold extensions to struct cgroup while
- * maintaining KMI stability.
- *
- * Hide the definition of struct cgroup_kmi_ext_info from MODVERSIONS so that it
- * can be modified to accommodate additional backports in the future. This type
- * is meant to be opaque to vendor modules.
+ * maintaining KMI stability. This type is meant to be opaque to vendor modules.
  */
-#ifdef __GENKSYMS__
-struct cgroup_kmi_ext_info;
-#else
 struct cgroup_kmi_ext_info {
 	/*
 	 * Metadata for cgroup v2 freeze time. Writes protected
@@ -444,7 +443,11 @@ struct cgroup_kmi_ext_info {
 		u64 frozen_nsec;
 	} freezer;
 };
-#endif /* __GENKSYMS__ */
+/*
+ * Hide the definition of struct cgroup_kmi_ext_info from the ABI so that it
+ * can be modified to accommodate additional backports in the future.
+ */
+ANDROID_KABI_DECLONLY(cgroup_kmi_ext_info);
 
 struct cgroup {
 	/* self css with NULL ->ss, points back to this cgroup */
@@ -495,6 +498,9 @@ struct cgroup {
 
 	int nr_threaded_children;	/* # of live threaded child cgroups */
 
+	/* sequence number for cgroup.kill, serialized by css_set_lock. */
+	unsigned int kill_seq;
+
 	struct kernfs_node *kn;		/* cgroup kernfs entry */
 	struct cgroup_file procs_file;	/* handle for "cgroup.procs" */
 	struct cgroup_file events_file;	/* handle for "cgroup.events" */
@@ -516,6 +522,12 @@ struct cgroup {
 
 	/* Private pointers for each registered subsystem */
 	struct cgroup_subsys_state __rcu *subsys[CGROUP_SUBSYS_COUNT];
+
+	/*
+	 * Keep track of total number of dying CSSes at and below this cgroup.
+	 * Protected by cgroup_mutex.
+	 */
+	int nr_dying_subsys[CGROUP_SUBSYS_COUNT];
 
 	struct cgroup_root *root;
 
@@ -586,9 +598,6 @@ struct cgroup {
 	/* used to store eBPF programs */
 	struct cgroup_bpf bpf;
 
-	/* If there is block congestion on this cgroup. */
-	atomic_t congestion_count;
-
 	/* Used to store internal freezer state */
 	struct cgroup_freezer_state freezer;
 
@@ -621,6 +630,10 @@ struct cgroup_root {
 	/* Unique id for this hierarchy. */
 	int hierarchy_id;
 
+	/* A list running through the active hierarchies */
+	struct list_head root_list;
+	struct rcu_head rcu;	/* Must be near the top */
+
 	/*
 	 * The root cgroup. The containing cgroup_root will be destroyed on its
 	 * release. cgrp->ancestors[0] will be used overflowing into the
@@ -634,9 +647,6 @@ struct cgroup_root {
 	/* Number of cgroups in the hierarchy, used only for /proc/cgroups */
 	atomic_t nr_cgrps;
 
-	/* A list running through the active hierarchies */
-	struct list_head root_list;
-
 	/* Hierarchy-specific flags */
 	unsigned int flags;
 
@@ -646,12 +656,7 @@ struct cgroup_root {
 	/* The name for this hierarchy - may be empty */
 	char name[MAX_CGROUP_ROOT_NAMELEN];
 
-	/* Use the original calculation to preserve the CRC value for the ABI. */
-#ifndef __GENKSYMS__
-	ANDROID_BACKPORT_USE_ARRAY(1, CGROUP_ROOT_BACKPORT_PADDING_SIZE, struct rcu_head rcu);
-#else
-	ANDROID_BACKPORT_USE_ARRAY(1, CGROUP_SUBSYS_COUNT * sizeof(atomic_t), struct rcu_head rcu);
-#endif
+	ANDROID_BACKPORT_RESERVE(1);
 };
 
 /*
@@ -741,9 +746,7 @@ struct cftype {
 	__poll_t (*poll)(struct kernfs_open_file *of,
 			 struct poll_table_struct *pt);
 
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
 	struct lock_class_key	lockdep_key;
-#endif
 };
 
 /*
@@ -757,6 +760,7 @@ struct cgroup_subsys {
 	void (*css_released)(struct cgroup_subsys_state *css);
 	void (*css_free)(struct cgroup_subsys_state *css);
 	void (*css_reset)(struct cgroup_subsys_state *css);
+	void (*css_killed)(struct cgroup_subsys_state *css);
 	void (*css_rstat_flush)(struct cgroup_subsys_state *css, int cpu);
 	int (*css_extra_stat_show)(struct seq_file *seq,
 				   struct cgroup_subsys_state *css);
@@ -836,9 +840,16 @@ struct cgroup_subsys {
 	 * specifies the mask of subsystems that this one depends on.
 	 */
 	unsigned int depends_on;
+
+	ANDROID_BACKPORT_RESERVE(1);
 };
 
 extern struct percpu_rw_semaphore cgroup_threadgroup_rwsem;
+
+struct cgroup_of_peak {
+	unsigned long		value;
+	struct list_head	list;
+};
 
 /**
  * cgroup_threadgroup_change_begin - threadgroup exclusion for cgroups

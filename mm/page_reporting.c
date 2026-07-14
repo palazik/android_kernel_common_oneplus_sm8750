@@ -7,7 +7,6 @@
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/scatterlist.h>
-#include <linux/mem_relinquish.h>
 
 #include "page_reporting.h"
 #include "internal.h"
@@ -21,7 +20,7 @@ static int page_order_update_notify(const char *val, const struct kernel_param *
 	 * If param is set beyond this limit, order is set to default
 	 * pageblock_order value
 	 */
-	return  param_set_uint_minmax(val, kp, 0, MAX_ORDER);
+	return  param_set_uint_minmax(val, kp, 0, MAX_PAGE_ORDER);
 }
 
 static const struct kernel_param_ops page_reporting_param_ops = {
@@ -153,7 +152,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
 	unsigned int page_len = PAGE_SIZE << order;
 	struct page *page, *next;
 	long budget;
-	int i, err = 0;
+	int err = 0;
 
 	/*
 	 * Perform early check, if free area is empty there is
@@ -207,10 +206,6 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
 			/* Add page to scatter list */
 			--(*offset);
 			sg_set_page(&sgl[*offset], page, page_len, 0);
-
-			/* Notify hyp that these pages are reclaimable. */
-			for (i = 0; i < (1<<order); i++)
-				page_relinquish(page+i);
 
 			continue;
 		}
@@ -375,7 +370,7 @@ int page_reporting_register(struct page_reporting_dev_info *prdev)
 	 */
 
 	if (page_reporting_order == -1) {
-		if (prdev->order > 0 && prdev->order <= MAX_ORDER)
+		if (prdev->order > 0 && prdev->order <= MAX_PAGE_ORDER)
 			page_reporting_order = prdev->order;
 		else
 			page_reporting_order = pageblock_order;

@@ -2709,11 +2709,11 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 
 	msm_host->mmc->caps |= MMC_CAP_WAIT_WHILE_BUSY | MMC_CAP_NEED_RSP_BUSY;
 
-	/* Set the timeout value to max possible */
-	host->max_timeout_count = 0xF;
-
 	/* Enable force hw reset during cqe recovery */
 	msm_host->mmc->cqe_recovery_reset_always = true;
+
+	/* Set the timeout value to max possible */
+	host->max_timeout_count = 0xF;
 
 	pm_runtime_get_noresume(&pdev->dev);
 	pm_runtime_set_active(&pdev->dev);

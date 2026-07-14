@@ -14,7 +14,7 @@
 
 #define HYP_EVENT(__name, __proto, __struct, __assign, __printk)		\
 	HYP_EVENT_FORMAT(__name, __struct);					\
-	void hyp_event_trace_##__name(struct ht_iterator *iter)			\
+	static void hyp_event_trace_##__name(struct ht_iterator *iter)		\
 	{									\
 		struct trace_hyp_format_##__name __maybe_unused *__entry =	\
 			(struct trace_hyp_format_##__name *)iter->ent;		\
@@ -50,7 +50,7 @@
 #define HYP_EVENT(__name, __proto, __struct, __assign, __printk)	\
 	static char hyp_event_print_fmt_##__name[] = __printk;		\
 	static bool hyp_event_enabled_##__name;				\
-	struct hyp_event __section("_hyp_events") hyp_event_##__name = {\
+	struct hyp_event __section("_hyp_events."#__name) hyp_event_##__name = {\
 		.name		= #__name,				\
 		.enabled	= &hyp_event_enabled_##__name,		\
 		.fields		= hyp_event_fields_##__name,		\

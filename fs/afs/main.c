@@ -18,7 +18,6 @@
 MODULE_DESCRIPTION("AFS Client File System");
 MODULE_AUTHOR("Red Hat, Inc.");
 MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);
 
 unsigned afs_debug;
 module_param_named(debug, afs_debug, uint, S_IWUSR | S_IRUGO);
@@ -42,8 +41,6 @@ const char afs_init_sysname[] = "arm_linux26";
 const char afs_init_sysname[] = "aarch64_linux26";
 #elif defined(CONFIG_X86_32)
 const char afs_init_sysname[] = "i386_linux26";
-#elif defined(CONFIG_IA64)
-const char afs_init_sysname[] = "ia64_linux26";
 #elif defined(CONFIG_PPC64)
 const char afs_init_sysname[] = "ppc64_linux26";
 #elif defined(CONFIG_PPC32)
@@ -93,8 +90,7 @@ static int __net_init afs_net_init(struct net *net_ns)
 	INIT_LIST_HEAD(&net->fs_probe_slow);
 	INIT_HLIST_HEAD(&net->fs_proc);
 
-	INIT_HLIST_HEAD(&net->fs_addresses4);
-	INIT_HLIST_HEAD(&net->fs_addresses6);
+	INIT_HLIST_HEAD(&net->fs_addresses);
 	seqlock_init(&net->fs_addr_lock);
 
 	INIT_WORK(&net->fs_manager, afs_manage_servers);
@@ -159,6 +155,7 @@ static void __net_exit afs_net_exit(struct net *net_ns)
 	afs_close_socket(net);
 	afs_proc_cleanup(net);
 	afs_put_sysnames(net->sysnames);
+	kfree_rcu(rcu_access_pointer(net->address_prefs), rcu);
 }
 
 static struct pernet_operations afs_net_ops = {

@@ -154,6 +154,7 @@ struct sockaddr;
 struct msghdr;
 struct module;
 struct sk_buff;
+struct proto_accept_arg;
 typedef int (*sk_read_actor_t)(read_descriptor_t *, struct sk_buff *,
 			       unsigned int, size_t);
 typedef int (*skb_read_actor_t)(struct sock *, struct sk_buff *);
@@ -172,7 +173,8 @@ struct proto_ops {
 	int		(*socketpair)(struct socket *sock1,
 				      struct socket *sock2);
 	int		(*accept)    (struct socket *sock,
-				      struct socket *newsock, int flags, bool kern);
+				      struct socket *newsock,
+				      struct proto_accept_arg *arg);
 	int		(*getname)   (struct socket *sock,
 				      struct sockaddr *addr,
 				      int peer);
@@ -305,10 +307,7 @@ do {									\
 	net_ratelimited_function(pr_debug, fmt, ##__VA_ARGS__)
 #else
 #define net_dbg_ratelimited(fmt, ...)				\
-	do {							\
-		if (0)						\
-			no_printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__); \
-	} while (0)
+	no_printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
 #endif
 
 #define net_get_random_once(buf, nbytes)			\
@@ -327,6 +326,25 @@ do {									\
 static inline bool sendpage_ok(struct page *page)
 {
 	return !PageSlab(page) && page_count(page) >= 1;
+}
+
+/*
+ * Check sendpage_ok on contiguous pages.
+ */
+static inline bool sendpages_ok(struct page *page, size_t len, size_t offset)
+{
+	struct page *p = page + (offset >> PAGE_SHIFT);
+	size_t count = 0;
+
+	while (count < len) {
+		if (!sendpage_ok(p))
+			return false;
+
+		p++;
+		count += PAGE_SIZE;
+	}
+
+	return true;
 }
 
 int kernel_sendmsg(struct socket *sock, struct msghdr *msg, struct kvec *vec,

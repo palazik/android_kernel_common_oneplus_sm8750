@@ -12,14 +12,12 @@
 #include <linux/bitops.h>
 #include <linux/elf.h>
 #include <linux/ftrace.h>
-#include <linux/gfp.h>
 #include <linux/kasan.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/moduleloader.h>
 #include <linux/random.h>
 #include <linux/scs.h>
-#include <linux/vmalloc.h>
 
 #include <asm/alternative.h>
 #include <asm/insn.h>
@@ -27,130 +25,6 @@
 #include <asm/kvm_hypevents_defs.h>
 #include <asm/scs.h>
 #include <asm/sections.h>
-
-static u64 module_direct_base __ro_after_init = 0;
-static u64 module_plt_base __ro_after_init = 0;
-
-/*
- * Choose a random page-aligned base address for a window of 'size' bytes which
- * entirely contains the interval [start, end - 1].
- */
-static u64 __init random_bounding_box(u64 size, u64 start, u64 end)
-{
-	u64 max_pgoff, pgoff;
-
-	if ((end - start) >= size)
-		return 0;
-
-	max_pgoff = (size - (end - start)) / PAGE_SIZE;
-	pgoff = get_random_u32_inclusive(0, max_pgoff);
-
-	return start - pgoff * PAGE_SIZE;
-}
-
-/*
- * Modules may directly reference data and text anywhere within the kernel
- * image and other modules. References using PREL32 relocations have a +/-2G
- * range, and so we need to ensure that the entire kernel image and all modules
- * fall within a 2G window such that these are always within range.
- *
- * Modules may directly branch to functions and code within the kernel text,
- * and to functions and code within other modules. These branches will use
- * CALL26/JUMP26 relocations with a +/-128M range. Without PLTs, we must ensure
- * that the entire kernel text and all module text falls within a 128M window
- * such that these are always within range. With PLTs, we can expand this to a
- * 2G window.
- *
- * We chose the 128M region to surround the entire kernel image (rather than
- * just the text) as using the same bounds for the 128M and 2G regions ensures
- * by construction that we never select a 128M region that is not a subset of
- * the 2G region. For very large and unusual kernel configurations this means
- * we may fall back to PLTs where they could have been avoided, but this keeps
- * the logic significantly simpler.
- */
-static int __init module_init_limits(void)
-{
-	u64 kernel_end = (u64)_end;
-	u64 kernel_start = (u64)_text;
-	u64 kernel_size = kernel_end - kernel_start;
-
-	/*
-	 * The default modules region is placed immediately below the kernel
-	 * image, and is large enough to use the full 2G relocation range.
-	 */
-	BUILD_BUG_ON(KIMAGE_VADDR != MODULES_END);
-	BUILD_BUG_ON(MODULES_VSIZE < SZ_2G);
-
-	if (!kaslr_enabled()) {
-		if (kernel_size < SZ_128M)
-			module_direct_base = kernel_end - SZ_128M;
-		if (kernel_size < SZ_2G)
-			module_plt_base = kernel_end - SZ_2G;
-	} else {
-		u64 min = kernel_start;
-		u64 max = kernel_end;
-
-		if (IS_ENABLED(CONFIG_RANDOMIZE_MODULE_REGION_FULL)) {
-			pr_info("2G module region forced by RANDOMIZE_MODULE_REGION_FULL\n");
-		} else {
-			module_direct_base = random_bounding_box(SZ_128M, min, max);
-			if (module_direct_base) {
-				min = module_direct_base;
-				max = module_direct_base + SZ_128M;
-			}
-		}
-
-		module_plt_base = random_bounding_box(SZ_2G, min, max);
-	}
-
-	pr_info("%llu pages in range for non-PLT usage",
-		module_direct_base ? (SZ_128M - kernel_size) / PAGE_SIZE : 0);
-	pr_info("%llu pages in range for PLT usage",
-		module_plt_base ? (SZ_2G - kernel_size) / PAGE_SIZE : 0);
-
-	return 0;
-}
-subsys_initcall(module_init_limits);
-
-void *module_alloc(unsigned long size)
-{
-	void *p = NULL;
-
-	/*
-	 * Where possible, prefer to allocate within direct branch range of the
-	 * kernel such that no PLTs are necessary.
-	 */
-	if (module_direct_base) {
-		p = __vmalloc_node_range(size, MODULE_ALIGN,
-					 module_direct_base,
-					 module_direct_base + SZ_128M,
-					 GFP_KERNEL | __GFP_NOWARN,
-					 PAGE_KERNEL, 0, NUMA_NO_NODE,
-					 __builtin_return_address(0));
-	}
-
-	if (!p && module_plt_base) {
-		p = __vmalloc_node_range(size, MODULE_ALIGN,
-					 module_plt_base,
-					 module_plt_base + SZ_2G,
-					 GFP_KERNEL | __GFP_NOWARN,
-					 PAGE_KERNEL, 0, NUMA_NO_NODE,
-					 __builtin_return_address(0));
-	}
-
-	if (!p) {
-		pr_warn_ratelimited("%s: unable to allocate memory\n",
-				    __func__);
-	}
-
-	if (p && (kasan_alloc_module_shadow(p, size, GFP_KERNEL) < 0)) {
-		vfree(p);
-		return NULL;
-	}
-
-	/* Memory is intended to be executable, reset the pointer tag. */
-	return kasan_reset_tag(p);
-}
 
 enum aarch64_reloc_op {
 	RELOC_OP_NONE,
@@ -585,6 +459,81 @@ static int module_init_ftrace_plt(const Elf_Ehdr *hdr,
 	return 0;
 }
 
+#ifdef CONFIG_KVM
+static const Elf_Shdr *find_symbol_table(const Elf_Ehdr *hdr,
+					 const Elf_Shdr *sechdrs)
+{
+	int idx;
+
+	for (idx = 1; idx < hdr->e_shnum; idx++) {
+		if (sechdrs[idx].sh_type == SHT_SYMTAB)
+			return &sechdrs[idx];
+	}
+
+	return NULL;
+}
+
+static int
+module_init_hyp_imported_sym(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
+			     struct module *mod)
+{
+	struct pkvm_el2_module *hyp_mod = &mod->arch.hyp;
+	struct pkvm_el2_sym *pkvm_sym;
+	const Elf_Shdr *symtab = NULL, *s, *se, *orig;
+	const char *strtab = NULL;
+	const Elf_Rela *rela;
+	const Elf_Sym *sym;
+
+	INIT_LIST_HEAD(&hyp_mod->ext_symbols);
+
+	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
+		if (s->sh_type != SHT_RELA)
+			continue;
+
+		/* Imported symbols only used in .hyp.text */
+		orig = &sechdrs[s->sh_info];
+		if ((void *)orig->sh_addr != hyp_mod->text.start)
+			continue;
+
+		for (rela = (Elf_Rela *)((void *)hdr + s->sh_offset);
+		     rela < (Elf_Rela *)((void *)hdr + s->sh_offset + s->sh_size); rela++) {
+			size_t len;
+
+			symtab = symtab ? symtab : find_symbol_table(hdr, sechdrs);
+			if (!symtab)
+				return -ENOEXEC;
+			strtab = (const char *)hdr + sechdrs[symtab->sh_link].sh_offset;
+
+			sym = (Elf_Sym *)((const char *)hdr + symtab->sh_offset) +
+				ELF64_R_SYM(rela->r_info);
+
+			/* Imported symbols are UNDEF */
+			if (sym->st_shndx != SHN_UNDEF)
+				continue;
+
+			if (ELF64_R_TYPE(rela->r_info) != R_AARCH64_CALL26) {
+				pr_warn("Unknown relocation type for imported symbol %s\n",
+					strtab + sym->st_name);
+				return -EINVAL;
+			}
+
+			pkvm_sym = kmalloc(sizeof(*pkvm_sym), GFP_KERNEL);
+			if (!pkvm_sym)
+				return -ENOMEM;
+
+			len = strlen(strtab + sym->st_name) + 1;
+			pkvm_sym->name = kzalloc(len, GFP_KERNEL);
+			strscpy(pkvm_sym->name, strtab + sym->st_name, len);
+			pkvm_sym->rela_pos = (void *)orig->sh_addr + rela->r_offset;
+
+			list_add(&pkvm_sym->node, &hyp_mod->ext_symbols);
+		}
+	}
+
+	return 0;
+}
+#endif
+
 static int module_init_hyp(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
 			   struct module *mod)
 {
@@ -604,6 +553,8 @@ static int module_init_hyp(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
 		.start	= (void *)s->sh_addr,
 		.end	= (void *)s->sh_addr + s->sh_size,
 	};
+
+	module_init_hyp_imported_sym(hdr, sechdrs, mod);
 
 	s = find_section(hdr, sechdrs, ".hyp.reloc");
 	if (!s)
@@ -636,30 +587,41 @@ static int module_init_hyp(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
 		};
 	}
 
-	s = find_section(hdr, sechdrs, "_hyp_events");
-	if (s) {
-		hyp_mod->hyp_events = (void *)s->sh_addr;
-		hyp_mod->nr_hyp_events = s->sh_size /
-			sizeof(*hyp_mod->hyp_events);
-
-		s = find_section(hdr, sechdrs, ".hyp.event_ids");
-		if (s) {
-			mod->arch.hyp.event_ids = (struct pkvm_module_section) {
-				.start	= (void *)s->sh_addr,
-				.end	= (void *)s->sh_addr + s->sh_size,
-			};
-		} else {
-			hyp_mod->hyp_events = NULL;
-			hyp_mod->nr_hyp_events = 0;
-			WARN(1, "%s: Did you forget define_events.h in the EL2 (hyp) code?",
-				mod->name);
-		}
-	} else {
-		s = find_section(hdr, sechdrs, ".hyp.event_ids");
-		WARN(s && s->sh_size,
-		     "%s: Did you forget kvm_define_hypevents.h in the EL1 code?",
-		     mod->name);
+	s = find_section(hdr, sechdrs, ".hyp.event_ids");
+	if (s && s->sh_size) {
+		mod->arch.hyp.event_ids = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
 	}
+
+	s = find_section(hdr, sechdrs, "_hyp_events");
+	if (s && s->sh_size) {
+		if (!mod->arch.hyp.event_ids.start) {
+			WARN(1, "%s: Did you forget define_events.h in the EL2 (hyp) code?",
+			     mod->name);
+		} else {
+			hyp_mod->hyp_events = (void *)s->sh_addr;
+			hyp_mod->nr_hyp_events = s->sh_size /
+				sizeof(*hyp_mod->hyp_events);
+		}
+	}
+
+	s = find_section(hdr, sechdrs, ".hyp.printk_fmts");
+	if (s && s->sh_size) {
+		hyp_mod->hyp_printk_fmts = (void *)s->sh_addr;
+		hyp_mod->nr_hyp_printk_fmts = s->sh_size /
+			sizeof(*hyp_mod->hyp_printk_fmts);
+	}
+
+	s = find_section(hdr, sechdrs, ".hyp.patchable_function_entries");
+	if (s && s->sh_size) {
+		hyp_mod->patchable_function_entries = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
+	}
+
 #endif
 	return 0;
 }
@@ -678,7 +640,7 @@ int module_finalize(const Elf_Ehdr *hdr,
 	if (scs_is_dynamic()) {
 		s = find_section(hdr, sechdrs, ".init.eh_frame");
 		if (s)
-			scs_patch((void *)s->sh_addr, s->sh_size);
+			__pi_scs_patch((void *)s->sh_addr, s->sh_size);
 	}
 
 	err = module_init_ftrace_plt(hdr, sechdrs, me);

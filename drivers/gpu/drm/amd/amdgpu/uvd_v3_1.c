@@ -98,7 +98,7 @@ static void uvd_v3_1_ring_emit_ib(struct amdgpu_ring *ring,
 }
 
 /**
- * uvd_v3_1_ring_emit_fence - emit a fence & trap command
+ * uvd_v3_1_ring_emit_fence - emit an fence & trap command
  *
  * @ring: amdgpu_ring pointer
  * @addr: address
@@ -242,11 +242,7 @@ static void uvd_v3_1_mc_resume(struct amdgpu_device *adev)
 	uint64_t addr;
 	uint32_t size;
 
-	/* When the keyselect is already set, don't perturb it. */
-	if (RREG32(mmUVD_FW_START))
-		return;
-
-	/* program the VCPU memory controller bits 0-27 */
+	/* programm the VCPU memory controller bits 0-27 */
 	addr = (adev->uvd.inst->gpu_addr + AMDGPU_UVD_FIRMWARE_OFFSET) >> 3;
 	size = AMDGPU_UVD_FIRMWARE_SIZE(adev) >> 3;
 	WREG32(mmUVD_VCPU_CACHE_OFFSET0, addr);
@@ -287,12 +283,6 @@ static int uvd_v3_1_fw_validate(struct amdgpu_device *adev)
 {
 	int i;
 	uint32_t keysel = adev->uvd.keyselect;
-
-	if (RREG32(mmUVD_FW_START) & UVD_FW_STATUS__PASS_MASK) {
-		dev_dbg(adev->dev, "UVD keyselect already set: 0x%x (on CPU: 0x%x)\n",
-			RREG32(mmUVD_FW_START), adev->uvd.keyselect);
-		return 0;
-	}
 
 	WREG32(mmUVD_FW_START, keysel);
 
@@ -426,7 +416,7 @@ static int uvd_v3_1_start(struct amdgpu_device *adev)
 	/* Set the write pointer delay */
 	WREG32(mmUVD_RBC_RB_WPTR_CNTL, 0);
 
-	/* Program the 4GB memory segment for rptr and ring buffer */
+	/* programm the 4GB memory segment for rptr and ring buffer */
 	WREG32(mmUVD_LMI_EXT40_ADDR, upper_32_bits(ring->gpu_addr) |
 		   (0x7 << 16) | (0x1 << 31));
 
@@ -587,8 +577,6 @@ static int uvd_v3_1_sw_init(void *handle)
 	ptr += ucode_len;
 	memcpy(&adev->uvd.keyselect, ptr, 4);
 
-	r = amdgpu_uvd_entity_init(adev);
-
 	return r;
 }
 
@@ -737,6 +725,13 @@ static int uvd_v3_1_hw_fini(void *handle)
 	return 0;
 }
 
+static int uvd_v3_1_prepare_suspend(void *handle)
+{
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+
+	return amdgpu_uvd_prepare_suspend(adev);
+}
+
 static int uvd_v3_1_suspend(void *handle)
 {
 	int r;
@@ -837,6 +832,7 @@ static const struct amd_ip_funcs uvd_v3_1_ip_funcs = {
 	.sw_fini = uvd_v3_1_sw_fini,
 	.hw_init = uvd_v3_1_hw_init,
 	.hw_fini = uvd_v3_1_hw_fini,
+	.prepare_suspend = uvd_v3_1_prepare_suspend,
 	.suspend = uvd_v3_1_suspend,
 	.resume = uvd_v3_1_resume,
 	.is_idle = uvd_v3_1_is_idle,
@@ -844,6 +840,8 @@ static const struct amd_ip_funcs uvd_v3_1_ip_funcs = {
 	.soft_reset = uvd_v3_1_soft_reset,
 	.set_clockgating_state = uvd_v3_1_set_clockgating_state,
 	.set_powergating_state = uvd_v3_1_set_powergating_state,
+	.dump_ip_state = NULL,
+	.print_ip_state = NULL,
 };
 
 const struct amdgpu_ip_block_version uvd_v3_1_ip_block = {

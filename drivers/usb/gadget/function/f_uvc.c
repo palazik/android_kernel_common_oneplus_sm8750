@@ -534,6 +534,7 @@ uvc_copy_descriptors(struct uvc_device *uvc, enum usb_device_speed speed)
 	void *mem;
 
 	switch (speed) {
+	case USB_SPEED_SUPER_PLUS:
 	case USB_SPEED_SUPER:
 		uvc_control_desc = uvc->desc.ss_control;
 		uvc_streaming_cls = uvc->desc.ss_streaming;
@@ -582,7 +583,8 @@ uvc_copy_descriptors(struct uvc_device *uvc, enum usb_device_speed speed)
 		bytes += uvc_interrupt_ep.bLength + uvc_interrupt_cs_ep.bLength;
 		n_desc += 2;
 
-		if (speed == USB_SPEED_SUPER) {
+		if (speed == USB_SPEED_SUPER ||
+		    speed == USB_SPEED_SUPER_PLUS) {
 			bytes += uvc_ss_interrupt_comp.bLength;
 			n_desc += 1;
 		}
@@ -637,7 +639,8 @@ uvc_copy_descriptors(struct uvc_device *uvc, enum usb_device_speed speed)
 
 	if (uvc->enable_interrupt_ep) {
 		UVC_COPY_DESCRIPTOR(mem, dst, &uvc_interrupt_ep);
-		if (speed == USB_SPEED_SUPER)
+		if (speed == USB_SPEED_SUPER ||
+		    speed == USB_SPEED_SUPER_PLUS)
 			UVC_COPY_DESCRIPTOR(mem, dst, &uvc_ss_interrupt_comp);
 
 		UVC_COPY_DESCRIPTOR(mem, dst, &uvc_interrupt_cs_ep);
@@ -828,6 +831,13 @@ uvc_function_bind(struct usb_configuration *c, struct usb_function *f)
 	if (IS_ERR(f->ss_descriptors)) {
 		ret = PTR_ERR(f->ss_descriptors);
 		f->ss_descriptors = NULL;
+		goto error;
+	}
+
+	f->ssp_descriptors = uvc_copy_descriptors(uvc, USB_SPEED_SUPER_PLUS);
+	if (IS_ERR(f->ssp_descriptors)) {
+		ret = PTR_ERR(f->ssp_descriptors);
+		f->ssp_descriptors = NULL;
 		goto error;
 	}
 
@@ -1147,5 +1157,6 @@ err_config:
 }
 
 DECLARE_USB_FUNCTION_INIT(uvc, uvc_alloc_inst, uvc_alloc);
+MODULE_DESCRIPTION("USB Video Class Gadget driver");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Laurent Pinchart");

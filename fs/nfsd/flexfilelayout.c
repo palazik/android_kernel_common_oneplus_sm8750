@@ -126,7 +126,7 @@ nfsd4_ff_proc_getdeviceinfo(struct super_block *sb, struct svc_rqst *rqstp,
 }
 
 static __be32
-nfsd4_ff_proc_layoutcommit(struct inode *inode,
+nfsd4_ff_proc_layoutcommit(struct inode *inode, struct svc_rqst *rqstp,
 		struct nfsd4_layoutcommit *lcp)
 {
 	return nfs_ok;

@@ -733,6 +733,26 @@ out:
 }
 
 #ifdef SECCOMP_ARCH_NATIVE
+static bool seccomp_uprobe_exception(struct seccomp_data *sd)
+{
+#if defined __NR_uretprobe || defined __NR_uprobe
+#ifdef SECCOMP_ARCH_COMPAT
+	if (sd->arch == SECCOMP_ARCH_NATIVE)
+#endif
+	{
+#ifdef __NR_uretprobe
+		if (sd->nr == __NR_uretprobe)
+			return true;
+#endif
+#ifdef __NR_uprobe
+		if (sd->nr == __NR_uprobe)
+			return true;
+#endif
+	}
+#endif
+	return false;
+}
+
 /**
  * seccomp_is_const_allow - check if filter is constant allow with given data
  * @fprog: The BPF programs
@@ -748,6 +768,10 @@ static bool seccomp_is_const_allow(struct sock_fprog_kern *fprog,
 
 	if (WARN_ON_ONCE(!fprog))
 		return false;
+
+	/* Our single exception to filtering. */
+	if (seccomp_uprobe_exception(sd))
+		return true;
 
 	for (pc = 0; pc < fprog->len; pc++) {
 		struct sock_filter *insn = &fprog->filter[pc];
@@ -1023,6 +1047,12 @@ static inline void seccomp_log(unsigned long syscall, long signr, u32 action,
  */
 static const int mode1_syscalls[] = {
 	__NR_seccomp_read, __NR_seccomp_write, __NR_seccomp_exit, __NR_seccomp_sigreturn,
+#ifdef __NR_uretprobe
+	__NR_uretprobe,
+#endif
+#ifdef __NR_uprobe
+	__NR_uprobe,
+#endif
 	-1, /* negative terminated */
 };
 
@@ -1085,7 +1115,7 @@ static void seccomp_handle_addfd(struct seccomp_kaddfd *addfd, struct seccomp_kn
 	 */
 	list_del_init(&addfd->list);
 	if (!addfd->setfd)
-		fd = receive_fd(addfd->file, addfd->flags);
+		fd = receive_fd(addfd->file, NULL, addfd->flags);
 	else
 		fd = receive_fd_replace(addfd->fd, addfd->file, addfd->flags);
 	addfd->ret = fd;
@@ -1477,7 +1507,7 @@ static int recv_wake_function(wait_queue_entry_t *wait, unsigned int mode, int s
 				  void *key)
 {
 	/* Avoid a wakeup if event not interesting for us. */
-	if (key && !(key_to_poll(key) & (EPOLLIN | EPOLLERR)))
+	if (key && !(key_to_poll(key) & (EPOLLIN | EPOLLERR | EPOLLHUP)))
 		return 0;
 	return autoremove_wake_function(wait, mode, sync, key);
 }
@@ -1487,6 +1517,9 @@ static int recv_wait_event(struct seccomp_filter *filter)
 	DEFINE_WAIT_FUNC(wait, recv_wake_function);
 	int ret;
 
+	if (refcount_read(&filter->users) == 0)
+		return 0;
+
 	if (atomic_dec_if_positive(&filter->notif->requests) >= 0)
 		return 0;
 
@@ -1494,6 +1527,8 @@ static int recv_wait_event(struct seccomp_filter *filter)
 		ret = prepare_to_wait_event(&filter->wqh, &wait, TASK_INTERRUPTIBLE);
 
 		if (atomic_dec_if_positive(&filter->notif->requests) >= 0)
+			break;
+		if (refcount_read(&filter->users) == 0)
 			break;
 
 		if (ret)
@@ -2345,7 +2380,7 @@ static bool seccomp_actions_logged_from_names(u32 *actions_logged, char *names)
 	return true;
 }
 
-static int read_actions_logged(struct ctl_table *ro_table, void *buffer,
+static int read_actions_logged(const struct ctl_table *ro_table, void *buffer,
 			       size_t *lenp, loff_t *ppos)
 {
 	char names[sizeof(seccomp_actions_avail)];
@@ -2363,7 +2398,7 @@ static int read_actions_logged(struct ctl_table *ro_table, void *buffer,
 	return proc_dostring(&table, 0, buffer, lenp, ppos);
 }
 
-static int write_actions_logged(struct ctl_table *ro_table, void *buffer,
+static int write_actions_logged(const struct ctl_table *ro_table, void *buffer,
 				size_t *lenp, loff_t *ppos, u32 *actions_logged)
 {
 	char names[sizeof(seccomp_actions_avail)];
@@ -2424,7 +2459,7 @@ static void audit_actions_logged(u32 actions_logged, u32 old_actions_logged,
 	return audit_seccomp_actions_logged(new, old, !ret);
 }
 
-static int seccomp_actions_logged_handler(struct ctl_table *ro_table, int write,
+static int seccomp_actions_logged_handler(const struct ctl_table *ro_table, int write,
 					  void *buffer, size_t *lenp,
 					  loff_t *ppos)
 {
@@ -2456,7 +2491,6 @@ static struct ctl_table seccomp_sysctl_table[] = {
 		.mode		= 0644,
 		.proc_handler	= seccomp_actions_logged_handler,
 	},
-	{ }
 };
 
 static int __init seccomp_sysctl_init(void)

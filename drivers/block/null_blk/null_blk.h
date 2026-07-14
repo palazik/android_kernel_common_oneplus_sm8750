@@ -16,11 +16,6 @@
 #include <linux/mutex.h>
 
 struct nullb_cmd {
-	union {
-		struct request *rq;
-		struct bio *bio;
-	};
-	unsigned int tag;
 	blk_status_t error;
 	bool fake_timeout;
 	struct nullb_queue *nq;
@@ -28,16 +23,11 @@ struct nullb_cmd {
 };
 
 struct nullb_queue {
-	unsigned long *tag_map;
-	wait_queue_head_t wait;
-	unsigned int queue_depth;
 	struct nullb_device *dev;
 	unsigned int requeue_selection;
 
 	struct list_head poll_list;
 	spinlock_t poll_lock;
-
-	struct nullb_cmd *cmds;
 };
 
 struct nullb_zone {
@@ -58,13 +48,6 @@ struct nullb_zone {
 	sector_t wp;
 	unsigned int len;
 	unsigned int capacity;
-};
-
-/* Queue modes */
-enum {
-	NULL_Q_BIO	= 0,
-	NULL_Q_RQ	= 1,
-	NULL_Q_MQ	= 2,
 };
 
 struct nullb_device {
@@ -88,7 +71,6 @@ struct nullb_device {
 	unsigned int imp_close_zone_no;
 	struct nullb_zone *zones;
 	sector_t zone_size_sects;
-	unsigned int zone_size_sects_shift;
 	bool need_zone_res_mgmt;
 	spinlock_t zone_res_lock;
 
@@ -100,6 +82,7 @@ struct nullb_device {
 	unsigned int zone_nr_conv; /* number of conventional zones */
 	unsigned int zone_max_open; /* max number of open zones */
 	unsigned int zone_max_active; /* max number of active zones */
+	unsigned int zone_append_max_sectors; /* Max sectors per zone append command */
 	unsigned int submit_queues; /* number of submission queues */
 	unsigned int prev_submit_queues; /* number of submission queues before change */
 	unsigned int poll_queues; /* number of IOPOLL submission queues */
@@ -108,7 +91,6 @@ struct nullb_device {
 	unsigned int queue_mode; /* block interface */
 	unsigned int blocksize; /* block size */
 	unsigned int max_sectors; /* Max sectors per command */
-	unsigned int max_segment_size; /* Max size of a single DMA segment. */
 	unsigned int irqmode; /* IRQ completion handler */
 	unsigned int hw_queue_depth; /* queue depth */
 	unsigned int index; /* index of the disk, only valid with a disk */
@@ -119,9 +101,13 @@ struct nullb_device {
 	bool memory_backed; /* if data is stored in memory */
 	bool discard; /* if support discard */
 	bool zoned; /* if device is zoned */
+	bool zone_full; /* Initialize zones to be full */
 	bool virt_boundary; /* virtual boundary on/off for the device */
 	bool no_sched; /* no IO scheduler for the device */
+	bool shared_tags; /* share tag set between devices for blk-mq */
 	bool shared_tag_bitmap; /* use hostwide shared tags */
+	bool fua; /* Support FUA */
+	bool preserves_write_order;
 };
 
 struct nullb {
@@ -132,14 +118,12 @@ struct nullb {
 	struct gendisk *disk;
 	struct blk_mq_tag_set *tag_set;
 	struct blk_mq_tag_set __tag_set;
-	unsigned int queue_depth;
 	atomic_long_t cur_bytes;
 	struct hrtimer bw_timer;
 	unsigned long cache_flush_pos;
 	spinlock_t lock;
 
 	struct nullb_queue *queues;
-	unsigned int nr_queues;
 	char disk_name[DISK_NAME_LEN];
 };
 
@@ -149,7 +133,7 @@ blk_status_t null_process_cmd(struct nullb_cmd *cmd, enum req_op op,
 			      sector_t sector, unsigned int nr_sectors);
 
 #ifdef CONFIG_BLK_DEV_ZONED
-int null_init_zoned_dev(struct nullb_device *dev, struct request_queue *q);
+int null_init_zoned_dev(struct nullb_device *dev, struct queue_limits *lim);
 int null_register_zoned_dev(struct nullb *nullb);
 void null_free_zoned_dev(struct nullb_device *dev);
 int null_report_zones(struct gendisk *disk, sector_t sector,
@@ -162,7 +146,7 @@ ssize_t zone_cond_store(struct nullb_device *dev, const char *page,
 			size_t count, enum blk_zone_cond cond);
 #else
 static inline int null_init_zoned_dev(struct nullb_device *dev,
-				      struct request_queue *q)
+		struct queue_limits *lim)
 {
 	pr_err("CONFIG_BLK_DEV_ZONED not enabled\n");
 	return -EINVAL;

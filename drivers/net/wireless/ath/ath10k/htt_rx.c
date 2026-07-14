@@ -4,7 +4,10 @@
  * Copyright (c) 2011-2017 Qualcomm Atheros, Inc.
  * Copyright (c) 2018, The Linux Foundation. All rights reserved.
  * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
+
+#include <linux/export.h>
 
 #include "core.h"
 #include "htc.h"
@@ -1295,7 +1298,7 @@ static void ath10k_htt_rx_h_ppdu(struct ath10k *ar,
 		status->encoding = RX_ENC_LEGACY;
 		status->bw = RATE_INFO_BW_20;
 
-		status->flag &= ~RX_FLAG_MACTIME_END;
+		status->flag &= ~RX_FLAG_MACTIME;
 		status->flag |= RX_FLAG_NO_SIGNAL_VAL;
 
 		status->flag &= ~(RX_FLAG_AMPDU_IS_LAST);
@@ -2965,7 +2968,6 @@ static void ath10k_htt_rx_tx_compl_ind(struct ath10k *ar,
 		break;
 	case HTT_DATA_TX_STATUS_DISCARD:
 	case HTT_DATA_TX_STATUS_POSTPONE:
-	case HTT_DATA_TX_STATUS_DOWNLOAD_FAIL:
 		tx_done.status = HTT_TX_COMPL_STATE_DISCARD;
 		break;
 	default:

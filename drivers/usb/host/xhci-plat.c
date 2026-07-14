@@ -20,9 +20,7 @@
 #include <linux/acpi.h>
 #include <linux/usb/of.h>
 #include <linux/reset.h>
-
-#include <trace/hooks/usb.h>
-#include <trace/hooks/xhci.h>
+#include <linux/usb/xhci-sideband.h>
 
 #include "xhci.h"
 #include "xhci-plat.h"
@@ -132,6 +130,9 @@ static const struct of_device_id usb_xhci_of_match[] = {
 		.data = &xhci_plat_marvell_armada3700,
 	}, {
 		.compatible = "brcm,xhci-brcm-v2",
+		.data = &xhci_plat_brcm,
+	}, {
+		.compatible = "brcm,bcm2711-xhci",
 		.data = &xhci_plat_brcm,
 	}, {
 		.compatible = "brcm,bcm7445-xhci",
@@ -260,6 +261,12 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 		if (device_property_read_bool(tmpdev, "write-64-hi-lo-quirk"))
 			xhci->quirks |= XHCI_WRITE_64_HI_LO;
 
+		if (device_property_read_bool(tmpdev, "xhci-missing-cas-quirk"))
+			xhci->quirks |= XHCI_MISSING_CAS;
+
+		if (device_property_read_bool(tmpdev, "xhci-skip-phy-init-quirk"))
+			xhci->quirks |= XHCI_SKIP_PHY_INIT;
+
 		device_property_read_u32(tmpdev, "imod-interval-ns",
 					 &xhci->imod_interval);
 		device_property_read_u16(tmpdev, "num-hc-interrupters",
@@ -287,7 +294,8 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 
 	hcd->tpl_support = of_usb_host_tpl_support(sysdev->of_node);
 
-	if (priv && (priv->quirks & XHCI_SKIP_PHY_INIT))
+	if ((priv && (priv->quirks & XHCI_SKIP_PHY_INIT)) ||
+	    (xhci->quirks & XHCI_SKIP_PHY_INIT))
 		hcd->skip_phy_initialization = 1;
 
 	if (priv && (priv->quirks & XHCI_SG_TRB_CACHE_SIZE_QUIRK))
@@ -446,17 +454,11 @@ void xhci_plat_remove(struct platform_device *dev)
 }
 EXPORT_SYMBOL_GPL(xhci_plat_remove);
 
-static int xhci_plat_suspend(struct device *dev)
+static int xhci_plat_suspend_common(struct device *dev)
 {
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
-	struct usb_device *udev;
-	int ret, bypass = 0;
-
-	udev = hcd->self.root_hub;
-	trace_android_rvh_usb_dev_suspend(udev, PMSG_SUSPEND, &bypass);
-	if (bypass)
-		return 0;
+	int ret;
 
 	if (pm_runtime_suspended(dev))
 		pm_runtime_resume(dev);
@@ -480,17 +482,30 @@ static int xhci_plat_suspend(struct device *dev)
 	return 0;
 }
 
+static int xhci_plat_suspend(struct device *dev)
+{
+	struct usb_hcd	*hcd = dev_get_drvdata(dev);
+	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
+
+	if (xhci_sideband_check(hcd)) {
+		priv->sideband_at_suspend = 1;
+		dev_dbg(dev, "sideband instance active, skip suspend.\n");
+		return 0;
+	}
+
+	return xhci_plat_suspend_common(dev);
+}
+
+static int xhci_plat_freeze(struct device *dev)
+{
+	return xhci_plat_suspend_common(dev);
+}
+
 static int xhci_plat_resume_common(struct device *dev, struct pm_message pmsg)
 {
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
-	struct usb_device *udev;
-	int ret, bypass = 0;
-
-	udev = hcd->self.root_hub;
-	trace_android_vh_usb_dev_resume(udev, PMSG_RESUME, &bypass);
-	if (bypass)
-		return 0;
+	int ret;
 
 	if (!device_may_wakeup(dev) && (xhci->quirks & XHCI_SUSPEND_RESUME_CLKS)) {
 		ret = clk_prepare_enable(xhci->clk);
@@ -529,7 +544,21 @@ disable_clks:
 
 static int xhci_plat_resume(struct device *dev)
 {
+	struct usb_hcd	*hcd = dev_get_drvdata(dev);
+	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
+
+	if (priv->sideband_at_suspend) {
+		priv->sideband_at_suspend = 0;
+		dev_dbg(dev, "sideband instance active, skip resume.\n");
+		return 0;
+	}
+
 	return xhci_plat_resume_common(dev, PMSG_RESUME);
+}
+
+static int xhci_plat_thaw(struct device *dev)
+{
+	return xhci_plat_resume_common(dev, PMSG_THAW);
 }
 
 static int xhci_plat_restore(struct device *dev)
@@ -542,15 +571,10 @@ static int __maybe_unused xhci_plat_runtime_suspend(struct device *dev)
 	struct usb_hcd  *hcd = dev_get_drvdata(dev);
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 	int ret;
-	int bypass = 0;
 
 	ret = xhci_priv_suspend_quirk(hcd);
 	if (ret)
 		return ret;
-
-	trace_android_vh_xhci_suspend(dev, &bypass);
-	if (bypass)
-		return 0;
 
 	return xhci_suspend(xhci, true);
 }
@@ -559,11 +583,6 @@ static int __maybe_unused xhci_plat_runtime_resume(struct device *dev)
 {
 	struct usb_hcd  *hcd = dev_get_drvdata(dev);
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
-	int	bypass = 0;
-
-	trace_android_vh_xhci_resume(dev, &bypass);
-	if (bypass)
-		return 0;
 
 	return xhci_resume(xhci, PMSG_AUTO_RESUME);
 }
@@ -571,9 +590,9 @@ static int __maybe_unused xhci_plat_runtime_resume(struct device *dev)
 const struct dev_pm_ops xhci_plat_pm_ops = {
 	.suspend = pm_sleep_ptr(xhci_plat_suspend),
 	.resume = pm_sleep_ptr(xhci_plat_resume),
-	.freeze = pm_sleep_ptr(xhci_plat_suspend),
-	.thaw = pm_sleep_ptr(xhci_plat_resume),
-	.poweroff = pm_sleep_ptr(xhci_plat_suspend),
+	.freeze = pm_sleep_ptr(xhci_plat_freeze),
+	.thaw = pm_sleep_ptr(xhci_plat_thaw),
+	.poweroff = pm_sleep_ptr(xhci_plat_freeze),
 	.restore = pm_sleep_ptr(xhci_plat_restore),
 
 	SET_RUNTIME_PM_OPS(xhci_plat_runtime_suspend,

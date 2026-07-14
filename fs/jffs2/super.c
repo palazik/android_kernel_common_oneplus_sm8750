@@ -151,6 +151,7 @@ static struct dentry *jffs2_get_parent(struct dentry *child)
 }
 
 static const struct export_operations jffs2_export_ops = {
+	.encode_fh = generic_encode_ino32_fh,
 	.get_parent = jffs2_get_parent,
 	.fh_to_dentry = jffs2_fh_to_dentry,
 	.fh_to_parent = jffs2_fh_to_parent,
@@ -387,7 +388,7 @@ static int __init init_jffs2_fs(void)
 	jffs2_inode_cachep = kmem_cache_create("jffs2_i",
 					     sizeof(struct jffs2_inode_info),
 					     0, (SLAB_RECLAIM_ACCOUNT|
-						SLAB_MEM_SPREAD|SLAB_ACCOUNT),
+						SLAB_ACCOUNT),
 					     jffs2_i_init_once);
 	if (!jffs2_inode_cachep) {
 		pr_err("error: Failed to initialise inode cache\n");
@@ -440,4 +441,3 @@ MODULE_DESCRIPTION("The Journalling Flash File System, v2");
 MODULE_AUTHOR("Red Hat, Inc.");
 MODULE_LICENSE("GPL"); // Actually dual-licensed, but it doesn't matter for
 		       // the sake of this tag. It's Free Software.
-MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);

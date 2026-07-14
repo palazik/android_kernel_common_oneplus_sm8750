@@ -89,8 +89,6 @@ struct microcode_amd {
 	unsigned int			mpb[];
 };
 
-#define PATCH_MAX_SIZE (3 * PAGE_SIZE)
-
 static struct equiv_cpu_table {
 	unsigned int num_entries;
 	struct equiv_cpu_entry *entry;
@@ -404,8 +402,7 @@ static bool verify_equivalence_table(const u8 *buf, size_t buf_size)
  * On success, @sh_psize returns the patch size according to the section header,
  * to the caller.
  */
-static bool
-__verify_patch_section(const u8 *buf, size_t buf_size, u32 *sh_psize)
+static bool __verify_patch_section(const u8 *buf, size_t buf_size, u32 *sh_psize)
 {
 	u32 p_type, p_size;
 	const u32 *hdr;
@@ -441,13 +438,13 @@ __verify_patch_section(const u8 *buf, size_t buf_size, u32 *sh_psize)
  * exceed the per-family maximum). @sh_psize is the size read from the section
  * header.
  */
-static bool __verify_patch_size(u32 sh_psize, size_t buf_size)
+static unsigned int __verify_patch_size(u32 sh_psize, size_t buf_size)
 {
 	u8 family = x86_family(bsp_cpuid_1_eax);
 	u32 max_size;
 
 	if (family >= 0x15)
-		goto ret;
+		return min_t(u32, sh_psize, buf_size);
 
 #define F1XH_MPB_MAX_SIZE 2048
 #define F14H_MPB_MAX_SIZE 1824
@@ -461,15 +458,13 @@ static bool __verify_patch_size(u32 sh_psize, size_t buf_size)
 		break;
 	default:
 		WARN(1, "%s: WTF family: 0x%x\n", __func__, family);
-		return false;
+		return 0;
 	}
 
-	if (sh_psize > max_size)
-		return false;
+	if (sh_psize > min_t(u32, buf_size, max_size))
+		return 0;
 
-ret:
-	/* Working with the whole buffer so < is ok. */
-	return sh_psize <= buf_size;
+	return sh_psize;
 }
 
 /*
@@ -485,6 +480,7 @@ static int verify_patch(const u8 *buf, size_t buf_size, u32 *patch_size)
 	u8 family = x86_family(bsp_cpuid_1_eax);
 	struct microcode_header_amd *mc_hdr;
 	u32 cur_rev, cutoff, patch_rev;
+	unsigned int ret;
 	u32 sh_psize;
 	u16 proc_id;
 	u8 patch_fam;
@@ -508,7 +504,8 @@ static int verify_patch(const u8 *buf, size_t buf_size, u32 *patch_size)
 		return -1;
 	}
 
-	if (!__verify_patch_size(sh_psize, buf_size)) {
+	ret = __verify_patch_size(sh_psize, buf_size);
+	if (!ret) {
 		pr_debug("Per-family patch size mismatch.\n");
 		return -1;
 	}
@@ -704,7 +701,7 @@ static bool get_builtin_microcode(struct cpio_data *cp)
 
 	if (family >= 0x15)
 		snprintf(fw_name, sizeof(fw_name),
-			 "amd-ucode/microcode_amd_fam%.2xh.bin", family);
+			 "amd-ucode/microcode_amd_fam%02hhxh.bin", family);
 
 	if (firmware_request_builtin(&fw, fw_name)) {
 		cp->size = fw.size;

@@ -43,11 +43,6 @@ module_param_named(metacopy, ovl_metacopy_def, bool, 0644);
 MODULE_PARM_DESC(metacopy,
 		 "Default to on or off for the metadata only copy up feature");
 
-static bool __read_mostly ovl_override_creds_def = true;
-module_param_named(override_creds, ovl_override_creds_def, bool, 0644);
-MODULE_PARM_DESC(ovl_override_creds_def,
-		 "Use mounter's credentials for accesses");
-
 enum ovl_opt {
 	Opt_lowerdir,
 	Opt_lowerdir_add,
@@ -63,8 +58,8 @@ enum ovl_opt {
 	Opt_xino,
 	Opt_metacopy,
 	Opt_verity,
+	Opt_fsync,
 	Opt_volatile,
-	Opt_override_creds,
 };
 
 static const struct constant_table ovl_parameter_bool[] = {
@@ -145,9 +140,22 @@ static int ovl_verity_mode_def(void)
 	return OVL_VERITY_OFF;
 }
 
-#define fsparam_string_empty(NAME, OPT) \
-	__fsparam(fs_param_is_string, NAME, OPT, fs_param_can_be_empty, NULL)
+static const struct constant_table ovl_parameter_fsync[] = {
+	{ "volatile",	OVL_FSYNC_VOLATILE },
+	{ "auto",	OVL_FSYNC_AUTO     },
+	{ "strict",	OVL_FSYNC_STRICT   },
+	{}
+};
 
+static const char *ovl_fsync_mode(struct ovl_config *config)
+{
+	return ovl_parameter_fsync[config->fsync_mode].name;
+}
+
+static int ovl_fsync_mode_def(void)
+{
+	return OVL_FSYNC_AUTO;
+}
 
 const struct fs_parameter_spec ovl_parameter_spec[] = {
 	fsparam_string_empty("lowerdir",    Opt_lowerdir),
@@ -164,8 +172,8 @@ const struct fs_parameter_spec ovl_parameter_spec[] = {
 	fsparam_enum("xino",                Opt_xino, ovl_parameter_xino),
 	fsparam_enum("metacopy",            Opt_metacopy, ovl_parameter_bool),
 	fsparam_enum("verity",              Opt_verity, ovl_parameter_verity),
+	fsparam_enum("fsync",               Opt_fsync, ovl_parameter_fsync),
 	fsparam_flag("volatile",            Opt_volatile),
-	fsparam_enum("override_creds",      Opt_override_creds, ovl_parameter_bool),
 	{}
 };
 
@@ -601,14 +609,14 @@ static int ovl_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_verity:
 		config->verity_mode = result.uint_32;
 		break;
+	case Opt_fsync:
+		config->fsync_mode = result.uint_32;
+		break;
 	case Opt_volatile:
-		config->ovl_volatile = true;
+		config->fsync_mode = OVL_FSYNC_VOLATILE;
 		break;
 	case Opt_userxattr:
 		config->userxattr = true;
-		break;
-	case Opt_override_creds:
-		config->override_creds = result.uint_32;
 		break;
 	default:
 		pr_err("unrecognized mount option \"%s\" or missing value\n",
@@ -716,6 +724,7 @@ int ovl_init_fs_context(struct fs_context *fc)
 	ofs->config.nfs_export		= ovl_nfs_export_def;
 	ofs->config.xino		= ovl_xino_def();
 	ofs->config.metacopy		= ovl_metacopy_def;
+	ofs->config.fsync_mode		= ovl_fsync_mode_def();
 
 	fc->s_fs_info		= ofs;
 	fc->fs_private		= ctx;
@@ -734,10 +743,8 @@ void ovl_free_fs(struct ovl_fs *ofs)
 	unsigned i;
 
 	iput(ofs->workbasedir_trap);
-	iput(ofs->indexdir_trap);
 	iput(ofs->workdir_trap);
 	dput(ofs->whiteout);
-	dput(ofs->indexdir);
 	dput(ofs->workdir);
 	if (ofs->workdir_locked)
 		ovl_inuse_unlock(ofs->workbasedir);
@@ -786,9 +793,9 @@ int ovl_fs_params_verify(const struct ovl_fs_context *ctx,
 		config->index = false;
 	}
 
-	if (!config->upperdir && config->ovl_volatile) {
+	if (!config->upperdir && ovl_is_volatile(config)) {
 		pr_info("option \"volatile\" is meaningless in a non-upper mount, ignoring it.\n");
-		config->ovl_volatile = false;
+		config->fsync_mode = ovl_fsync_mode_def();
 	}
 
 	if (!config->upperdir && config->uuid == OVL_UUID_ON) {
@@ -1003,19 +1010,18 @@ int ovl_show_options(struct seq_file *m, struct dentry *dentry)
 		seq_printf(m, ",redirect_dir=%s",
 			   ovl_redirect_mode(&ofs->config));
 	if (ofs->config.index != ovl_index_def)
-		seq_printf(m, ",index=%s", ofs->config.index ? "on" : "off");
+		seq_printf(m, ",index=%s", str_on_off(ofs->config.index));
 	if (ofs->config.uuid != ovl_uuid_def())
 		seq_printf(m, ",uuid=%s", ovl_uuid_mode(&ofs->config));
 	if (ofs->config.nfs_export != ovl_nfs_export_def)
-		seq_printf(m, ",nfs_export=%s", ofs->config.nfs_export ?
-						"on" : "off");
+		seq_printf(m, ",nfs_export=%s",
+			   str_on_off(ofs->config.nfs_export));
 	if (ofs->config.xino != ovl_xino_def() && !ovl_same_fs(ofs))
 		seq_printf(m, ",xino=%s", ovl_xino_mode(&ofs->config));
 	if (ofs->config.metacopy != ovl_metacopy_def)
-		seq_printf(m, ",metacopy=%s",
-			   ofs->config.metacopy ? "on" : "off");
-	if (ofs->config.ovl_volatile)
-		seq_puts(m, ",volatile");
+		seq_printf(m, ",metacopy=%s", str_on_off(ofs->config.metacopy));
+	if (ofs->config.fsync_mode != ovl_fsync_mode_def())
+		seq_printf(m, ",fsync=%s", ovl_fsync_mode(&ofs->config));
 	if (ofs->config.userxattr)
 		seq_puts(m, ",userxattr");
 	if (ofs->config.verity_mode != ovl_verity_mode_def())

@@ -45,13 +45,6 @@ void __init arm64_hugetlb_cma_reserve(void)
 	else
 		order = CONT_PMD_SHIFT - PAGE_SHIFT;
 
-	/*
-	 * HugeTLB CMA reservation is required for gigantic
-	 * huge pages which could not be allocated via the
-	 * page allocator. Just warn if there is any change
-	 * breaking this assumption.
-	 */
-	WARN_ON(order <= MAX_ORDER);
 	hugetlb_cma_reserve(order);
 }
 #endif /* CONFIG_CMA */
@@ -85,20 +78,6 @@ bool arch_hugetlb_migration_supported(struct hstate *h)
 	return true;
 }
 #endif
-
-int pmd_huge(pmd_t pmd)
-{
-	return pmd_val(pmd) && !(pmd_val(pmd) & PMD_TABLE_BIT);
-}
-
-int pud_huge(pud_t pud)
-{
-#ifndef __PAGETABLE_PMD_FOLDED
-	return pud_val(pud) && !(pud_val(pud) & PUD_TABLE_BIT);
-#else
-	return 0;
-#endif
-}
 
 static int find_num_contig(struct mm_struct *mm, unsigned long addr,
 			   pte_t *ptep, size_t *pgsize)
@@ -141,7 +120,7 @@ static inline int num_contig_ptes(unsigned long size, size_t *pgsize)
 	return contig_ptes;
 }
 
-pte_t huge_ptep_get(pte_t *ptep)
+pte_t huge_ptep_get(struct mm_struct *mm, unsigned long addr, pte_t *ptep)
 {
 	int ncontig, i;
 	size_t pgsize;
@@ -275,7 +254,10 @@ pte_t *huge_pte_alloc(struct mm_struct *mm, struct vm_area_struct *vma,
 	pte_t *ptep = NULL;
 
 	pgdp = pgd_offset(mm, addr);
-	p4dp = p4d_offset(pgdp, addr);
+	p4dp = p4d_alloc(mm, pgdp, addr);
+	if (!p4dp)
+		return NULL;
+
 	pudp = pud_alloc(mm, p4dp, addr);
 	if (!pudp)
 		return NULL;
@@ -324,7 +306,7 @@ pte_t *huge_pte_offset(struct mm_struct *mm,
 	if (sz != PUD_SIZE && pud_none(pud))
 		return NULL;
 	/* hugepage or swap? */
-	if (pud_huge(pud) || !pud_present(pud))
+	if (pud_leaf(pud) || !pud_present(pud))
 		return (pte_t *)pudp;
 	/* table; check the next level */
 
@@ -336,7 +318,7 @@ pte_t *huge_pte_offset(struct mm_struct *mm,
 	if (!(sz == PMD_SIZE || sz == CONT_PMD_SIZE) &&
 	    pmd_none(pmd))
 		return NULL;
-	if (pmd_huge(pmd) || !pmd_present(pmd))
+	if (pmd_leaf(pmd) || !pmd_present(pmd))
 		return (pte_t *)pmdp;
 
 	if (sz == CONT_PTE_SIZE)
@@ -545,8 +527,7 @@ pte_t huge_ptep_modify_prot_start(struct vm_area_struct *vma, unsigned long addr
 {
 	unsigned long psize = huge_page_size(hstate_vma(vma));
 
-	if (IS_ENABLED(CONFIG_ARM64_ERRATUM_2645198) &&
-	    cpus_have_const_cap(ARM64_WORKAROUND_2645198)) {
+	if (alternative_has_cap_unlikely(ARM64_WORKAROUND_2645198)) {
 		/*
 		 * Break-before-make (BBM) is required for all user space mappings
 		 * when the permission changes from executable to non-executable

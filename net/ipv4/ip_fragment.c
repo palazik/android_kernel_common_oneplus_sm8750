@@ -50,6 +50,7 @@
 #include <linux/netfilter_ipv4.h>
 #include <net/inet_ecn.h>
 #include <net/l3mdev.h>
+#include <trace/hooks/net.h>
 
 /* NOTE. Logic of IP defragmentation is parallel to corresponding IPv6
  * code now. If you change something here, _PLEASE_ update ipv6/reassembly.c
@@ -322,6 +323,8 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
 			goto discard_qp;
 		qp->q.flags |= INET_FRAG_LAST_IN;
 		qp->q.len = end;
+
+		trace_android_vh_reasm_timer_adjust(&qp->q, skb);
 	} else {
 		if (end&7) {
 			end &= ~7;
@@ -360,7 +363,7 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
 		qp->iif = dev->ifindex;
 
 	qp->q.stamp = skb->tstamp;
-	qp->q.mono_delivery_time = skb->mono_delivery_time;
+	qp->q.tstamp_type = skb->tstamp_type;
 	qp->q.meat += skb->len;
 	qp->ecn |= ecn;
 	add_frag_mem_limit(qp->q.fqdir, skb->truesize);
@@ -488,7 +491,7 @@ out_fail:
 /* Process an incoming IP datagram fragment. */
 int ip_defrag(struct net *net, struct sk_buff *skb, u32 user)
 {
-	struct net_device *dev = skb->dev ? : skb_dst(skb)->dev;
+	struct net_device *dev = skb->dev ? : skb_dst_dev(skb);
 	int vif = l3mdev_master_ifindex_rcu(dev);
 	struct ipq *qp;
 
@@ -585,7 +588,6 @@ static struct ctl_table ip4_frags_ns_ctl_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &dist_min,
 	},
-	{ }
 };
 
 /* secret interval has been deprecated */
@@ -598,7 +600,6 @@ static struct ctl_table ip4_frags_ctl_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_jiffies,
 	},
-	{ }
 };
 
 static int __net_init ip4_frags_ns_ctl_register(struct net *net)
@@ -637,7 +638,7 @@ err_alloc:
 
 static void __net_exit ip4_frags_ns_ctl_unregister(struct net *net)
 {
-	struct ctl_table *table;
+	const struct ctl_table *table;
 
 	table = net->ipv4.frags_hdr->ctl_table_arg;
 	unregister_net_sysctl_table(net->ipv4.frags_hdr);

@@ -3767,8 +3767,6 @@ static int qlcnic_attach_func(struct pci_dev *pdev)
 	struct qlcnic_adapter *adapter = pci_get_drvdata(pdev);
 	struct net_device *netdev = adapter->netdev;
 
-	pdev->error_state = pci_channel_io_normal;
-
 	err = pci_enable_device(pdev);
 	if (err)
 		return err;
@@ -4146,7 +4144,7 @@ qlcnic_inetaddr_event(struct notifier_block *this,
 
 	struct in_ifaddr *ifa = (struct in_ifaddr *)ptr;
 
-	dev = ifa->ifa_dev ? ifa->ifa_dev->dev : NULL;
+	dev = ifa->ifa_dev->dev;
 
 recheck:
 	if (dev == NULL)

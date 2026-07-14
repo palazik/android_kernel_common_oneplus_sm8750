@@ -3,7 +3,6 @@
 #include <vmlinux.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
-#include "bpf_experimental.h"
 
 /* From uapi/linux/dma-buf.h */
 #define DMA_BUF_NAME_LEN 32
@@ -87,9 +86,8 @@ int iter_dmabuf_for_each(const void *ctx)
 		 * The entire name buffer is used as a map key.
 		 * Zeroize any uninitialized trailing bytes after the NUL.
 		 */
-		bpf_for(i, 0, DMA_BUF_NAME_LEN)
-			if (i >= len)
-				name[i] = 0;
+		bpf_for(i, len, DMA_BUF_NAME_LEN)
+			name[i] = 0;
 
 		found = bpf_map_lookup_elem(&testbuf_hash, name);
 		if (found) {

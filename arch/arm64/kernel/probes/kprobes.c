@@ -10,6 +10,7 @@
 
 #define pr_fmt(fmt) "kprobes: " fmt
 
+#include <linux/execmem.h>
 #include <linux/extable.h>
 #include <linux/kasan.h>
 #include <linux/kernel.h>
@@ -40,6 +41,20 @@ DEFINE_PER_CPU(struct kprobe_ctlblk, kprobe_ctlblk);
 
 static void __kprobes
 post_kprobe_handler(struct kprobe *, struct kprobe_ctlblk *, struct pt_regs *);
+
+void *alloc_insn_page(void)
+{
+	void *addr;
+
+	addr = execmem_alloc(EXECMEM_KPROBES, PAGE_SIZE);
+	if (!addr)
+		return NULL;
+	if (set_memory_rox((unsigned long)addr, 1)) {
+		execmem_free(addr);
+		return NULL;
+	}
+	return addr;
+}
 
 static void __kprobes arch_prepare_ss_slot(struct kprobe *p)
 {
@@ -127,19 +142,6 @@ int __kprobes arch_prepare_kprobe(struct kprobe *p)
 		arch_prepare_simulate(p);
 
 	return 0;
-}
-
-void *alloc_insn_page(void)
-{
-	void *addr;
-
-	addr = __vmalloc_node_range(PAGE_SIZE, 1, VMALLOC_START, VMALLOC_END,
-			GFP_KERNEL, PAGE_KERNEL_ROX, VM_FLUSH_RESET_PERMS,
-			NUMA_NO_NODE, __builtin_return_address(0));
-	if (!addr)
-		return NULL;
-	set_memory_rox((unsigned long)addr, 1);
-	return addr;
 }
 
 /* arm kprobe: install breakpoint in text */
@@ -377,6 +379,21 @@ static struct break_hook kprobes_break_ss_hook = {
 	.fn = kprobe_breakpoint_ss_handler,
 };
 
+static int __kprobes
+kretprobe_breakpoint_handler(struct pt_regs *regs, unsigned long esr)
+{
+	if (regs->pc != (unsigned long)__kretprobe_trampoline)
+		return DBG_HOOK_ERROR;
+
+	regs->pc = kretprobe_trampoline_handler(regs, (void *)regs->regs[29]);
+	return DBG_HOOK_HANDLED;
+}
+
+static struct break_hook kretprobes_break_hook = {
+	.imm = KRETPROBES_BRK_IMM,
+	.fn = kretprobe_breakpoint_handler,
+};
+
 /*
  * Provide a blacklist of symbols identifying ranges which cannot be kprobed.
  * This blacklist is exposed to userspace via debugfs (kprobes/blacklist).
@@ -402,11 +419,6 @@ int __init arch_populate_kprobe_blacklist(void)
 	return ret;
 }
 
-void __kprobes __used *trampoline_probe_handler(struct pt_regs *regs)
-{
-	return (void *)kretprobe_trampoline_handler(regs, (void *)regs->regs[29]);
-}
-
 void __kprobes arch_prepare_kretprobe(struct kretprobe_instance *ri,
 				      struct pt_regs *regs)
 {
@@ -426,6 +438,7 @@ int __init arch_init_kprobes(void)
 {
 	register_kernel_break_hook(&kprobes_break_hook);
 	register_kernel_break_hook(&kprobes_break_ss_hook);
+	register_kernel_break_hook(&kretprobes_break_hook);
 
 	return 0;
 }

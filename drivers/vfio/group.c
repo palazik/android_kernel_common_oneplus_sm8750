@@ -112,7 +112,7 @@ static int vfio_group_ioctl_set_container(struct vfio_group *group,
 		return -EFAULT;
 
 	f = fdget(fd);
-	if (!f.file)
+	if (!fd_file(f))
 		return -EBADF;
 
 	mutex_lock(&group->group_lock);
@@ -125,13 +125,13 @@ static int vfio_group_ioctl_set_container(struct vfio_group *group,
 		goto out_unlock;
 	}
 
-	container = vfio_container_from_file(f.file);
+	container = vfio_container_from_file(fd_file(f));
 	if (container) {
 		ret = vfio_container_attach_group(container, group);
 		goto out_unlock;
 	}
 
-	iommufd = iommufd_ctx_from_file(f.file);
+	iommufd = iommufd_ctx_from_file(fd_file(f));
 	if (!IS_ERR(iommufd)) {
 		if (IS_ENABLED(CONFIG_VFIO_NOIOMMU) &&
 		    group->type == VFIO_NO_IOMMU)
@@ -840,9 +840,6 @@ struct iommu_group *vfio_file_iommu_group(struct file *file)
 {
 	struct vfio_group *group = vfio_group_from_file(file);
 	struct iommu_group *iommu_group = NULL;
-
-	if (!IS_ENABLED(CONFIG_SPAPR_TCE_IOMMU))
-		return NULL;
 
 	if (!group)
 		return NULL;

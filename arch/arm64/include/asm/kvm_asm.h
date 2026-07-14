@@ -10,6 +10,7 @@
 #include <asm/hyp_image.h>
 #include <asm/insn.h>
 #include <asm/virt.h>
+#include <asm/sysreg.h>
 
 #define ARM_EXIT_WITH_SERROR_BIT  31
 #define ARM_EXCEPTION_CODE(x)	  ((x) & ~(1U << ARM_EXIT_WITH_SERROR_BIT))
@@ -73,18 +74,21 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___pkvm_init_module,
 	__KVM_HOST_SMCCC_FUNC___pkvm_register_hcall,
 	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_init,
+	__KVM_HOST_SMCCC_FUNC___pkvm_devices_init,
 	__KVM_HOST_SMCCC_FUNC___pkvm_prot_finalize,
 
 	/* Hypercalls available after pKVM finalisation */
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_share_hyp,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_unshare_hyp,
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_map_guest,
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_unmap_guest,
-	__KVM_HOST_SMCCC_FUNC___pkvm_relax_perms,
-	__KVM_HOST_SMCCC_FUNC___pkvm_wrprotect,
-	__KVM_HOST_SMCCC_FUNC___pkvm_dirty_log,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_donate_guest,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_donate_guest_sglist,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_share_guest,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_unshare_guest,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_relax_perms_guest,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_wrprotect_guest,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_test_clear_young_guest,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_mkyoung_guest,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_split_guest,
-	__KVM_HOST_SMCCC_FUNC___pkvm_tlb_flush_vmid,
 	__KVM_HOST_SMCCC_FUNC___kvm_adjust_pc,
 	__KVM_HOST_SMCCC_FUNC___kvm_vcpu_run,
 	__KVM_HOST_SMCCC_FUNC___kvm_timer_set_cntvoff,
@@ -95,29 +99,46 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___pkvm_start_teardown_vm,
 	__KVM_HOST_SMCCC_FUNC___pkvm_finalize_teardown_vm,
 	__KVM_HOST_SMCCC_FUNC___pkvm_reclaim_dying_guest_page,
+	__KVM_HOST_SMCCC_FUNC___pkvm_reclaim_dying_guest_ffa_resources,
+	__KVM_HOST_SMCCC_FUNC___pkvm_notify_guest_vm_avail,
 	__KVM_HOST_SMCCC_FUNC___pkvm_vcpu_load,
 	__KVM_HOST_SMCCC_FUNC___pkvm_vcpu_put,
 	__KVM_HOST_SMCCC_FUNC___pkvm_vcpu_sync_state,
+	__KVM_HOST_SMCCC_FUNC___pkvm_update_clock_tracing,
 	__KVM_HOST_SMCCC_FUNC___pkvm_load_tracing,
 	__KVM_HOST_SMCCC_FUNC___pkvm_teardown_tracing,
 	__KVM_HOST_SMCCC_FUNC___pkvm_enable_tracing,
+	__KVM_HOST_SMCCC_FUNC___pkvm_reset_tracing,
 	__KVM_HOST_SMCCC_FUNC___pkvm_swap_reader_tracing,
 	__KVM_HOST_SMCCC_FUNC___pkvm_enable_event,
+	__KVM_HOST_SMCCC_FUNC___pkvm_selftest_event,
+	__KVM_HOST_SMCCC_FUNC___pkvm_sync_ftrace,
+	__KVM_HOST_SMCCC_FUNC___pkvm_disable_ftrace,
+	__KVM_HOST_SMCCC_FUNC___pkvm_tlb_flush_vmid,
 	__KVM_HOST_SMCCC_FUNC___pkvm_hyp_alloc_mgt_refill,
 	__KVM_HOST_SMCCC_FUNC___pkvm_hyp_alloc_mgt_reclaimable,
 	__KVM_HOST_SMCCC_FUNC___pkvm_hyp_alloc_mgt_reclaim,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_alloc_domain,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_free_domain,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_attach_dev,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_attach_dev_nested,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_detach_dev,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_detach_dev_nested,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_iotlb_inv_nested_domain,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_nested_cfg_sync,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_map_pages,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_unmap_pages,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_iova_to_phys,
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_hvc_pd,
-	__KVM_HOST_SMCCC_FUNC___pkvm_stage2_snapshot,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_iotlb_sync_map,
-	__KVM_HOST_SMCCC_FUNC___pkvm_hyp_pool_report_free_pages,
-	__KVM_HOST_SMCCC_FUNC___pkvm_hyp_pool_report_min_free_pages,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_hvc_pd,
+	__KVM_HOST_SMCCC_FUNC___pkvm_ptdump,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_map_sg,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_donate_hyp_mmio,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_reclaim_hyp_mmio,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_map_guest_mmio,
+	__KVM_HOST_SMCCC_FUNC___pkvm_pviommu_attach,
+	__KVM_HOST_SMCCC_FUNC___pkvm_pviommu_add_vsid,
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_get_ffa_version,
 
 	/*
 	 * Start of the dynamically registered hypercalls. Start a bit
@@ -236,6 +257,7 @@ struct kvm_nvhe_init_params {
 	unsigned long hfgwtr_el2;
 	unsigned long vttbr;
 	unsigned long vtcr;
+	unsigned long tmp;
 };
 
 /*
@@ -277,8 +299,6 @@ extern unsigned long kvm_nvhe_sym(kvm_arm_hyp_percpu_base)[];
 DECLARE_KVM_NVHE_SYM(__per_cpu_start);
 DECLARE_KVM_NVHE_SYM(__per_cpu_end);
 
-extern unsigned long kvm_nvhe_sym(kvm_arm_hyp_host_fp_state)[];
-
 DECLARE_KVM_HYP_SYM(__bp_harden_hyp_vecs);
 #define __bp_harden_hyp_vecs	CHOOSE_HYP_SYM(__bp_harden_hyp_vecs)
 
@@ -293,7 +313,12 @@ extern void __kvm_tlb_flush_vmid_range(struct kvm_s2_mmu *mmu,
 					phys_addr_t start, unsigned long pages);
 extern void __kvm_tlb_flush_vmid(struct kvm_s2_mmu *mmu);
 
+extern int __kvm_tlbi_s1e2(struct kvm_s2_mmu *mmu, u64 va, u64 sys_encoding);
+
 extern void __kvm_timer_set_cntvoff(u64 cntvoff);
+extern void __kvm_at_s1e01(struct kvm_vcpu *vcpu, u32 op, u64 vaddr);
+extern void __kvm_at_s1e2(struct kvm_vcpu *vcpu, u32 op, u64 vaddr);
+extern void __kvm_at_s12(struct kvm_vcpu *vcpu, u32 op, u64 vaddr);
 
 extern int __kvm_vcpu_run(struct kvm_vcpu *vcpu);
 
@@ -318,7 +343,7 @@ extern u64 __kvm_get_mdcr_el2(void);
 	asm volatile(							\
 	"	mrs	%1, spsr_el2\n"					\
 	"	mrs	%2, elr_el2\n"					\
-	"1:	at	"at_op", %3\n"					\
+	"1:	" __msr_s(at_op, "%3") "\n"				\
 	"	isb\n"							\
 	"	b	9f\n"						\
 	"2:	msr	spsr_el2, %1\n"					\
@@ -330,6 +355,8 @@ extern u64 __kvm_get_mdcr_el2(void);
 	: "r" (addr), "i" (-EFAULT));					\
 	__kvm_at_err;							\
 } )
+
+void vcpu_illegal_trap(struct kvm_vcpu *vcpu, u64 *exit_code);
 
 void __noreturn hyp_panic(void);
 asmlinkage void kvm_unexpected_el2_exception(void);

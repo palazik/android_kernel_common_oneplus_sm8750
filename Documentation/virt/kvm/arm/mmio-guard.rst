@@ -28,10 +28,13 @@ This relies on a set of hypercalls defined in the KVM-specific range,
 using the HVC64 calling convention.
 
 When operating on a range of contiguous IPA space, it is recommended
-to use ARM_SMCCC_KVM_FUNC_MMIO_RGUARD_MAP and
-ARM_SMCCC_KVM_FUNC_MMIO_RGUARD_UNMAP. Those HVCs take a number of
+to use ARM_SMCCC_KVM_FUNC_MMIO_RGUARD_MAP. This HVC takes a number of
 granules as an argument. See ``KVM_FUNC_HAS_RANGE`` in hypercalls.rst
 for a complete description.
+
+Both ARM_SMCCC_KVM_FUNC_MMIO_GUARD_UNMAP and
+ARM_SMCCC_KVM_FUNC_MMIO_RGUARD_UNMAP are only declared for legacy guests,
+that is, older than 6.12.
 
 * ARM_SMCCC_KVM_FUNC_MMIO_GUARD_INFO
 
@@ -73,12 +76,6 @@ for a complete description.
 
     ==============    ========    ======================================
     Function ID:      (uint32)    0xC6000008
-    Arguments:        (uint64)    PG-sized IPA range aligned to the PG
-                                  size which has been previously mapped.
-                                  Must be aligned to the PG size and
-                                  have been previously mapped (r1)
-    Return Values:    (int64)     NOT_SUPPORTED(-1) on error, or
-                                  RET_SUCCESS(0) (r0)
     ==============    ========    ======================================
 
 * ARM_SMCCC_KVM_FUNC_MMIO_RGUARD_MAP
@@ -101,14 +98,4 @@ for a complete description.
 
     ==============    ========    ======================================
     Function ID:      (uint32)    0xC600000B
-    Arguments:        (uint64)    PG-sized IPA range aligned to the PG
-                                  size which has been previously mapped.
-                                  Must be aligned to the PG size and
-                                  have been previously mapped (r1)
-                      (uint64)    Number of granules to unguard (r2). See
-                                  ``KVM_FUNC_HAS_RANGE`` in
-                                  hypercalls.rst for more details
-    Return Values:    (int64)     NOT_SUPPORTED(-1) on error, or
-                                  RET_SUCCESS(0) (r0)
-                      (uint64)     Number of shared granules (r1)
     ==============    ========    ======================================

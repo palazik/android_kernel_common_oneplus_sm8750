@@ -6,7 +6,7 @@
 #include <crypto/aes.h>
 #include <linux/crypto.h>
 #include <linux/module.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <trace/hooks/fips140.h>
 
 /*

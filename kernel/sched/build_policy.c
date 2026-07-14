@@ -16,22 +16,25 @@
 #include <linux/sched/clock.h>
 #include <linux/sched/cputime.h>
 #include <linux/sched/hotplug.h>
+#include <linux/sched/isolation.h>
 #include <linux/sched/posix-timers.h>
 #include <linux/sched/rt.h>
 
 #include <linux/cpuidle.h>
 #include <linux/jiffies.h>
+#include <linux/kobject.h>
 #include <linux/livepatch.h>
+#include <linux/pm.h>
 #include <linux/psi.h>
+#include <linux/rhashtable.h>
+#include <linux/seq_buf.h>
 #include <linux/seqlock_api.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 #include <linux/tsacct_kern.h>
 #include <linux/vtime.h>
-#ifdef CONFIG_HMBIRD_SCHED
 #include <linux/sysrq.h>
 #include <linux/percpu-rwsem.h>
-#endif
 
 #include <uapi/linux/sched/types.h>
 
@@ -56,10 +59,8 @@
 #include "cputime.c"
 #include "deadline.c"
 
-#ifdef CONFIG_HMBIRD_SCHED
-#include "hmbird/hmbird_util_track.c"
-#include "hmbird/hmbird_sched_proc.c"
-#include "hmbird/hmbird_shadow_tick.c"
-#include "hmbird/hmbird.c"
-#include "hmbird/hmbird_misc.c"
+#ifdef CONFIG_SCHED_CLASS_EXT
+# include "ext.c"
 #endif
+
+#include "syscalls.c"

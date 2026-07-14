@@ -236,7 +236,7 @@ static int ishtp_cl_device_probe(struct device *dev)
  *
  * Return: 1 if dev & drv matches, 0 otherwise.
  */
-static int ishtp_cl_bus_match(struct device *dev, struct device_driver *drv)
+static int ishtp_cl_bus_match(struct device *dev, const struct device_driver *drv)
 {
 	struct ishtp_cl_device *device = to_ishtp_cl_device(dev);
 	struct ishtp_cl_driver *driver = to_ishtp_cl_driver(drv);
@@ -386,7 +386,7 @@ static const struct dev_pm_ops ishtp_cl_bus_dev_pm_ops = {
 	.restore = ishtp_cl_device_resume,
 };
 
-static struct bus_type ishtp_cl_bus_type = {
+static const struct bus_type ishtp_cl_bus_type = {
 	.name		= "ishtp",
 	.dev_groups	= ishtp_cl_dev_groups,
 	.probe		= ishtp_cl_device_probe,
@@ -549,7 +549,7 @@ void ishtp_cl_bus_rx_event(struct ishtp_cl_device *device)
 		return;
 
 	if (device->event_cb)
-		schedule_work(&device->event_work);
+		queue_work(device->ishtp_dev->unbound_wq, &device->event_work);
 }
 
 /**
@@ -730,6 +730,8 @@ void ishtp_bus_remove_all_clients(struct ishtp_device *ishtp_dev,
 	spin_lock_irqsave(&ishtp_dev->cl_list_lock, flags);
 	list_for_each_entry(cl, &ishtp_dev->cl_list, link) {
 		cl->state = ISHTP_CL_DISCONNECTED;
+		if (warm_reset && cl->device && cl->device->reference_count)
+			continue;
 
 		/*
 		 * Wake any pending process. The waiter would check dev->state
@@ -850,6 +852,7 @@ EXPORT_SYMBOL(ishtp_device);
 
 /**
  * ishtp_wait_resume() - Wait for IPC resume
+ * @dev: ishtp device
  *
  * Wait for IPC resume
  *
@@ -883,6 +886,22 @@ struct device *ishtp_get_pci_device(struct ishtp_cl_device *device)
 	return device->ishtp_dev->devc;
 }
 EXPORT_SYMBOL(ishtp_get_pci_device);
+
+/**
+ * ishtp_get_workqueue - Retrieve the workqueue associated with an ISHTP device
+ * @cl_device: Pointer to the ISHTP client device structure
+ *
+ * Returns the workqueue_struct pointer (unbound_wq) associated with the given
+ * ISHTP client device. This workqueue is typically used for scheduling work
+ * related to the device.
+ *
+ * Return: Pointer to struct workqueue_struct.
+ */
+struct workqueue_struct *ishtp_get_workqueue(struct ishtp_cl_device *cl_device)
+{
+	return cl_device->ishtp_dev->unbound_wq;
+}
+EXPORT_SYMBOL(ishtp_get_workqueue);
 
 /**
  * ishtp_trace_callback() - Return trace callback
@@ -937,4 +956,5 @@ static void __exit ishtp_bus_unregister(void)
 module_init(ishtp_bus_register);
 module_exit(ishtp_bus_unregister);
 
+MODULE_DESCRIPTION("ISHTP bus driver");
 MODULE_LICENSE("GPL");

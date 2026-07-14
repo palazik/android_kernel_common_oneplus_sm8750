@@ -60,6 +60,7 @@ static ssize_t brightness_store(struct device *dev,
 	if (state == LED_OFF)
 		led_trigger_remove(led_cdev);
 	led_set_brightness(led_cdev, state);
+	flush_work(&led_cdev->set_brightness_work);
 
 	ret = size;
 unlock:
@@ -509,6 +510,11 @@ int led_classdev_register_ext(struct device *parent,
 	ret = led_classdev_next_name(proposed_name, final_name, sizeof(final_name));
 	if (ret < 0)
 		return ret;
+	else if (ret && led_cdev->flags & LED_REJECT_NAME_CONFLICT)
+		return -EEXIST;
+	else if (ret)
+		dev_warn(parent, "Led %s renamed to %s due to name collision\n",
+			 proposed_name, final_name);
 
 	if (led_cdev->color >= LED_COLOR_ID_MAX)
 		dev_warn(parent, "LED %s color identifier out of range\n", final_name);
@@ -523,10 +529,6 @@ int led_classdev_register_ext(struct device *parent,
 	}
 	if (init_data && init_data->fwnode)
 		device_set_node(led_cdev->dev, init_data->fwnode);
-
-	if (ret)
-		dev_warn(parent, "Led %s renamed to %s due to name collision",
-				proposed_name, dev_name(led_cdev->dev));
 
 	if (led_cdev->flags & LED_BRIGHT_HW_CHANGED) {
 		ret = led_add_brightness_hw_changed(led_cdev);
@@ -673,19 +675,12 @@ EXPORT_SYMBOL_GPL(devm_led_classdev_unregister);
 
 static int __init leds_init(void)
 {
-	leds_wq = alloc_ordered_workqueue("leds", 0);
-	if (!leds_wq) {
-		pr_err("Failed to create LEDs ordered workqueue\n");
-		return -ENOMEM;
-	}
-
 	return class_register(&leds_class);
 }
 
 static void __exit leds_exit(void)
 {
 	class_unregister(&leds_class);
-	destroy_workqueue(leds_wq);
 }
 
 subsys_initcall(leds_init);

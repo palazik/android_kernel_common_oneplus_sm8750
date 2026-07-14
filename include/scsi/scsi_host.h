@@ -212,7 +212,11 @@ struct scsi_host_template {
 	 *     up after yourself before returning non-0
 	 *
 	 * Status: OPTIONAL
+	 *
+	 * Note: slave_configure is the legacy version, use device_configure for
+	 * all new code.  A driver must never define both.
 	 */
+	int (* device_configure)(struct scsi_device *, struct queue_limits *lim);
 	int (* slave_configure)(struct scsi_device *);
 
 	/*
@@ -245,6 +249,9 @@ struct scsi_host_template {
 	 * after all activity to attached scsi devices has ceased, the
 	 * midlayer calls this point so that the driver may deallocate
 	 * and terminate any references to the target.
+	 *
+	 * Note: This callback is called with the host lock held and hence
+	 * must not sleep.
 	 *
 	 * Status: OPTIONAL
 	 */
@@ -373,9 +380,18 @@ struct scsi_host_template {
 	/*
 	 * This determines if we will use a non-interrupt driven
 	 * or an interrupt driven scheme.  It is set to the maximum number
-	 * of simultaneous commands a single hw queue in HBA will accept.
+	 * of simultaneous commands a single hw queue in HBA will accept
+	 * excluding internal commands.
 	 */
 	int can_queue;
+
+	/*
+	 * This determines how many commands the HBA will set aside
+	 * for internal commands. This number will be added to
+	 * @can_queue to calcumate the maximum number of simultaneous
+	 * commands sent to the host.
+	 */
+	int nr_reserved_cmds;
 
 	/*
 	 * In many instances, especially where disconnect / reconnect are
@@ -402,6 +418,8 @@ struct scsi_host_template {
 	 * Maximum size in bytes of a single segment.
 	 */
 	unsigned int max_segment_size;
+
+	unsigned int dma_alignment;
 
 	/*
 	 * DMA scatter gather segment boundary limit. A segment crossing this
@@ -496,7 +514,6 @@ struct scsi_host_template {
 	 */
 	u64 vendor_id;
 
-	ANDROID_OEM_DATA(1);
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
@@ -611,6 +628,11 @@ struct Scsi_Host {
 	unsigned short max_cmd_len;
 
 	int this_id;
+
+	/*
+	 * Number of commands this host can handle at the same time.
+	 * This excludes reserved commands as specified by nr_reserved_cmds.
+	 */
 	int can_queue;
 	short cmd_per_lun;
 	short unsigned int sg_tablesize;
@@ -618,6 +640,7 @@ struct Scsi_Host {
 	unsigned int max_sectors;
 	unsigned int opt_sectors;
 	unsigned int max_segment_size;
+	unsigned int dma_alignment;
 	unsigned long dma_boundary;
 	unsigned long virt_boundary_mask;
 	/*
@@ -630,6 +653,12 @@ struct Scsi_Host {
 	 */
 	unsigned nr_hw_queues;
 	unsigned nr_maps;
+
+	/*
+	 * Number of reserved commands to allocate, if any.
+	 */
+	unsigned int nr_reserved_cmds;
+
 	unsigned active_mode:2;
 
 	/*
@@ -669,10 +698,11 @@ struct Scsi_Host {
 	/* The transport requires the LUN bits NOT to be stored in CDB[1] */
 	unsigned no_scsi2_lun_in_cdb:1;
 
+	unsigned no_highmem:1;
+
 	/*
 	 * Optional work queue to be utilized by the transport
 	 */
-	char work_q_name[20];
 	struct workqueue_struct *work_q;
 
 	/*

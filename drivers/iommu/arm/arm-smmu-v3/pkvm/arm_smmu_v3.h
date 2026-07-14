@@ -2,19 +2,14 @@
 #ifndef __KVM_ARM_SMMU_V3_H
 #define __KVM_ARM_SMMU_V3_H
 
+#include <asm/arm-smmu-v3-common.h>
 #include <asm/kvm_asm.h>
-#include <linux/io-pgtable.h>
 #include <kvm/iommu.h>
-
-#if IS_ENABLED(CONFIG_ARM_SMMU_V3_PKVM)
 
 /*
  * Parameters from the trusted host:
  * @mmio_addr		base address of the SMMU registers
  * @mmio_size		size of the registers resource
- * @caches_clean_on_power_on
- *			is it safe to elide cache and TLB invalidation commands
- *			while the SMMU is OFF
  *
  * Other members are filled and used at runtime by the SMMU driver.
  */
@@ -23,19 +18,17 @@ struct hyp_arm_smmu_v3_device {
 	phys_addr_t		mmio_addr;
 	size_t			mmio_size;
 	unsigned long		features;
-	bool			caches_clean_on_power_on;
 
 	void __iomem		*base;
 	u32			cmdq_prod;
 	__le64			*cmdq_base;
 	size_t			cmdq_log2size;
-	__le64			*strtab_base;
-	size_t			strtab_num_entries;
-	size_t			strtab_num_l1_entries;
-	u8			strtab_split;
-	struct io_pgtable_cfg	pgtable_cfg_s1;
-	struct io_pgtable_cfg	pgtable_cfg_s2;
-	u32			ssid_bits; /* SSID has max of 20 bits*/
+	/* strtab_cfg.l2.l2ptrs is not used, instead computed from L1 */
+	struct arm_smmu_strtab_cfg strtab_cfg;
+	size_t			oas;
+	size_t			ias;
+	size_t			pgsize_bitmap;
+	size_t			ssid_bits;
 };
 
 extern size_t kvm_nvhe_sym(kvm_hyp_arm_smmu_v3_count);
@@ -44,13 +37,14 @@ extern size_t kvm_nvhe_sym(kvm_hyp_arm_smmu_v3_count);
 extern struct hyp_arm_smmu_v3_device *kvm_nvhe_sym(kvm_hyp_arm_smmu_v3_smmus);
 #define kvm_hyp_arm_smmu_v3_smmus kvm_nvhe_sym(kvm_hyp_arm_smmu_v3_smmus)
 
-enum kvm_arm_smmu_domain_stage {
+enum kvm_arm_smmu_domain_type {
 	KVM_ARM_SMMU_DOMAIN_BYPASS = KVM_IOMMU_DOMAIN_IDMAP_TYPE,
+	KVM_ARM_SMMU_DOMAIN_ANY = KVM_IOMMU_DOMAIN_ANY_TYPE,
 	KVM_ARM_SMMU_DOMAIN_S1,
 	KVM_ARM_SMMU_DOMAIN_S2,
+	KVM_ARM_SMMU_DOMAIN_MAX,
 };
 
 extern struct kvm_iommu_ops smmu_ops;
-#endif /* CONFIG_ARM_SMMU_V3_PKVM */
 
 #endif /* __KVM_ARM_SMMU_V3_H */

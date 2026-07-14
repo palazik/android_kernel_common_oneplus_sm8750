@@ -212,6 +212,17 @@ pid>/``).
 This value defaults to 0.
 
 
+core_sort_vma
+=============
+
+The default coredump writes VMAs in address order. By setting
+``core_sort_vma`` to 1, VMAs will be written from smallest size
+to largest size. This is known to break at least elfutils, but
+can be handy when dealing with very large (and truncated)
+coredumps where the more useful debugging details are included
+in the smaller VMAs.
+
+
 core_uses_pid
 =============
 
@@ -273,6 +284,17 @@ domainname "frop.org", not to be confused with the NIS (Network
 Information Service) or YP (Yellow Pages) domainname. These two
 domain names are in general different. For a detailed discussion
 see the ``hostname(1)`` man page.
+
+
+export_pmu_events (arm64 only)
+==============================
+
+Controls the PMU export bit (PMCR_EL0.X), which enables the exporting of
+events over an IMPLEMENTATION DEFINED PMU event export bus to another device.
+
+0: disables exporting of events (default).
+
+1: enables exporting of events.
 
 
 firmware_config
@@ -454,7 +476,7 @@ ignore-unaligned-usertrap
 
 On architectures where unaligned accesses cause traps, and where this
 feature is supported (``CONFIG_SYSCTL_ARCH_UNALIGN_NO_WARN``;
-currently, ``arc``, ``ia64`` and ``loongarch``), controls whether all
+currently, ``arc``, ``parisc`` and ``loongarch``), controls whether all
 unaligned traps are logged.
 
 = =============================================================
@@ -463,10 +485,7 @@ unaligned traps are logged.
   setting.
 = =============================================================
 
-See also `unaligned-trap`_ and `unaligned-dump-stack`_. On ``ia64``,
-this allows system administrators to override the
-``IA64_THREAD_UAC_NOPRINT`` ``prctl`` and avoid logs being flooded.
-
+See also `unaligned-trap`_.
 
 io_uring_disabled
 =================
@@ -615,6 +634,9 @@ default (``MSGMNB``).
 ``msgmni`` is the maximum number of IPC queues. 32000 by default
 (``MSGMNI``).
 
+All of these parameters are set per ipc namespace. The maximum number of bytes
+in POSIX message queues is limited by ``RLIMIT_MSGQUEUE``. This limit is
+respected hierarchically in the each user namespace.
 
 msg_next_id, sem_next_id, and shm_next_id (System V IPC)
 ========================================================
@@ -871,6 +893,7 @@ bit 3  print locks info if ``CONFIG_LOCKDEP`` is on
 bit 4  print ftrace buffer
 bit 5  print all printk messages in buffer
 bit 6  print all CPUs backtrace (if available in the arch)
+bit 7  print only tasks in uninterruptible (blocked) state
 =====  ============================================
 
 So for example to print tasks and memory info on panic, user can::
@@ -1200,7 +1223,8 @@ automatically on platforms where it can run (that is,
 platforms with asymmetric CPU topologies and having an Energy
 Model available). If your platform happens to meet the
 requirements for EAS but you do not want to use it, change
-this value to 0.
+this value to 0. On Non-EAS platforms, write operation fails and
+read doesn't return anything.
 
 task_delayacct
 ===============
@@ -1294,15 +1318,20 @@ are doing anyway :)
 shmall
 ======
 
-This parameter sets the total amount of shared memory pages that
-can be used system wide. Hence, ``shmall`` should always be at least
-``ceil(shmmax/PAGE_SIZE)``.
+This parameter sets the total amount of shared memory pages that can be used
+inside ipc namespace. The shared memory pages counting occurs for each ipc
+namespace separately and is not inherited. Hence, ``shmall`` should always be at
+least ``ceil(shmmax/PAGE_SIZE)``.
 
 If you are not sure what the default ``PAGE_SIZE`` is on your Linux
 system, you can run the following command::
 
 	# getconf PAGE_SIZE
 
+To reduce or disable the ability to allocate shared memory, you must create a
+new ipc namespace, set this parameter to the required value and prohibit the
+creation of a new ipc namespace in the current user namespace or cgroups can
+be used.
 
 shmmax
 ======
@@ -1554,22 +1583,6 @@ This only works if the kernel was booted with ``tp_printk`` enabled.
 
 See Documentation/admin-guide/kernel-parameters.rst and
 Documentation/trace/boottime-trace.rst.
-
-
-.. _unaligned-dump-stack:
-
-unaligned-dump-stack (ia64)
-===========================
-
-When logging unaligned accesses, controls whether the stack is
-dumped.
-
-= ===================================================
-0 Do not dump the stack. This is the default setting.
-1 Dump the stack.
-= ===================================================
-
-See also `ignore-unaligned-usertrap`_.
 
 
 unaligned-trap

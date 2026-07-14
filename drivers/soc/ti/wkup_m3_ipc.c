@@ -710,7 +710,7 @@ err_free_mbox:
 	return ret;
 }
 
-static int wkup_m3_ipc_remove(struct platform_device *pdev)
+static void wkup_m3_ipc_remove(struct platform_device *pdev)
 {
 	wkup_m3_ipc_dbg_destroy(m3_ipc_state);
 
@@ -720,8 +720,6 @@ static int wkup_m3_ipc_remove(struct platform_device *pdev)
 	rproc_put(m3_ipc_state->rproc);
 
 	m3_ipc_state = NULL;
-
-	return 0;
 }
 
 static int __maybe_unused wkup_m3_ipc_suspend(struct device *dev)

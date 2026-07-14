@@ -2,8 +2,6 @@
 /*
  * Copyright (C) 2022 Arm Ltd.
  */
-#include "arm_smmu_v3.h"
-
 #include <asm/kvm_hyp.h>
 #include <asm/kvm_mmu.h>
 #include <linux/types.h>
@@ -14,6 +12,7 @@
 #include <nvhe/iommu.h>
 #include <nvhe/mem_protect.h>
 
+#include "arm_smmu_v3.h"
 #include "arm-smmu-v3-module.h"
 
 #define io_pgtable_cfg_to_pgtable(x) container_of((x), struct io_pgtable, cfg)
@@ -21,18 +20,28 @@
 #define io_pgtable_cfg_to_data(x)					\
 	io_pgtable_to_data(io_pgtable_cfg_to_pgtable(x))
 
-void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp, struct io_pgtable_cfg *cfg)
+int arm_lpae_map_exists(void)
+{
+	return -EEXIST;
+}
+
+void arm_lpae_unmap_empty(void)
+{
+}
+
+void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp,
+			     struct io_pgtable_cfg *cfg, void *cookie)
 {
 	void *addr;
 	struct arm_lpae_io_pgtable *data = io_pgtable_cfg_to_data(cfg);
 
-	if(!PAGE_ALIGNED(size))
+	if (!PAGE_ALIGNED(size))
 		return NULL;
 
 	if (data->idmapped)
 		addr = kvm_iommu_donate_pages_atomic(get_order(size));
 	else
-		addr = kvm_iommu_donate_pages_request(get_order(size));
+		addr = kvm_iommu_donate_pages(get_order(size), 0);
 
 	if (addr && !cfg->coherent_walk)
 		kvm_flush_dcache_to_poc(addr, size);
@@ -40,17 +49,17 @@ void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp, struct io_pgtable_cfg *cfg)
 	return addr;
 }
 
-void __arm_lpae_free_pages(void *addr, size_t size, struct io_pgtable_cfg *cfg)
+void __arm_lpae_free_pages(void *addr, size_t size, struct io_pgtable_cfg *cfg,
+			   void *cookie)
 {
 	u8 order;
 	struct arm_lpae_io_pgtable *data = io_pgtable_cfg_to_data(cfg);
 
 	/*
-	 * It's guaranteed all allocations are aligned, but io-pgtable-arm-common
+	 * It's guaranteed all allocations are aligned, but core code
 	 * might free PGD with it's actual size.
 	 */
-	size = PAGE_ALIGN(size);
-	order = get_order(size);
+	order = get_order(PAGE_ALIGN(size));
 
 	if (!cfg->coherent_walk)
 		kvm_flush_dcache_to_poc(addr, size);
@@ -68,7 +77,8 @@ void __arm_lpae_sync_pte(arm_lpae_iopte *ptep, int num_entries,
 		kvm_flush_dcache_to_poc(ptep, sizeof(*ptep) * num_entries);
 }
 
-static int kvm_arm_io_pgtable_init(struct io_pgtable_cfg *cfg, struct arm_lpae_io_pgtable *data)
+static int kvm_arm_io_pgtable_init(struct io_pgtable_cfg *cfg,
+				   struct arm_lpae_io_pgtable *data)
 {
 	int ret = -EINVAL;
 
@@ -87,8 +97,8 @@ static int kvm_arm_io_pgtable_init(struct io_pgtable_cfg *cfg, struct arm_lpae_i
 }
 
 struct io_pgtable *kvm_arm_io_pgtable_alloc(struct io_pgtable_cfg *cfg,
-					   void *cookie,
-					   int *out_ret)
+					    void *cookie,
+					    int *out_ret)
 {
 	size_t pgd_size, alignment;
 	struct arm_lpae_io_pgtable *data;
@@ -96,6 +106,7 @@ struct io_pgtable *kvm_arm_io_pgtable_alloc(struct io_pgtable_cfg *cfg,
 
 	data = hyp_alloc(sizeof(*data));
 	if (!data) {
+		kvm_iommu_request_hyp_alloc();
 		*out_ret = hyp_alloc_errno();
 		return NULL;
 	}
@@ -105,7 +116,7 @@ struct io_pgtable *kvm_arm_io_pgtable_alloc(struct io_pgtable_cfg *cfg,
 		goto out_free;
 
 	pgd_size = PAGE_ALIGN(ARM_LPAE_PGD_SIZE(data));
-	data->pgd = __arm_lpae_alloc_pages(pgd_size, 0, &data->iop.cfg);
+	data->pgd = __arm_lpae_alloc_pages(pgd_size, 0, &data->iop.cfg, cookie);
 	if (!data->pgd) {
 		ret = -ENOMEM;
 		goto out_free;
@@ -115,10 +126,21 @@ struct io_pgtable *kvm_arm_io_pgtable_alloc(struct io_pgtable_cfg *cfg,
 	 * its size. Otherwise 64 bytes.
 	 */
 	alignment = max(pgd_size, 8 * sizeof(arm_lpae_iopte));
-	BUG_ON(!IS_ALIGNED(hyp_virt_to_phys(data->pgd), alignment));
+	if (!IS_ALIGNED(hyp_virt_to_phys(data->pgd), alignment)) {
+		__arm_lpae_free_pages(data->pgd, pgd_size,
+				      &data->iop.cfg, cookie);
+		ret = -EINVAL;
+		goto out_free;
+	}
 
 	data->iop.cookie = cookie;
-	data->iop.cfg.arm_lpae_s2_cfg.vttbr = __arm_lpae_virt_to_phys(data->pgd);
+	if (cfg->fmt == ARM_64_LPAE_S2)
+		data->iop.cfg.arm_lpae_s2_cfg.vttbr = __arm_lpae_virt_to_phys(data->pgd);
+	else if (cfg->fmt == ARM_64_LPAE_S1)
+		data->iop.cfg.arm_lpae_s1_cfg.ttbr = __arm_lpae_virt_to_phys(data->pgd);
+
+	if (!data->iop.cfg.coherent_walk)
+		kvm_flush_dcache_to_poc(data->pgd, pgd_size);
 
 	/* Ensure the empty pgd is visible before any actual TTBR write */
 	wmb();
@@ -139,24 +161,8 @@ int kvm_arm_io_pgtable_free(struct io_pgtable *iopt)
 	if (!data->iop.cfg.coherent_walk)
 		kvm_flush_dcache_to_poc(data->pgd, pgd_size);
 
+	io_pgtable_tlb_flush_all(iopt);
 	__arm_lpae_free_pgtable(data, data->start_level, data->pgd);
 	hyp_free(data);
 	return 0;
-}
-
-int arm_lpae_mapping_exists(struct arm_lpae_io_pgtable *data)
-{
-	/*
-	 * Sometime the hypervisor forces mapping in the host page table, for example,
-	 * on teardown we force pages to host even if they were shared.
-	 * If this is not an idmapped domain, then this is a host bug.
-	 */
-	WARN_ON(!data->idmapped);
-	return -EEXIST;
-}
-
-void arm_lpae_mapping_missing(struct arm_lpae_io_pgtable *data)
-{
-	/* Similar to arm_lpae_mapping_exists() */
-	WARN_ON(!data->idmapped);
 }

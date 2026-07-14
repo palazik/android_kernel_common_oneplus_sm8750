@@ -16,6 +16,7 @@
 #include <linux/static_key.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/vmalloc.h>
 
 #include "kasan.h"
 
@@ -57,7 +58,12 @@ enum kasan_mode kasan_mode __ro_after_init;
 EXPORT_SYMBOL_GPL(kasan_mode);
 
 /* Whether to enable vmalloc tagging. */
+#ifdef CONFIG_KASAN_VMALLOC
 DEFINE_STATIC_KEY_TRUE(kasan_flag_vmalloc);
+#else
+DEFINE_STATIC_KEY_FALSE(kasan_flag_vmalloc);
+#endif
+EXPORT_SYMBOL_GPL(kasan_flag_vmalloc);
 
 #define PAGE_ALLOC_SAMPLE_DEFAULT	1
 #define PAGE_ALLOC_SAMPLE_ORDER_DEFAULT	3
@@ -124,6 +130,9 @@ static int __init early_kasan_flag_vmalloc(char *arg)
 {
 	if (!arg)
 		return -EINVAL;
+
+	if (!IS_ENABLED(CONFIG_KASAN_VMALLOC))
+		return 0;
 
 	if (!strcmp(arg, "off"))
 		kasan_arg_vmalloc = KASAN_ARG_VMALLOC_OFF;
@@ -350,7 +359,7 @@ void *__kasan_unpoison_vmalloc(const void *start, unsigned long size,
 		return (void *)start;
 	}
 
-	tag = kasan_random_tag();
+	tag = (flags & KASAN_VMALLOC_KEEP_TAG) ? get_tag(start) : kasan_random_tag();
 	start = set_tag(start, tag);
 
 	/* Unpoison and initialize memory up to size. */

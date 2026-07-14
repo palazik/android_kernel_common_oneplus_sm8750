@@ -105,8 +105,44 @@ struct attribute_group {
 #define SYSFS_GROUP_INVISIBLE	020000
 
 /*
- * The first call to is_visible() in the create / update path may
- * indicate visibility for the entire group
+ * DEFINE_SYSFS_GROUP_VISIBLE(name):
+ *	A helper macro to pair with the assignment of ".is_visible =
+ *	SYSFS_GROUP_VISIBLE(name)", that arranges for the directory
+ *	associated with a named attribute_group to optionally be hidden.
+ *	This allows for static declaration of attribute_groups, and the
+ *	simplification of attribute visibility lifetime that implies,
+ *	without polluting sysfs with empty attribute directories.
+ * Ex.
+ *
+ * static umode_t example_attr_visible(struct kobject *kobj,
+ *                                   struct attribute *attr, int n)
+ * {
+ *       if (example_attr_condition)
+ *               return 0;
+ *       else if (ro_attr_condition)
+ *               return 0444;
+ *       return a->mode;
+ * }
+ *
+ * static bool example_group_visible(struct kobject *kobj)
+ * {
+ *       if (example_group_condition)
+ *               return false;
+ *       return true;
+ * }
+ *
+ * DEFINE_SYSFS_GROUP_VISIBLE(example);
+ *
+ * static struct attribute_group example_group = {
+ *       .name = "example",
+ *       .is_visible = SYSFS_GROUP_VISIBLE(example),
+ *       .attrs = &example_attrs,
+ * };
+ *
+ * Note that it expects <name>_attr_visible and <name>_group_visible to
+ * be defined. For cases where individual attributes do not need
+ * separate visibility consideration, only entire group visibility at
+ * once, see DEFINE_SIMPLE_SYSFS_GROUP_VISIBLE().
  */
 #define DEFINE_SYSFS_GROUP_VISIBLE(name)                             \
 	static inline umode_t sysfs_group_visible_##name(            \
@@ -118,8 +154,42 @@ struct attribute_group {
 	}
 
 /*
+ * DEFINE_SIMPLE_SYSFS_GROUP_VISIBLE(name):
+ *	A helper macro to pair with SYSFS_GROUP_VISIBLE() that like
+ *	DEFINE_SYSFS_GROUP_VISIBLE() controls group visibility, but does
+ *	not require the implementation of a per-attribute visibility
+ *	callback.
+ * Ex.
+ *
+ * static bool example_group_visible(struct kobject *kobj)
+ * {
+ *       if (example_group_condition)
+ *               return false;
+ *       return true;
+ * }
+ *
+ * DEFINE_SIMPLE_SYSFS_GROUP_VISIBLE(example);
+ *
+ * static struct attribute_group example_group = {
+ *       .name = "example",
+ *       .is_visible = SYSFS_GROUP_VISIBLE(example),
+ *       .attrs = &example_attrs,
+ * };
+ */
+#define DEFINE_SIMPLE_SYSFS_GROUP_VISIBLE(name)                   \
+	static inline umode_t sysfs_group_visible_##name(         \
+		struct kobject *kobj, struct attribute *a, int n) \
+	{                                                         \
+		if (n == 0 && !name##_group_visible(kobj))        \
+			return SYSFS_GROUP_INVISIBLE;             \
+		return a->mode;                                   \
+	}
+
+/*
  * Same as DEFINE_SYSFS_GROUP_VISIBLE, but for groups with only binary
- * attributes
+ * attributes. If an attribute_group defines both text and binary
+ * attributes, the group visibility is determined by the function
+ * specified to is_visible() not is_bin_visible()
  */
 #define DEFINE_SYSFS_BIN_GROUP_VISIBLE(name)                             \
 	static inline umode_t sysfs_group_visible_##name(                \
@@ -128,6 +198,15 @@ struct attribute_group {
 		if (n == 0 && !name##_group_visible(kobj))               \
 			return SYSFS_GROUP_INVISIBLE;                    \
 		return name##_attr_visible(kobj, attr, n);               \
+	}
+
+#define DEFINE_SIMPLE_SYSFS_BIN_GROUP_VISIBLE(name)                   \
+	static inline umode_t sysfs_group_visible_##name(             \
+		struct kobject *kobj, struct bin_attribute *a, int n) \
+	{                                                             \
+		if (n == 0 && !name##_group_visible(kobj))            \
+			return SYSFS_GROUP_INVISIBLE;                 \
+		return a->mode;                                       \
 	}
 
 #define SYSFS_GROUP_VISIBLE(fn) sysfs_group_visible_##fn
@@ -220,6 +299,8 @@ struct bin_attribute {
 			char *, loff_t, size_t);
 	ssize_t (*write)(struct file *, struct kobject *, struct bin_attribute *,
 			 char *, loff_t, size_t);
+	loff_t (*llseek)(struct file *, struct kobject *, struct bin_attribute *,
+			 loff_t, int);
 	int (*mmap)(struct file *, struct kobject *, struct bin_attribute *attr,
 		    struct vm_area_struct *vma);
 };
@@ -289,6 +370,17 @@ struct bin_attribute bin_attr_##_name = __BIN_ATTR_ADMIN_RO(_name, _size)
 
 #define BIN_ATTR_ADMIN_RW(_name, _size)					\
 struct bin_attribute bin_attr_##_name = __BIN_ATTR_ADMIN_RW(_name, _size)
+
+#define __BIN_ATTR_SIMPLE_RO(_name, _mode) {				\
+	.attr	= { .name = __stringify(_name), .mode = _mode },	\
+	.read	= sysfs_bin_attr_simple_read,				\
+}
+
+#define BIN_ATTR_SIMPLE_RO(_name)					\
+struct bin_attribute bin_attr_##_name = __BIN_ATTR_SIMPLE_RO(_name, 0444)
+
+#define BIN_ATTR_SIMPLE_ADMIN_RO(_name)					\
+struct bin_attribute bin_attr_##_name = __BIN_ATTR_SIMPLE_RO(_name, 0400)
 
 struct sysfs_ops {
 	ssize_t	(*show)(struct kobject *, struct attribute *, char *);
@@ -396,6 +488,10 @@ __printf(2, 3)
 int sysfs_emit(char *buf, const char *fmt, ...);
 __printf(3, 4)
 int sysfs_emit_at(char *buf, int at, const char *fmt, ...);
+
+ssize_t sysfs_bin_attr_simple_read(struct file *file, struct kobject *kobj,
+				   struct bin_attribute *attr, char *buf,
+				   loff_t off, size_t count);
 
 #else /* CONFIG_SYSFS */
 
@@ -651,6 +747,15 @@ static inline int sysfs_emit(char *buf, const char *fmt, ...)
 
 __printf(3, 4)
 static inline int sysfs_emit_at(char *buf, int at, const char *fmt, ...)
+{
+	return 0;
+}
+
+static inline ssize_t sysfs_bin_attr_simple_read(struct file *file,
+						 struct kobject *kobj,
+						 struct bin_attribute *attr,
+						 char *buf, loff_t off,
+						 size_t count)
 {
 	return 0;
 }

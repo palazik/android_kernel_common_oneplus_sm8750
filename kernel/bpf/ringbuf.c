@@ -631,7 +631,7 @@ const struct bpf_func_proto bpf_ringbuf_reserve_dynptr_proto = {
 	.arg1_type	= ARG_CONST_MAP_PTR,
 	.arg2_type	= ARG_ANYTHING,
 	.arg3_type	= ARG_ANYTHING,
-	.arg4_type	= ARG_PTR_TO_DYNPTR | DYNPTR_TYPE_RINGBUF | MEM_UNINIT,
+	.arg4_type	= ARG_PTR_TO_DYNPTR | DYNPTR_TYPE_RINGBUF | MEM_UNINIT | MEM_WRITE,
 };
 
 BPF_CALL_2(bpf_ringbuf_submit_dynptr, struct bpf_dynptr_kern *, ptr, u64, flags)
@@ -788,8 +788,7 @@ schedule_work_return:
 	/* Prevent the clearing of the busy-bit from being reordered before the
 	 * storing of any rb consumer or producer positions.
 	 */
-	smp_mb__before_atomic();
-	atomic_set(&rb->busy, 0);
+	atomic_set_release(&rb->busy, 0);
 
 	if (flags & BPF_RB_FORCE_WAKEUP)
 		irq_work_queue(&rb->work);

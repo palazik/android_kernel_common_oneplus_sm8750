@@ -155,13 +155,6 @@ static struct hyp_page *__hyp_extract_page(struct hyp_pool *pool,
 	return p;
 }
 
-static void update_free_pages(struct hyp_pool *pool, u64 free_pages)
-{
-	WRITE_ONCE(pool->free_pages, free_pages);
-	if (pool->min_free_pages > free_pages)
-		WRITE_ONCE(pool->min_free_pages, free_pages);
-}
-
 static void __hyp_put_page(struct hyp_pool *pool, struct hyp_page *p)
 {
 	u64 free_pages;
@@ -189,7 +182,7 @@ static void __hyp_put_page(struct hyp_pool *pool, struct hyp_page *p)
 	if (old_refcount == 1) {
 		free_pages = pool->free_pages + (1ULL << p->order);
 		__hyp_attach_page(pool, p);
-		update_free_pages(pool, free_pages);
+		WRITE_ONCE(pool->free_pages, free_pages);
 		hyp_spin_unlock(&pool->lock);
 	}
 }
@@ -246,7 +239,7 @@ void *hyp_alloc_pages(struct hyp_pool *pool, u8 order)
 	hyp_set_page_refcounted(p);
 
 	free_pages = pool->free_pages - (1ULL << p->order);
-	update_free_pages(pool, free_pages);
+	WRITE_ONCE(pool->free_pages, free_pages);
 	hyp_spin_unlock(&pool->lock);
 
 	return hyp_page_to_virt(p);
@@ -264,11 +257,6 @@ u64 hyp_pool_free_pages(struct hyp_pool *pool)
 	return READ_ONCE(pool->free_pages);
 }
 
-u64 hyp_pool_min_free_pages(struct hyp_pool *pool)
-{
-	return READ_ONCE(pool->min_free_pages);
-}
-
 /*
  * empty_alloc alloc set true when pool has no pages initially, but we still want
  * to use it in the future, which means nr_pages only has to be valid to init
@@ -282,7 +270,8 @@ static int __hyp_pool_init(struct hyp_pool *pool, u64 pfn, unsigned int nr_pages
 	int i;
 
 	hyp_spin_lock_init(&pool->lock);
-	pool->max_order = min(MAX_ORDER, get_order(nr_pages << PAGE_SHIFT));
+	pool->max_order = min(MAX_PAGE_ORDER,
+			      get_order(nr_pages << PAGE_SHIFT));
 	for (i = 0; i <= pool->max_order; i++)
 		INIT_LIST_HEAD(&pool->free_area[i]);
 
@@ -305,13 +294,11 @@ static int __hyp_pool_init(struct hyp_pool *pool, u64 pfn, unsigned int nr_pages
 	for (i = reserved_pages; i < nr_pages; i++)
 		__hyp_put_page(pool, &p[i]);
 
-	pool->min_free_pages = pool->free_pages;
-
 	return 0;
 }
 
 int hyp_pool_init(struct hyp_pool *pool, u64 pfn, unsigned int nr_pages,
-		    unsigned int reserved_pages)
+		  unsigned int reserved_pages)
 {
 	return __hyp_pool_init(pool, pfn, nr_pages, reserved_pages, false);
 }

@@ -50,6 +50,8 @@
 #define pmd_pgtable(pmd) pmd_page(pmd)
 #endif
 
+#define pmd_folio(pmd) page_folio(pmd_page(pmd))
+
 /*
  * A page table page can be thought of an array like this: pXd_t[PTRS_PER_PxD]
  *
@@ -149,9 +151,7 @@ static inline pgd_t *pgd_offset_pgd(pgd_t *pgd, unsigned long address)
  * a shortcut which implies the use of the kernel's pgd, instead
  * of a process's
  */
-#ifndef pgd_offset_k
 #define pgd_offset_k(address)		pgd_offset(&init_mm, (address))
-#endif
 
 /*
  * In many cases it is known that a virtual address is mapped at PMD or PTE
@@ -179,6 +179,13 @@ static inline pte_t *virt_to_kpte(unsigned long vaddr)
 
 #ifndef pmd_young
 static inline int pmd_young(pmd_t pmd)
+{
+	return 0;
+}
+#endif
+
+#ifndef pmd_dirty
+static inline int pmd_dirty(pmd_t pmd)
 {
 	return 0;
 }
@@ -424,7 +431,18 @@ static inline bool arch_has_hw_nonleaf_pmd_young(void)
  */
 static inline bool arch_has_hw_pte_young(void)
 {
-	return false;
+	return IS_ENABLED(CONFIG_ARCH_HAS_HW_PTE_YOUNG);
+}
+#endif
+
+#ifndef exec_folio_order
+/*
+ * Returns preferred minimum folio order for executable file-backed memory. Must
+ * be in range [0, PMD_ORDER). Default to order-0.
+ */
+static inline unsigned int exec_folio_order(void)
+{
+	return 0;
 }
 #endif
 
@@ -438,6 +456,12 @@ static inline void arch_check_zapped_pte(struct vm_area_struct *vma,
 #ifndef arch_check_zapped_pmd
 static inline void arch_check_zapped_pmd(struct vm_area_struct *vma,
 					 pmd_t pmd)
+{
+}
+#endif
+
+#ifndef arch_check_zapped_pud
+static inline void arch_check_zapped_pud(struct vm_area_struct *vma, pud_t pud)
 {
 }
 #endif
@@ -724,13 +748,18 @@ static inline void clear_full_ptes(struct mm_struct *mm, unsigned long addr,
  * fault. This function updates TLB only, do nothing with cache or others.
  * It is the difference with function update_mmu_cache.
  */
-#ifndef __HAVE_ARCH_UPDATE_MMU_TLB
+#ifndef update_mmu_tlb_range
+static inline void update_mmu_tlb_range(struct vm_area_struct *vma,
+				unsigned long address, pte_t *ptep, unsigned int nr)
+{
+}
+#endif
+
 static inline void update_mmu_tlb(struct vm_area_struct *vma,
 				unsigned long address, pte_t *ptep)
 {
+	update_mmu_tlb_range(vma, address, ptep, 1);
 }
-#define __HAVE_ARCH_UPDATE_MMU_TLB
-#endif
 
 /*
  * Some architectures may be able to avoid expensive synchronization
@@ -1161,7 +1190,7 @@ static inline void arch_swap_restore(swp_entry_t entry, struct folio *folio)
 #endif
 
 #ifndef __HAVE_ARCH_MOVE_PTE
-#define move_pte(pte, prot, old_addr, new_addr)	(pte)
+#define move_pte(pte, old_addr, new_addr)	(pte)
 #endif
 
 #ifndef pte_accessible
@@ -1885,23 +1914,37 @@ typedef unsigned int pgtbl_mod_mask;
 #endif
 
 /*
- * p?d_leaf() - true if this entry is a final mapping to a physical address.
- * This differs from p?d_huge() by the fact that they are always available (if
- * the architecture supports large pages at the appropriate level) even
- * if CONFIG_HUGETLB_PAGE is not defined.
- * Only meaningful when called on a valid entry.
+ * pXd_leaf() is the API to check whether a pgtable entry is a huge page
+ * mapping.  It should work globally across all archs, without any
+ * dependency on CONFIG_* options.  For architectures that do not support
+ * huge mappings on specific levels, below fallbacks will be used.
+ *
+ * A leaf pgtable entry should always imply the following:
+ *
+ * - It is a "present" entry.  IOW, before using this API, please check it
+ *   with pXd_present() first. NOTE: it may not always mean the "present
+ *   bit" is set.  For example, PROT_NONE entries are always "present".
+ *
+ * - It should _never_ be a swap entry of any type.  Above "present" check
+ *   should have guarded this, but let's be crystal clear on this.
+ *
+ * - It should contain a huge PFN, which points to a huge page larger than
+ *   PAGE_SIZE of the platform.  The PFN format isn't important here.
+ *
+ * - It should cover all kinds of huge mappings (e.g., pXd_trans_huge(),
+ *   pXd_devmap(), or hugetlb mappings).
  */
 #ifndef pgd_leaf
-#define pgd_leaf(x)	0
+#define pgd_leaf(x)	false
 #endif
 #ifndef p4d_leaf
-#define p4d_leaf(x)	0
+#define p4d_leaf(x)	false
 #endif
 #ifndef pud_leaf
-#define pud_leaf(x)	0
+#define pud_leaf(x)	false
 #endif
 #ifndef pmd_leaf
-#define pmd_leaf(x)	0
+#define pmd_leaf(x)	false
 #endif
 
 #ifndef pgd_leaf_size
@@ -1916,8 +1959,25 @@ typedef unsigned int pgtbl_mod_mask;
 #ifndef pmd_leaf_size
 #define pmd_leaf_size(x) PMD_SIZE
 #endif
+#ifndef __pte_leaf_size
 #ifndef pte_leaf_size
 #define pte_leaf_size(x) PAGE_SIZE
+#endif
+#define __pte_leaf_size(x,y) pte_leaf_size(y)
+#endif
+
+/*
+ * We always define pmd_pfn for all archs as it's used in lots of generic
+ * code.  Now it happens too for pud_pfn (and can happen for larger
+ * mappings too in the future; we're not there yet).  Instead of defining
+ * it for all archs (like pmd_pfn), provide a fallback.
+ *
+ * Note that returning 0 here means any arch that didn't define this can
+ * get severely wrong when it hits a real pud leaf.  It's arch's
+ * responsibility to properly define it when a huge pud is possible.
+ */
+#ifndef pud_pfn
+#define pud_pfn(x) 0
 #endif
 
 /*
@@ -1940,6 +2000,18 @@ typedef unsigned int pgtbl_mod_mask;
 
 #ifndef MAX_PTRS_PER_P4D
 #define MAX_PTRS_PER_P4D PTRS_PER_P4D
+#endif
+
+#ifndef pte_pgprot
+#define pte_pgprot(x) ((pgprot_t) {0})
+#endif
+
+#ifndef pmd_pgprot
+#define pmd_pgprot(x) ((pgprot_t) {0})
+#endif
+
+#ifndef pud_pgprot
+#define pud_pgprot(x) ((pgprot_t) {0})
 #endif
 
 /* description of effects of mapping type and prot in current implementation.

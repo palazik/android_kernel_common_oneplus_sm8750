@@ -11,14 +11,17 @@
  */
 
 #include <linux/dma-buf.h>
+#include <linux/dma-direct.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-heap.h>
 #include <linux/err.h>
 #include <linux/highmem.h>
+#include <linux/iommu.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/printk.h>
 #include <linux/scatterlist.h>
-#include <linux/slab.h>
+#include <linux/swiotlb.h>
 #include <linux/vmalloc.h>
 
 static struct dma_heap *sys_heap;
@@ -45,7 +48,7 @@ struct dma_heap_attachment {
 	bool uncached;
 };
 
-#define LOW_ORDER_GFP (GFP_HIGHUSER | __GFP_ZERO | __GFP_RETRY_MAYFAIL)
+#define LOW_ORDER_GFP (GFP_HIGHUSER | __GFP_ZERO)
 #define HIGH_ORDER_GFP  (((GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN \
 				| __GFP_NORETRY) & ~__GFP_RECLAIM) \
 				| __GFP_COMP)
@@ -65,6 +68,28 @@ static gfp_t order_flags[] = {HIGH_ORDER_GFP, HIGH_ORDER_GFP, LOW_ORDER_GFP};
 static const unsigned int orders[] = {ORDER_1M, ORDER_64K, ORDER_FOR_PAGE_SIZE};
 
 #define NUM_ORDERS ARRAY_SIZE(orders)
+
+static bool needs_swiotlb_bounce(struct device *dev, struct sg_table *table)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	struct scatterlist *sg;
+	int i;
+
+	for_each_sgtable_dma_sg(table, sg, i) {
+		// SG_DMA_SWIOTLB is set only for dma-iommu, not for dma-direct
+		if (domain && IS_ENABLED(CONFIG_NEED_SG_DMA_FLAGS)) {
+			if (sg_dma_is_swiotlb(table->sgl))
+				return true;
+		} else {
+			phys_addr_t paddr = domain ?
+					    iommu_iova_to_phys(domain, sg_dma_address(sg)) :
+					    dma_to_phys(dev, sg_dma_address(sg));
+			if (swiotlb_find_pool(dev, paddr))
+				return true;
+		}
+	}
+	return false;
+}
 
 static struct sg_table *dup_sg_table(struct sg_table *table)
 {
@@ -151,6 +176,13 @@ static struct sg_table *system_heap_map_dma_buf(struct dma_buf_attachment *attac
 	ret = dma_map_sgtable(attachment->dev, table, direction, attr);
 	if (ret)
 		return ERR_PTR(ret);
+
+	if (a->uncached && needs_swiotlb_bounce(attachment->dev, table)) {
+		pr_err("Cannot map uncached system heap buffer for %s, as it requires SWIOTLB",
+			dev_name(attachment->dev));
+		dma_unmap_sgtable(attachment->dev, table, direction, attr);
+		return ERR_PTR(-EINVAL);
+	}
 
 	a->mapped = true;
 	return table;
@@ -377,9 +409,6 @@ static struct dma_buf *system_heap_do_allocate(struct dma_heap *heap,
 	struct list_head pages;
 	struct page *page, *tmp_page;
 	int i, ret = -ENOMEM;
-
-	if (len / PAGE_SIZE > totalram_pages())
-		return ERR_PTR(-ENOMEM);
 
 	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
 	if (!buffer)

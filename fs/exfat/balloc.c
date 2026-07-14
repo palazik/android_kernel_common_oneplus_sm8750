@@ -14,38 +14,67 @@
 #if BITS_PER_LONG == 32
 #define __le_long __le32
 #define lel_to_cpu(A) le32_to_cpu(A)
+#define cpu_to_lel(A) cpu_to_le32(A)
 #elif BITS_PER_LONG == 64
 #define __le_long __le64
 #define lel_to_cpu(A) le64_to_cpu(A)
+#define cpu_to_lel(A) cpu_to_le64(A)
 #else
 #error "BITS_PER_LONG not 32 or 64"
 #endif
 
-static const unsigned char free_bit[] = {
-	0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2,/*  0 ~  19*/
-	0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2, 0, 1, 0, 3,/* 20 ~  39*/
-	0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2,/* 40 ~  59*/
-	0, 1, 0, 6, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,/* 60 ~  79*/
-	0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2,/* 80 ~  99*/
-	0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3,/*100 ~ 119*/
-	0, 1, 0, 2, 0, 1, 0, 7, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2,/*120 ~ 139*/
-	0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5,/*140 ~ 159*/
-	0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2,/*160 ~ 179*/
-	0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 6, 0, 1, 0, 2, 0, 1, 0, 3,/*180 ~ 199*/
-	0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2,/*200 ~ 219*/
-	0, 1, 0, 5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,/*220 ~ 239*/
-	0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0                /*240 ~ 254*/
-};
-
 /*
  *  Allocation Bitmap Management Functions
  */
+static bool exfat_test_bitmap_range(struct super_block *sb, unsigned int clu,
+		unsigned int count)
+{
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	unsigned int start = clu;
+	unsigned int end = clu + count;
+	unsigned int ent_idx, i, b;
+	unsigned int bit_offset, bits_to_check;
+	__le_long *bitmap_le;
+	unsigned long mask, word;
+
+	if (!is_valid_cluster(sbi, start) || !is_valid_cluster(sbi, end - 1))
+		return false;
+
+	while (start < end) {
+		ent_idx = CLUSTER_TO_BITMAP_ENT(start);
+		i = BITMAP_OFFSET_SECTOR_INDEX(sb, ent_idx);
+		b = BITMAP_OFFSET_BIT_IN_SECTOR(sb, ent_idx);
+
+		bitmap_le = (__le_long *)sbi->vol_amap[i]->b_data;
+
+		/* Calculate how many bits we can check in the current word */
+		bit_offset = b % BITS_PER_LONG;
+		bits_to_check = min(end - start,
+				    (unsigned int)(BITS_PER_LONG - bit_offset));
+
+		/* Create a bitmask for the range of bits to check */
+		if (bits_to_check >= BITS_PER_LONG)
+			mask = ~0UL;
+		else
+			mask = ((1UL << bits_to_check) - 1) << bit_offset;
+		word = lel_to_cpu(bitmap_le[b / BITS_PER_LONG]);
+
+		/* Check if all bits in the mask are set */
+		if ((word & mask) != mask)
+			return false;
+
+		start += bits_to_check;
+	}
+
+	return true;
+}
+
 static int exfat_allocate_bitmap(struct super_block *sb,
 		struct exfat_dentry *ep)
 {
 	struct exfat_sb_info *sbi = EXFAT_SB(sb);
 	long long map_size;
-	unsigned int i, need_map_size;
+	unsigned int i, j, need_map_size;
 	sector_t sector;
 
 	sbi->map_clu = le32_to_cpu(ep->dentry.bitmap.start_clu);
@@ -72,20 +101,25 @@ static int exfat_allocate_bitmap(struct super_block *sb,
 	sector = exfat_cluster_to_sector(sbi, sbi->map_clu);
 	for (i = 0; i < sbi->map_sectors; i++) {
 		sbi->vol_amap[i] = sb_bread(sb, sector + i);
-		if (!sbi->vol_amap[i]) {
-			/* release all buffers and free vol_amap */
-			int j = 0;
-
-			while (j < i)
-				brelse(sbi->vol_amap[j++]);
-
-			kvfree(sbi->vol_amap);
-			sbi->vol_amap = NULL;
-			return -EIO;
-		}
+		if (!sbi->vol_amap[i])
+			goto err_out;
 	}
 
+	if (exfat_test_bitmap_range(sb, sbi->map_clu,
+		EXFAT_B_TO_CLU_ROUND_UP(map_size, sbi)) == false)
+		goto err_out;
+
 	return 0;
+
+err_out:
+	j = 0;
+	/* release all buffers and free vol_amap */
+	while (j < i)
+		brelse(sbi->vol_amap[j++]);
+
+	kvfree(sbi->vol_amap);
+	sbi->vol_amap = NULL;
+	return -EIO;
 }
 
 int exfat_load_bitmap(struct super_block *sb)
@@ -201,32 +235,35 @@ unsigned int exfat_find_free_bitmap(struct super_block *sb, unsigned int clu)
 {
 	unsigned int i, map_i, map_b, ent_idx;
 	unsigned int clu_base, clu_free;
-	unsigned char k, clu_mask;
+	unsigned long clu_bits, clu_mask;
 	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	__le_long bitval;
 
 	WARN_ON(clu < EXFAT_FIRST_CLUSTER);
-	ent_idx = CLUSTER_TO_BITMAP_ENT(clu);
-	clu_base = BITMAP_ENT_TO_CLUSTER(ent_idx & ~(BITS_PER_BYTE_MASK));
+	ent_idx = ALIGN_DOWN(CLUSTER_TO_BITMAP_ENT(clu), BITS_PER_LONG);
+	clu_base = BITMAP_ENT_TO_CLUSTER(ent_idx);
 	clu_mask = IGNORED_BITS_REMAINED(clu, clu_base);
 
 	map_i = BITMAP_OFFSET_SECTOR_INDEX(sb, ent_idx);
 	map_b = BITMAP_OFFSET_BYTE_IN_SECTOR(sb, ent_idx);
 
 	for (i = EXFAT_FIRST_CLUSTER; i < sbi->num_clusters;
-	     i += BITS_PER_BYTE) {
-		k = *(sbi->vol_amap[map_i]->b_data + map_b);
+	     i += BITS_PER_LONG) {
+		bitval = *(__le_long *)(sbi->vol_amap[map_i]->b_data + map_b);
 		if (clu_mask > 0) {
-			k |= clu_mask;
+			bitval |= cpu_to_lel(clu_mask);
 			clu_mask = 0;
 		}
-		if (k < 0xFF) {
-			clu_free = clu_base + free_bit[k];
+		if (lel_to_cpu(bitval) != ULONG_MAX) {
+			clu_bits = lel_to_cpu(bitval);
+			clu_free = clu_base + ffz(clu_bits);
 			if (clu_free < sbi->num_clusters)
 				return clu_free;
 		}
-		clu_base += BITS_PER_BYTE;
+		clu_base += BITS_PER_LONG;
+		map_b += sizeof(long);
 
-		if (++map_b >= sb->s_blocksize ||
+		if (map_b >= sb->s_blocksize ||
 		    clu_base >= sbi->num_clusters) {
 			if (++map_i >= sbi->map_sectors) {
 				clu_base = EXFAT_FIRST_CLUSTER;

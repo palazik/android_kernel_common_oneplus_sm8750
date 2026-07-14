@@ -25,7 +25,7 @@ DECLARE_RWSEM(conn_list_lock);
 /**
  * ksmbd_conn_free() - free resources of the connection instance
  *
- * @conn:	connection instance to be cleand up
+ * @conn:	connection instance to be cleaned up
  *
  * During the thread termination, the corresponding conn instance
  * resources(sock/memory) are released and finally the conn object is freed.
@@ -41,15 +41,6 @@ void ksmbd_conn_free(struct ksmbd_conn *conn)
 	kfree(conn->preauth_info);
 	kfree(conn->mechToken);
 	if (atomic_dec_and_test(&conn->refcnt)) {
-		/*
-		 * async_ida is embedded in struct ksmbd_conn, so pair
-		 * ida_destroy() with the final kfree() rather than with
-		 * the unconditional field teardown above.  This keeps
-		 * the IDA valid for the entire lifetime of the struct,
-		 * even while other refcount holders (oplock / vfs
-		 * durable handles) still reference the connection.
-		 */
-		ida_destroy(&conn->async_ida);
 		conn->transport->ops->free_transport(conn->transport);
 		kfree(conn);
 	}
@@ -64,7 +55,7 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
 {
 	struct ksmbd_conn *conn;
 
-	conn = kzalloc(sizeof(struct ksmbd_conn), GFP_KERNEL);
+	conn = kzalloc(sizeof(struct ksmbd_conn), KSMBD_DEFAULT_GFP);
 	if (!conn)
 		return NULL;
 
@@ -378,7 +369,7 @@ recheck:
 		/* 4 for rfc1002 length field */
 		/* 1 for implied bcc[0] */
 		size = pdu_size + 4 + 1;
-		conn->request_buf = kvmalloc(size, GFP_KERNEL);
+		conn->request_buf = kvmalloc(size, KSMBD_DEFAULT_GFP);
 		if (!conn->request_buf)
 			break;
 
@@ -484,24 +475,54 @@ out:
 
 static void stop_sessions(void)
 {
-	struct ksmbd_conn *conn;
+	struct ksmbd_conn *conn, *target;
 	struct ksmbd_transport *t;
+	bool any;
 	int bkt;
 
+	/*
+	 * Serialised via init_lock; no concurrent stop_sessions() can
+	 * touch conn->stop_called, so writing it under the read lock is
+	 * safe.
+	 */
 again:
+	target = NULL;
+	any = false;
 	down_read(&conn_list_lock);
 	hash_for_each(conn_list, bkt, conn, hlist) {
-		t = conn->transport;
-		ksmbd_conn_set_exiting(conn);
-		if (t->ops->shutdown) {
-			up_read(&conn_list_lock);
-			t->ops->shutdown(t);
-			down_read(&conn_list_lock);
-		}
+		any = true;
+		if (conn->stop_called)
+			continue;
+		atomic_inc(&conn->refcnt);
+		conn->stop_called = true;
+		/*
+		 * Mark the connection EXITING while still holding the
+		 * read lock so the selection and the status transition
+		 * happen together.  Do not regress a connection that has
+		 * already advanced to RELEASING on its own (e.g. the
+		 * handler exited its receive loop for an unrelated
+		 * reason).
+		 */
+		if (READ_ONCE(conn->status) != KSMBD_SESS_RELEASING)
+			ksmbd_conn_set_exiting(conn);
+		target = conn;
+		break;
 	}
 	up_read(&conn_list_lock);
 
-	if (!hash_empty(conn_list)) {
+	if (target) {
+		t = target->transport;
+		if (t->ops->shutdown)
+			t->ops->shutdown(t);
+		if (atomic_dec_and_test(&target->refcnt)) {
+			ida_destroy(&target->async_ida);
+			t->ops->free_transport(t);
+			kfree(target);
+		}
+		goto again;
+	}
+
+	if (any) {
 		msleep(100);
 		goto again;
 	}

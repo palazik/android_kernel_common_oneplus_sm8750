@@ -136,8 +136,7 @@ enum {
 #define BITMAP_OFFSET_BIT_IN_SECTOR(sb, ent) (ent & BITS_PER_SECTOR_MASK(sb))
 #define BITMAP_OFFSET_BYTE_IN_SECTOR(sb, ent) \
 	((ent / BITS_PER_BYTE) & ((sb)->s_blocksize - 1))
-#define BITS_PER_BYTE_MASK	0x7
-#define IGNORED_BITS_REMAINED(clu, clu_base) ((1 << ((clu) - (clu_base))) - 1)
+#define IGNORED_BITS_REMAINED(clu, clu_base) ((1UL << ((clu) - (clu_base))) - 1)
 
 #define ES_ENTRY_NUM(name_len)	(ES_IDX_LAST_FILENAME(name_len) + 1)
 /* 19 entries = 1 file entry + 1 stream entry + 17 filename entries */
@@ -441,8 +440,6 @@ int exfat_ent_get(struct super_block *sb, unsigned int loc,
 		unsigned int *content);
 int exfat_ent_set(struct super_block *sb, unsigned int loc,
 		unsigned int content);
-int exfat_count_ext_entries(struct super_block *sb, struct exfat_chain *p_dir,
-		int entry, struct exfat_dentry *p_entry);
 int exfat_chain_cont_cluster(struct super_block *sb, unsigned int chain,
 		unsigned int len);
 int exfat_zeroed_cluster(struct inode *dir, unsigned int clu);
@@ -498,9 +495,7 @@ void exfat_init_ext_entry(struct exfat_entry_set_cache *es, int num_entries,
 		struct exfat_uni_name *p_uniname);
 void exfat_remove_entries(struct inode *inode, struct exfat_entry_set_cache *es,
 		int order);
-int exfat_update_dir_chksum(struct inode *inode, struct exfat_chain *p_dir,
-		int entry);
-void exfat_update_dir_chksum_with_entry_set(struct exfat_entry_set_cache *es);
+void exfat_update_dir_chksum(struct exfat_entry_set_cache *es);
 int exfat_calc_num_entries(struct exfat_uni_name *p_uniname);
 int exfat_find_dir_entry(struct super_block *sb, struct exfat_inode_info *ei,
 		struct exfat_chain *p_dir, struct exfat_uni_name *p_uniname,

@@ -7,30 +7,12 @@
 #include <linux/stringify.h>
 
 /*
- * Export symbols from the kernel to modules.  Forked from module.h
- * to reduce the amount of pointless cruft we feed to gcc when only
- * exporting a simple symbol or two.
- *
- * Try not to add #includes here.  It slows compilation and makes kernel
- * hackers place grumpy comments in header files.
- */
-
-/*
  * This comment block is used by fixdep. Please do not remove.
  *
  * When CONFIG_MODVERSIONS is changed from n to y, all source files having
  * EXPORT_SYMBOL variants must be re-compiled because genksyms is run as a
  * side effect of the *.o build rule.
  */
-
-#ifndef __ASSEMBLY__
-#ifdef MODULE
-extern struct module __this_module;
-#define THIS_MODULE (&__this_module)
-#else
-#define THIS_MODULE ((struct module *)0)
-#endif
-#endif /* __ASSEMBLY__ */
 
 #ifdef CONFIG_64BIT
 #define __EXPORT_SYMBOL_REF(sym)			\
@@ -76,15 +58,30 @@ extern struct module __this_module;
 
 #else
 
+#ifdef CONFIG_GENDWARFKSYMS
+/*
+ * With CONFIG_GENDWARFKSYMS, ensure the compiler emits debugging
+ * information for all exported symbols, including those defined in
+ * different TUs, by adding a __gendwarfksyms_ptr_<symbol> pointer
+ * that's discarded during the final link.
+ */
+#define __GENDWARFKSYMS_EXPORT(sym)				\
+	static typeof(sym) *__gendwarfksyms_ptr_##sym __used	\
+		__section(".discard.gendwarfksyms") = &sym;
+#else
+#define __GENDWARFKSYMS_EXPORT(sym)
+#endif
+
 #define __EXPORT_SYMBOL(sym, license, ns)			\
 	extern typeof(sym) sym;					\
 	__ADDRESSABLE(sym)					\
+	__GENDWARFKSYMS_EXPORT(sym)				\
 	asm(__stringify(___EXPORT_SYMBOL(sym, license, ns)))
 
 #endif
 
 #ifdef DEFAULT_SYMBOL_NAMESPACE
-#define _EXPORT_SYMBOL(sym, license)	__EXPORT_SYMBOL(sym, license, __stringify(DEFAULT_SYMBOL_NAMESPACE))
+#define _EXPORT_SYMBOL(sym, license)	__EXPORT_SYMBOL(sym, license, DEFAULT_SYMBOL_NAMESPACE)
 #else
 #define _EXPORT_SYMBOL(sym, license)	__EXPORT_SYMBOL(sym, license, "")
 #endif

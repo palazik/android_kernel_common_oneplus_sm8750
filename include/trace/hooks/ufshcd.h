@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM ufshcd
+#undef TRACE_INCLUDE_PATH
 #define TRACE_INCLUDE_PATH trace/hooks
 #if !defined(_TRACE_HOOK_UFSHCD_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_HOOK_UFSHCD_H
@@ -12,19 +13,22 @@
 struct ufs_hba;
 struct request;
 struct ufshcd_lrb;
+struct scsi_cmnd;
+struct cq_entry;
+struct uic_command;
 
 DECLARE_HOOK(android_vh_ufs_fill_prdt,
 	TP_PROTO(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
 		 unsigned int segments, int *err),
 	TP_ARGS(hba, lrbp, segments, err));
 
-DECLARE_RESTRICTED_HOOK(android_rvh_ufs_reprogram_all_keys,
-			TP_PROTO(struct ufs_hba *hba, int *err),
-			TP_ARGS(hba, err), 1);
-
 DECLARE_RESTRICTED_HOOK(android_rvh_ufs_complete_init,
 			TP_PROTO(struct ufs_hba *hba),
 			TP_ARGS(hba), 1);
+
+DECLARE_RESTRICTED_HOOK(android_rvh_ufs_reprogram_all_keys,
+			TP_PROTO(struct ufs_hba *hba, int *err),
+			TP_ARGS(hba, err), 1);
 
 DECLARE_HOOK(android_vh_ufs_prepare_command,
 	TP_PROTO(struct ufs_hba *hba, struct request *rq,
@@ -62,39 +66,29 @@ DECLARE_HOOK(android_vh_ufs_update_sdev,
 	TP_PROTO(struct scsi_device *sdev),
 	TP_ARGS(sdev));
 
-DECLARE_HOOK(android_vh_ufs_send_command_post_change,
-	TP_PROTO(struct ufs_hba *hba, struct ufshcd_lrb *lrbp),
-	TP_ARGS(hba, lrbp));
+DECLARE_HOOK(android_vh_ufs_eh_timed_out,
+	TP_PROTO(struct ufs_hba *hba, struct scsi_cmnd *scmd),
+	TP_ARGS(hba, scmd));
 
-DECLARE_HOOK(android_vh_ufs_perf_huristic_ctrl,
-	TP_PROTO(struct ufs_hba *hba,
-		 struct ufshcd_lrb *lrbp, int *err),
+DECLARE_HOOK(android_vh_ufs_link_startup,
+	TP_PROTO(struct ufs_hba *hba, int err),
+	TP_ARGS(hba, err));
+
+DECLARE_HOOK(android_vh_ufs_dev_cmd_completion,
+	TP_PROTO(struct ufs_hba *hba, struct ufshcd_lrb *lrbp, int err),
 	TP_ARGS(hba, lrbp, err));
 
-DECLARE_HOOK(android_vh_ufs_abort_success_ctrl,
-	TP_PROTO(struct ufs_hba *hba,
-		 struct ufshcd_lrb *lrbp),
-	TP_ARGS(hba, lrbp));
+DECLARE_HOOK(android_vh_ufs_wait_for_uic_cmd,
+	TP_PROTO(struct ufs_hba *hba, struct uic_command *uic_cmd, int err),
+	TP_ARGS(hba, uic_cmd, err));
 
-DECLARE_HOOK(android_vh_ufs_err_handler,
-	TP_PROTO(struct ufs_hba *hba,
-		 bool *err_handled),
-	TP_ARGS(hba, err_handled));
+DECLARE_HOOK(android_vh_ufs_transfer_rsp_status,
+	TP_PROTO(struct ufs_hba *hba, struct ufshcd_lrb *lrbp, struct cq_entry *cqe, int result),
+	TP_ARGS(hba, lrbp, cqe, result));
 
-DECLARE_HOOK(android_vh_ufs_compl_rsp_check_done,
-	TP_PROTO(struct ufs_hba *hba,
-		 struct ufshcd_lrb *lrbp, bool *done),
-	TP_ARGS(hba, lrbp, done));
-
-DECLARE_HOOK(android_vh_ufs_err_print_ctrl,
-	TP_PROTO(struct ufs_hba *hba,
-		 bool *skip),
-	TP_ARGS(hba, skip));
-
-DECLARE_HOOK(android_vh_ufs_err_check_ctrl,
-	TP_PROTO(struct ufs_hba *hba,
-		 bool *err_check),
-	TP_ARGS(hba, err_check));
+DECLARE_HOOK(android_vh_ufs_mcq_cleanup,
+	TP_PROTO(struct ufs_hba *hba, int task_tag, bool start),
+	TP_ARGS(hba, task_tag, start));
 
 #endif /* _TRACE_HOOK_UFSHCD_H */
 /* This part must be outside protection */

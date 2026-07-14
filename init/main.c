@@ -101,6 +101,8 @@
 #include <linux/init_syscalls.h>
 #include <linux/stackdepot.h>
 #include <linux/randomize_kstack.h>
+#include <linux/pidfs.h>
+#include <linux/ptdump.h>
 #include <net/net_namespace.h>
 
 #include <asm/io.h>
@@ -326,7 +328,7 @@ static int __init xbc_snprint_cmdline(char *buf, size_t size,
 {
 	struct xbc_node *knode, *vnode;
 	char *end = buf + size;
-	const char *val;
+	const char *val, *q;
 	int ret;
 
 	xbc_node_for_each_key_value(root, knode, val) {
@@ -344,8 +346,14 @@ static int __init xbc_snprint_cmdline(char *buf, size_t size,
 			continue;
 		}
 		xbc_array_for_each_value(vnode, val) {
-			ret = snprintf(buf, rest(buf, end), "%s=\"%s\" ",
-				       xbc_namebuf, val);
+			/*
+			 * For prettier and more readable /proc/cmdline, only
+			 * quote the value when necessary, i.e. when it contains
+			 * whitespace.
+			 */
+			q = strpbrk(val, " \t\r\n") ? "\"" : "";
+			ret = snprintf(buf, rest(buf, end), "%s=%s%s%s ",
+				       xbc_namebuf, q, val, q);
 			if (ret < 0)
 				return ret;
 			buf += ret;
@@ -485,6 +493,11 @@ static int __init warn_bootconfig(char *str)
 #endif	/* CONFIG_BOOT_CONFIG */
 
 early_param("bootconfig", warn_bootconfig);
+
+bool __init cmdline_has_extra_options(void)
+{
+	return extra_command_line || extra_init_args;
+}
 
 /* Change NUL term back to "=", to make "param" the whole string. */
 static void __init repair_env_string(char *param, char *val)
@@ -633,14 +646,16 @@ static void __init setup_command_line(char *command_line)
 
 	if (extra_command_line)
 		xlen = strlen(extra_command_line);
-	if (extra_init_args)
+	if (extra_init_args) {
+		extra_init_args = strim(extra_init_args); /* remove trailing space */
 		ilen = strlen(extra_init_args) + 4; /* for " -- " */
+	}
 
-	len = xlen + strlen(boot_command_line) + 1;
+	len = xlen + strlen(boot_command_line) + ilen + 1;
 
-	saved_command_line = memblock_alloc(len + ilen, SMP_CACHE_BYTES);
+	saved_command_line = memblock_alloc(len, SMP_CACHE_BYTES);
 	if (!saved_command_line)
-		panic("%s: Failed to allocate %zu bytes\n", __func__, len + ilen);
+		panic("%s: Failed to allocate %zu bytes\n", __func__, len);
 
 	len = xlen + strlen(command_line) + 1;
 
@@ -696,7 +711,7 @@ static void __init setup_command_line(char *command_line)
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
 
-noinline void __ref __noreturn rest_init(void)
+static noinline void __ref __noreturn rest_init(void)
 {
 	struct task_struct *tsk;
 	int pid;
@@ -791,6 +806,10 @@ void __init __weak smp_setup_processor_id(void)
 {
 }
 
+void __init __weak smp_prepare_boot_cpu(void)
+{
+}
+
 # if THREAD_SIZE >= PAGE_SIZE
 void __init __weak thread_stack_cache_init(void)
 {
@@ -837,11 +856,6 @@ static int __init early_randomize_kstack_offset(char *buf)
 early_param("randomize_kstack_offset", early_randomize_kstack_offset);
 #endif
 
-void __init __weak __noreturn arch_call_rest_init(void)
-{
-	rest_init();
-}
-
 static void __init print_unknown_bootoptions(void)
 {
 	char *unknown_options;
@@ -884,6 +898,44 @@ static void __init print_unknown_bootoptions(void)
 		&unknown_options[1]);
 	memblock_free(unknown_options, len);
 }
+
+static void __init early_numa_node_init(void)
+{
+#ifdef CONFIG_USE_PERCPU_NUMA_NODE_ID
+#ifndef cpu_to_node
+	int cpu;
+
+	/* The early_cpu_to_node() should be ready here. */
+	for_each_possible_cpu(cpu)
+		set_cpu_numa_node(cpu, early_cpu_to_node(cpu));
+#endif
+#endif
+}
+
+#ifdef CONFIG_GKI_DYNAMIC_TASK_STRUCT_SIZE
+static void __init setup_arch_task_struct_size(void)
+{
+	arch_task_struct_size = sizeof(struct task_struct);
+}
+
+static int __init task_struct_vendor_size_setup(char *str)
+{
+	u64 size;
+
+	if (!str)
+		return -EINVAL;
+
+	size = memparse(str, &str);
+
+	if (size < 0 || size > CONFIG_GKI_TASK_STRUCT_VENDOR_SIZE_MAX)
+		return -EINVAL;
+
+	arch_task_struct_size = sizeof(struct task_struct) + size;
+
+	return 0;
+}
+early_param("android_arch_task_struct_size", task_struct_vendor_size_setup);
+#endif
 
 #define KERNEL_CMDLINE_PREFIX		"Kernel command line: "
 #define KERNEL_CMDLINE_PREFIX_LEN	(sizeof(KERNEL_CMDLINE_PREFIX) - 1)
@@ -980,31 +1032,6 @@ static void __init print_kernel_cmdline(const char *cmdline)
 		pr_notice("%s%s\n", KERNEL_CMDLINE_PREFIX, cmdline);
 }
 
-#ifdef CONFIG_GKI_DYNAMIC_TASK_STRUCT_SIZE
-static void __init setup_arch_task_struct_size(void)
-{
-	arch_task_struct_size = sizeof(struct task_struct);
-}
-
-static int __init task_struct_vendor_size_setup(char *str)
-{
-	u64 size;
-
-	if (!str)
-		return -EINVAL;
-
-	size = memparse(str, &str);
-
-	if (size < 0 || size > CONFIG_GKI_TASK_STRUCT_VENDOR_SIZE_MAX)
-		return -EINVAL;
-
-	arch_task_struct_size = sizeof(struct task_struct) + size;
-
-	return 0;
-}
-early_param("android_arch_task_struct_size", task_struct_vendor_size_setup);
-#endif
-
 asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
 void start_kernel(void)
 {
@@ -1031,18 +1058,21 @@ void start_kernel(void)
 #ifdef CONFIG_GKI_DYNAMIC_TASK_STRUCT_SIZE
 	setup_arch_task_struct_size();
 #endif
-	early_security_init();
 	setup_arch(&command_line);
+	/* Static keys and static calls are needed by LSMs */
+	jump_label_init();
+	static_call_init();
+	early_security_init();
 	setup_boot_config();
 	setup_command_line(command_line);
 	setup_nr_cpu_ids();
 	setup_per_cpu_areas();
 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
+	early_numa_node_init();
 	boot_cpu_hotplug_init();
 
 	print_kernel_cmdline(saved_command_line);
 	/* parameters may set static keys */
-	jump_label_init();
 	parse_early_param();
 	after_dashes = parse_args("Booting kernel",
 				  static_command_line, __start___param,
@@ -1197,6 +1227,7 @@ void start_kernel(void)
 	seq_file_init();
 	proc_root_init();
 	nsfs_init();
+	pidfs_init();
 	cpuset_init();
 	mem_cgroup_init();
 	cgroup_init();
@@ -1208,7 +1239,7 @@ void start_kernel(void)
 	kcsan_init();
 
 	/* Do the rest non-__init'ed, we're now alive */
-	arch_call_rest_init();
+	rest_init();
 
 	/*
 	 * Avoid stack canaries in callers of boot_init_stack_canary for gcc-10
@@ -1535,10 +1566,9 @@ static int __init set_debug_rodata(char *str)
 early_param("rodata", set_debug_rodata);
 #endif
 
-#ifdef CONFIG_STRICT_KERNEL_RWX
 static void mark_readonly(void)
 {
-	if (rodata_enabled) {
+	if (IS_ENABLED(CONFIG_STRICT_KERNEL_RWX) && rodata_enabled) {
 		/*
 		 * load_module() results in W+X mappings, which are cleaned
 		 * up with init_free_wq. Let's make sure that queued work is
@@ -1546,22 +1576,18 @@ static void mark_readonly(void)
 		 * insecure pages which are W+X.
 		 */
 		flush_module_init_free_work();
+		jump_label_init_ro();
 		mark_rodata_ro();
+		debug_checkwx();
 		rodata_test();
-	} else
+	} else if (IS_ENABLED(CONFIG_STRICT_KERNEL_RWX)) {
 		pr_info("Kernel memory protection disabled.\n");
+	} else if (IS_ENABLED(CONFIG_ARCH_HAS_STRICT_KERNEL_RWX)) {
+		pr_warn("Kernel memory protection not selected by kernel config.\n");
+	} else {
+		pr_warn("This architecture does not have kernel memory protection.\n");
+	}
 }
-#elif defined(CONFIG_ARCH_HAS_STRICT_KERNEL_RWX)
-static inline void mark_readonly(void)
-{
-	pr_warn("Kernel memory protection not selected by kernel config.\n");
-}
-#else
-static inline void mark_readonly(void)
-{
-	pr_warn("This architecture does not have kernel memory protection.\n");
-}
-#endif
 
 void __weak free_initmem(void)
 {
@@ -1684,6 +1710,7 @@ static noinline void __init kernel_init_freeable(void)
 	sched_init_smp();
 
 	workqueue_init_topology();
+	async_init();
 	padata_init();
 	page_alloc_init_late();
 

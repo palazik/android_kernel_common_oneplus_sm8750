@@ -6,25 +6,23 @@
  */
 #include <asm/kvm_pkvm.h>
 #include <asm/kvm_mmu.h>
-#include <linux/cma.h>
-#include <linux/dma-map-ops.h>
-#include <linux/local_lock.h>
+
 #include <linux/moduleparam.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 
+#include "arm-smmu-v3.h"
 #include "pkvm/arm_smmu_v3.h"
 
-#include "arm-smmu-v3.h"
+extern struct kvm_iommu_ops kvm_nvhe_sym(smmu_ops);
 
 struct host_arm_smmu_device {
 	struct arm_smmu_device		smmu;
 	pkvm_handle_t			id;
 	u32				boot_gbpa;
-	bool				hvc_pd;
-	struct io_pgtable_cfg		cfg_s1;
-	struct io_pgtable_cfg		cfg_s2;
+	struct kvm_power_domain		power_domain;
 };
 
 #define smmu_to_host(_smmu) \
@@ -34,8 +32,16 @@ struct kvm_arm_smmu_master {
 	struct arm_smmu_device		*smmu;
 	struct device			*dev;
 	struct xarray			domains;
+	struct kvm_arm_smmu_stream	*streams;
+	unsigned int			num_streams;
 	u32				ssid_bits;
 	bool				idmapped; /* Stage-2 is transparently identity mapped*/
+};
+
+struct kvm_arm_smmu_stream {
+	u32				id;
+	struct kvm_arm_smmu_master	*master;
+	struct rb_node			node;
 };
 
 struct kvm_arm_smmu_domain {
@@ -43,7 +49,6 @@ struct kvm_arm_smmu_domain {
 	struct arm_smmu_device		*smmu;
 	struct mutex			init_mutex;
 	pkvm_handle_t			id;
-	unsigned long			type;
 };
 
 #define to_kvm_smmu_domain(_domain) \
@@ -54,6 +59,8 @@ static unsigned long                   pkvm_module_token;
 
 #define ksym_ref_addr_nvhe(x) \
 	((typeof(kvm_nvhe_sym(x)) *)(pkvm_el2_mod_va(&kvm_nvhe_sym(x), pkvm_module_token)))
+
+int kvm_nvhe_sym(smmu_init_hyp_module)(const struct pkvm_module_ops *ops);
 #else
 #define ksym_ref_addr_nvhe(x) \
 	((typeof(kvm_nvhe_sym(x)) *)(kern_hyp_va(lm_alias(&kvm_nvhe_sym(x)))))
@@ -63,139 +70,12 @@ static size_t				kvm_arm_smmu_cur;
 static size_t				kvm_arm_smmu_count;
 static struct hyp_arm_smmu_v3_device	*kvm_arm_smmu_array;
 static DEFINE_IDA(kvm_arm_smmu_domain_ida);
-
-int kvm_nvhe_sym(smmu_init_hyp_module)(const struct pkvm_module_ops *ops);
-extern struct kvm_iommu_ops kvm_nvhe_sym(smmu_ops);
-
 /*
  * Pre allocated pages that can be used from the EL2 part of the driver from atomic
  * context, ideally used for page table pages for identity domains.
  */
 static int atomic_pages;
 module_param(atomic_pages, int, 0);
-
-#ifdef CONFIG_CMA
-static phys_addr_t __topup_virt_to_phys(void *virt)
-{
-	return __pa(virt);
-}
-
-static struct page *__kvm_arm_smmu_alloc_from_cma(gfp_t gfp)
-{
-	bool from_spare = (gfp & GFP_ATOMIC) == GFP_ATOMIC;
-	static atomic64_t spare_p;
-	struct page *p = NULL;
-
-again:
-	if (from_spare)
-		return (struct page *)atomic64_cmpxchg(&spare_p, atomic64_read(&spare_p), 0);
-
-	p = kvm_iommu_cma_alloc();
-	if (!p) {
-		from_spare = true;
-		goto again;
-	}
-
-	/*
-	 * Top-up the spare block if necessary. If we failed to update spare_p
-	 * then someone did it already and we can proceed with that page.
-	 */
-	if (!atomic64_read(&spare_p)) {
-		if (!atomic64_cmpxchg(&spare_p, 0, (u64)p))
-			goto again;
-	}
-
-	return p;
-}
-
-static int __kvm_arm_smmu_topup_from_cma(size_t size, gfp_t gfp, size_t *allocated)
-{
-	*allocated = 0;
-
-	while (*allocated < size) {
-		struct page *p = __kvm_arm_smmu_alloc_from_cma(gfp);
-		struct kvm_hyp_memcache mc;
-
-		if (!p)
-			return -ENOMEM;
-
-		init_hyp_memcache(&mc);
-		push_hyp_memcache(&mc, page_to_virt(p), __topup_virt_to_phys,
-				  PMD_SHIFT - PAGE_SHIFT);
-
-		if (__pkvm_topup_hyp_alloc_mgt_mc(HYP_ALLOC_MGT_IOMMU_ID, &mc)) {
-			kvm_iommu_cma_release(p);
-			return -EINVAL;
-		}
-
-		*allocated += PMD_SIZE;
-	}
-
-	return 0;
-}
-#else
-static int __kvm_arm_smmu_topup_from_cma(size_t size, gfp_t gfp, size_t *allocated)
-{
-	return -ENOMEM;
-}
-#endif /* CONFIG_CMA */
-
-static int kvm_arm_smmu_topup_memcache(struct arm_smccc_res *res, gfp_t gfp)
-{
-	struct kvm_hyp_req req;
-
-	hyp_reqs_smccc_decode(res, &req);
-
-	if ((res->a1 == -ENOMEM) && (req.type != KVM_HYP_REQ_TYPE_MEM)) {
-		/*
-		 * There is no way for drivers to populate hyp_alloc requests,
-		 * so -ENOMEM + no request indicates that.
-		 */
-		return __pkvm_topup_hyp_alloc(1);
-	} else if (req.type != KVM_HYP_REQ_TYPE_MEM) {
-		return -EBADE;
-	}
-
-	if (req.mem.dest == REQ_MEM_DEST_HYP_IOMMU) {
-		size_t nr_pages, from_cma = 0;
-		int ret;
-
-		nr_pages = req.mem.nr_pages;
-
-		if (req.mem.sz_alloc < PMD_SIZE) {
-			size_t size = req.mem.sz_alloc * nr_pages;
-
-			ret = __kvm_arm_smmu_topup_from_cma(size, gfp, &from_cma);
-			if (!ret)
-				return 0;
-
-			nr_pages -= from_cma / req.mem.sz_alloc;
-		}
-
-		return __pkvm_topup_hyp_alloc_mgt_gfp(HYP_ALLOC_MGT_IOMMU_ID,
-						      nr_pages,
-						      req.mem.sz_alloc,
-						      gfp);
-	} else if (req.mem.dest == REQ_MEM_DEST_HYP_ALLOC) {
-		/* Fill hyp alloc*/
-		return __pkvm_topup_hyp_alloc(req.mem.nr_pages);
-	}
-
-	pr_err("Bogus mem request");
-	return -EBADE;
-}
-
-/*
- * Issue hypercall, and retry after filling the memcache if necessary.
- */
-#define kvm_call_hyp_nvhe_mc(...)					\
-({									\
-	struct arm_smccc_res __res;					\
-	do {								\
-		__res = kvm_call_hyp_nvhe_smccc(__VA_ARGS__);		\
-	} while (__res.a1 && !kvm_arm_smmu_topup_memcache(&__res, GFP_KERNEL));\
-	__res.a1;							\
-})
 
 static struct platform_driver kvm_arm_smmu_driver;
 
@@ -211,15 +91,97 @@ kvm_arm_smmu_get_by_fwnode(struct fwnode_handle *fwnode)
 
 static struct iommu_ops kvm_arm_smmu_ops;
 
+static int kvm_arm_smmu_streams_cmp_key(const void *lhs, const struct rb_node *rhs)
+{
+	struct kvm_arm_smmu_stream *stream_rhs = rb_entry(rhs, struct kvm_arm_smmu_stream, node);
+	const u32 *sid_lhs = lhs;
+
+	if (*sid_lhs < stream_rhs->id)
+		return -1;
+	if (*sid_lhs > stream_rhs->id)
+		return 1;
+	return 0;
+}
+
+static int kvm_arm_smmu_streams_cmp_node(struct rb_node *lhs, const struct rb_node *rhs)
+{
+	return kvm_arm_smmu_streams_cmp_key(&rb_entry(lhs, struct kvm_arm_smmu_stream, node)->id,
+					    rhs);
+}
+
+static int kvm_arm_smmu_insert_master(struct arm_smmu_device *smmu,
+				      struct kvm_arm_smmu_master *master)
+{
+	int i;
+	int ret = 0;
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(master->dev);
+
+	master->streams = kcalloc(fwspec->num_ids, sizeof(*master->streams), GFP_KERNEL);
+	if (!master->streams)
+		return -ENOMEM;
+	master->num_streams = fwspec->num_ids;
+
+	mutex_lock(&smmu->streams_mutex);
+	for (i = 0; i < fwspec->num_ids; i++) {
+		struct kvm_arm_smmu_stream *new_stream = &master->streams[i];
+		struct rb_node *existing;
+		u32 sid = fwspec->ids[i];
+
+		new_stream->id = sid;
+		new_stream->master = master;
+
+		existing = rb_find_add(&new_stream->node, &smmu->streams,
+				       kvm_arm_smmu_streams_cmp_node);
+		if (existing) {
+			struct kvm_arm_smmu_master *existing_master = rb_entry(existing,
+									struct kvm_arm_smmu_stream,
+									node)->master;
+
+			/* Bridged PCI devices may end up with duplicated IDs */
+			if (existing_master == master)
+				continue;
+
+			dev_warn(master->dev,
+				 "Aliasing StreamID 0x%x (from %s) unsupported, expect DMA to be broken\n",
+				 sid, dev_name(existing_master->dev));
+			ret = -ENODEV;
+			break;
+		}
+	}
+
+	if (ret) {
+		for (i--; i >= 0; i--)
+			rb_erase(&master->streams[i].node, &smmu->streams);
+		kfree(master->streams);
+	}
+	mutex_unlock(&smmu->streams_mutex);
+
+	return ret;
+}
+
+static void kvm_arm_smmu_remove_master(struct kvm_arm_smmu_master *master)
+{
+	int i;
+	struct arm_smmu_device *smmu = master->smmu;
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(master->dev);
+
+	if (!smmu || !master->streams)
+		return;
+
+	mutex_lock(&smmu->streams_mutex);
+	for (i = 0; i < fwspec->num_ids; i++)
+		rb_erase(&master->streams[i].node, &smmu->streams);
+	mutex_unlock(&smmu->streams_mutex);
+
+	kfree(master->streams);
+}
+
 static struct iommu_device *kvm_arm_smmu_probe_device(struct device *dev)
 {
-	int ret;
 	struct arm_smmu_device *smmu;
 	struct kvm_arm_smmu_master *master;
 	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
-
-	if (!fwspec || fwspec->ops != &kvm_arm_smmu_ops)
-		return ERR_PTR(-ENODEV);
+	int ret;
 
 	if (WARN_ON_ONCE(dev_iommu_priv_get(dev)))
 		return ERR_PTR(-EBUSY);
@@ -234,22 +196,29 @@ static struct iommu_device *kvm_arm_smmu_probe_device(struct device *dev)
 
 	master->dev = dev;
 	master->smmu = smmu;
+
+	ret = kvm_arm_smmu_insert_master(smmu, master);
+	if (ret)
+		goto err_free_master;
+
 	device_property_read_u32(dev, "pasid-num-bits", &master->ssid_bits);
+
 	master->ssid_bits = min(smmu->ssid_bits, master->ssid_bits);
 	xa_init(&master->domains);
 	master->idmapped = device_property_read_bool(dev, "iommu-idmapped");
 	dev_iommu_priv_set(dev, master);
-
 	if (!device_link_add(dev, smmu->dev,
-			     DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE |
+			     DL_FLAG_PM_RUNTIME |
 			     DL_FLAG_AUTOREMOVE_SUPPLIER)) {
 		ret = -ENOLINK;
-		goto err_free;
+		goto err_remove_master;
 	}
 
 	return &smmu->iommu;
 
-err_free:
+err_remove_master:
+	kvm_arm_smmu_remove_master(master);
+err_free_master:
 	kfree(master);
 	return ERR_PTR(ret);
 }
@@ -265,12 +234,13 @@ static struct iommu_domain *kvm_arm_smmu_domain_alloc(unsigned type)
 	 */
 	if (type != IOMMU_DOMAIN_DMA &&
 	    type != IOMMU_DOMAIN_UNMANAGED &&
-	    type != IOMMU_DOMAIN_IDENTITY)
-		return NULL;
+	    type != IOMMU_DOMAIN_IDENTITY &&
+		type != IOMMU_DOMAIN_BLOCKED)
+		return ERR_PTR(-EOPNOTSUPP);
 
 	kvm_smmu_domain = kzalloc(sizeof(*kvm_smmu_domain), GFP_KERNEL);
 	if (!kvm_smmu_domain)
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 
 	mutex_init(&kvm_smmu_domain->init_mutex);
 
@@ -282,14 +252,16 @@ static int kvm_arm_smmu_domain_finalize(struct kvm_arm_smmu_domain *kvm_smmu_dom
 {
 	int ret = 0;
 	struct arm_smmu_device *smmu = master->smmu;
-	struct host_arm_smmu_device *host_smmu = smmu_to_host(smmu);
 	unsigned int max_domains;
+	enum kvm_arm_smmu_domain_type type;
+	struct io_pgtable_cfg cfg;
+	unsigned long ias;
 
-	if (kvm_smmu_domain->smmu) {
-		if (kvm_smmu_domain->smmu != smmu)
-			return -EINVAL;
+	if (kvm_smmu_domain->smmu && (kvm_smmu_domain->smmu != smmu))
+		return -EINVAL;
+
+	if (kvm_smmu_domain->smmu)
 		return 0;
-	}
 
 	if (kvm_smmu_domain->domain.type == IOMMU_DOMAIN_IDENTITY) {
 		kvm_smmu_domain->id = KVM_IOMMU_DOMAIN_IDMAP_ID;
@@ -302,14 +274,37 @@ static int kvm_arm_smmu_domain_finalize(struct kvm_arm_smmu_domain *kvm_smmu_dom
 
 	/* Default to stage-1. */
 	if (smmu->features & ARM_SMMU_FEAT_TRANS_S1) {
-		kvm_smmu_domain->type = KVM_ARM_SMMU_DOMAIN_S1;
-		kvm_smmu_domain->domain.pgsize_bitmap = host_smmu->cfg_s1.pgsize_bitmap;
-		kvm_smmu_domain->domain.geometry.aperture_end = (1UL << host_smmu->cfg_s1.ias) - 1;
+		ias = (smmu->features & ARM_SMMU_FEAT_VAX) ? 52 : 48;
+		cfg = (struct io_pgtable_cfg) {
+			.fmt = ARM_64_LPAE_S1,
+			.pgsize_bitmap = smmu->pgsize_bitmap,
+			.ias = min_t(unsigned long, ias, VA_BITS),
+			.oas = smmu->ias,
+			.coherent_walk = smmu->features & ARM_SMMU_FEAT_COHERENCY,
+		};
+		ret = io_pgtable_configure(&cfg);
+		if (ret)
+			return ret;
+
+		type = KVM_ARM_SMMU_DOMAIN_S1;
+		kvm_smmu_domain->domain.pgsize_bitmap = cfg.pgsize_bitmap;
+		kvm_smmu_domain->domain.geometry.aperture_end = (1UL << cfg.ias) - 1;
 		max_domains = 1 << smmu->asid_bits;
 	} else {
-		kvm_smmu_domain->type = KVM_ARM_SMMU_DOMAIN_S2;
-		kvm_smmu_domain->domain.pgsize_bitmap = host_smmu->cfg_s2.pgsize_bitmap;
-		kvm_smmu_domain->domain.geometry.aperture_end = (1UL << host_smmu->cfg_s2.ias) - 1;
+		cfg = (struct io_pgtable_cfg) {
+			.fmt = ARM_64_LPAE_S2,
+			.pgsize_bitmap = smmu->pgsize_bitmap,
+			.ias = smmu->ias,
+			.oas = smmu->oas,
+			.coherent_walk = smmu->features & ARM_SMMU_FEAT_COHERENCY,
+		};
+		ret = io_pgtable_configure(&cfg);
+		if (ret)
+			return ret;
+
+		type = KVM_ARM_SMMU_DOMAIN_S2;
+		kvm_smmu_domain->domain.pgsize_bitmap = cfg.pgsize_bitmap;
+		kvm_smmu_domain->domain.geometry.aperture_end = (1UL << cfg.ias) - 1;
 		max_domains = 1 << smmu->vmid_bits;
 	}
 	kvm_smmu_domain->domain.geometry.force_aperture = true;
@@ -317,9 +312,7 @@ static int kvm_arm_smmu_domain_finalize(struct kvm_arm_smmu_domain *kvm_smmu_dom
 	/*
 	 * The hypervisor uses the domain_id for asid/vmid so it has to be
 	 * unique, and it has to be in range of this smmu, which can be
-	 * either 8 or 16 bits, this can be improved a bit to make
-	 * 16 bit asids or vmids allocate from the end of the range to
-	 * give more chance to the smmus with 8 bits.
+	 * either 8 or 16 bits.
 	 */
 	ret = ida_alloc_range(&kvm_arm_smmu_domain_ida, KVM_IOMMU_DOMAIN_NR_START,
 			      min(KVM_IOMMU_MAX_DOMAINS, max_domains), GFP_KERNEL);
@@ -328,8 +321,7 @@ static int kvm_arm_smmu_domain_finalize(struct kvm_arm_smmu_domain *kvm_smmu_dom
 
 	kvm_smmu_domain->id = ret;
 
-	ret = kvm_call_hyp_nvhe_mc(__pkvm_host_iommu_alloc_domain,
-				   kvm_smmu_domain->id, kvm_smmu_domain->type);
+	ret = kvm_iommu_alloc_domain(kvm_smmu_domain->id, type);
 	if (ret) {
 		ida_free(&kvm_arm_smmu_domain_ida, kvm_smmu_domain->id);
 		return ret;
@@ -347,7 +339,7 @@ static void kvm_arm_smmu_domain_free(struct iommu_domain *domain)
 	struct arm_smmu_device *smmu = kvm_smmu_domain->smmu;
 
 	if (smmu && (kvm_smmu_domain->domain.type != IOMMU_DOMAIN_IDENTITY)) {
-		ret = kvm_call_hyp_nvhe(__pkvm_host_iommu_free_domain, kvm_smmu_domain->id);
+		ret = kvm_iommu_free_domain(kvm_smmu_domain->id);
 		ida_free(&kvm_arm_smmu_domain_ida, kvm_smmu_domain->id);
 	}
 	kfree(kvm_smmu_domain);
@@ -359,17 +351,15 @@ static int kvm_arm_smmu_detach_dev_pasid(struct host_arm_smmu_device *host_smmu,
 {
 	int i, ret;
 	struct arm_smmu_device *smmu = &host_smmu->smmu;
-	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(master->dev);
 	struct kvm_arm_smmu_domain *domain = xa_load(&master->domains, pasid);
 
 	if (!domain)
 		return 0;
 
-	for (i = 0; i < fwspec->num_ids; i++) {
-		int sid = fwspec->ids[i];
+	for (i = 0; i < master->num_streams; i++) {
+		int sid = master->streams[i].id;
 
-		ret = kvm_call_hyp_nvhe(__pkvm_host_iommu_detach_dev,
-					host_smmu->id, domain->id, sid, pasid);
+		ret = kvm_iommu_detach_dev(host_smmu->id, domain->id, sid, pasid);
 		if (ret) {
 			dev_err(smmu->dev, "cannot detach device %s (0x%x): %d\n",
 				dev_name(master->dev), sid, ret);
@@ -377,7 +367,17 @@ static int kvm_arm_smmu_detach_dev_pasid(struct host_arm_smmu_device *host_smmu,
 		}
 	}
 
+	/*
+	 * smmu->streams_mutex is taken to provide synchronization with respect to
+	 * kvm_arm_smmu_handle_event(), since that acquires the same lock. Taking the
+	 * lock makes domain removal atomic with respect to domain usage when reporting
+	 * faults related to a domain to an IOMMU client driver. This makes it so that
+	 * the domain doesn't go away while it is being used in the fault reporting
+	 * logic.
+	 */
+	mutex_lock(&smmu->streams_mutex);
 	xa_erase(&master->domains, pasid);
+	mutex_unlock(&smmu->streams_mutex);
 
 	return ret;
 }
@@ -388,6 +388,15 @@ static int kvm_arm_smmu_detach_dev(struct host_arm_smmu_device *host_smmu,
 	return kvm_arm_smmu_detach_dev_pasid(host_smmu, master, 0);
 }
 
+static void kvm_arm_smmu_remove_dev_pasid(struct device *dev, ioasid_t pasid,
+					  struct iommu_domain *domain)
+{
+	struct kvm_arm_smmu_master *master = dev_iommu_priv_get(dev);
+	struct host_arm_smmu_device *host_smmu = smmu_to_host(master->smmu);
+
+	kvm_arm_smmu_detach_dev_pasid(host_smmu, master, pasid);
+}
+
 static void kvm_arm_smmu_release_device(struct device *dev)
 {
 	struct kvm_arm_smmu_master *master = dev_iommu_priv_get(dev);
@@ -395,16 +404,9 @@ static void kvm_arm_smmu_release_device(struct device *dev)
 
 	kvm_arm_smmu_detach_dev(host_smmu, master);
 	xa_destroy(&master->domains);
+	kvm_arm_smmu_remove_master(master);
 	kfree(master);
 	iommu_fwspec_free(dev);
-}
-
-static void kvm_arm_smmu_remove_dev_pasid(struct device *dev, ioasid_t pasid)
-{
-	struct kvm_arm_smmu_master *master = dev_iommu_priv_get(dev);
-	struct host_arm_smmu_device *host_smmu = smmu_to_host(master->smmu);
-
-	kvm_arm_smmu_detach_dev_pasid(host_smmu, master, pasid);
 }
 
 static int kvm_arm_smmu_set_dev_pasid(struct iommu_domain *domain,
@@ -413,7 +415,6 @@ static int kvm_arm_smmu_set_dev_pasid(struct iommu_domain *domain,
 	int i, ret;
 	struct arm_smmu_device *smmu;
 	struct host_arm_smmu_device *host_smmu;
-	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
 	struct kvm_arm_smmu_master *master = dev_iommu_priv_get(dev);
 	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(domain);
 
@@ -424,7 +425,7 @@ static int kvm_arm_smmu_set_dev_pasid(struct iommu_domain *domain,
 	host_smmu = smmu_to_host(smmu);
 
 	ret = kvm_arm_smmu_detach_dev_pasid(host_smmu, master, pasid);
-	if (ret)
+	if (ret || (domain->type == IOMMU_DOMAIN_BLOCKED))
 		return ret;
 
 	mutex_lock(&kvm_smmu_domain->init_mutex);
@@ -433,12 +434,11 @@ static int kvm_arm_smmu_set_dev_pasid(struct iommu_domain *domain,
 	if (ret)
 		return ret;
 
-	for (i = 0; i < fwspec->num_ids; i++) {
-		int sid = fwspec->ids[i];
+	for (i = 0; i < master->num_streams; i++) {
+		int sid = master->streams[i].id;
 
-		ret = kvm_call_hyp_nvhe_mc(__pkvm_host_iommu_attach_dev,
-					   host_smmu->id, kvm_smmu_domain->id,
-					   sid, pasid, master->ssid_bits);
+		ret = kvm_iommu_attach_dev(host_smmu->id, kvm_smmu_domain->id,
+					   sid, pasid, master->ssid_bits, 0);
 		if (ret) {
 			dev_err(smmu->dev, "cannot attach device %s (0x%x): %d\n",
 				dev_name(dev), sid, ret);
@@ -457,81 +457,13 @@ static int kvm_arm_smmu_attach_dev(struct iommu_domain *domain,
 				   struct device *dev)
 {
 	struct kvm_arm_smmu_master *master = dev_iommu_priv_get(dev);
+	unsigned long pasid = 0;
 
-	/* If anything other than pasid 0 attached, we can't support through attach_dev. */
-	if(!xa_empty(&master->domains) && !xa_load(&master->domains, 0))
+	/* All pasids must be removed first. */
+	if (xa_find_after(&master->domains, &pasid, ULONG_MAX, XA_PRESENT))
 		return -EBUSY;
 
 	return kvm_arm_smmu_set_dev_pasid(domain, dev, 0);
-}
-
-static int kvm_arm_smmu_map_pages(struct iommu_domain *domain,
-				  unsigned long iova, phys_addr_t paddr,
-				  size_t pgsize, size_t pgcount, int prot,
-				  gfp_t gfp, size_t *total_mapped)
-{
-	size_t mapped;
-	size_t size = pgsize * pgcount;
-	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(domain);
-	struct arm_smccc_res res;
-
-	do {
-		res = kvm_call_hyp_nvhe_smccc(__pkvm_host_iommu_map_pages,
-					      kvm_smmu_domain->id,
-					      iova, paddr, pgsize, pgcount, prot);
-		mapped = res.a1;
-		iova += mapped;
-		paddr += mapped;
-		WARN_ON(mapped % pgsize);
-		WARN_ON(mapped > pgcount * pgsize);
-		pgcount -= mapped / pgsize;
-		*total_mapped += mapped;
-	} while (*total_mapped < size && !kvm_arm_smmu_topup_memcache(&res, gfp));
-	if (*total_mapped < size)
-		return -EINVAL;
-
-	return 0;
-}
-
-static size_t kvm_arm_smmu_unmap_pages(struct iommu_domain *domain,
-				       unsigned long iova, size_t pgsize,
-				       size_t pgcount,
-				       struct iommu_iotlb_gather *iotlb_gather)
-{
-	size_t unmapped;
-	size_t total_unmapped = 0;
-	size_t size = pgsize * pgcount;
-	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(domain);
-	struct arm_smccc_res res;
-
-	do {
-		res = kvm_call_hyp_nvhe_smccc(__pkvm_host_iommu_unmap_pages,
-					      kvm_smmu_domain->id,
-					      iova, pgsize, pgcount);
-		unmapped = res.a1;
-		total_unmapped += unmapped;
-		iova += unmapped;
-		WARN_ON(unmapped % pgsize);
-		pgcount -= unmapped / pgsize;
-
-		/*
-		 * The page table driver can unmap less than we asked for. If it
-		 * didn't unmap anything at all, then it either reached the end
-		 * of the range, or it needs a page in the memcache to break a
-		 * block mapping.
-		 */
-	} while (total_unmapped < size &&
-		 (unmapped || !kvm_arm_smmu_topup_memcache(&res, GFP_ATOMIC)));
-
-	return total_unmapped;
-}
-
-static phys_addr_t kvm_arm_smmu_iova_to_phys(struct iommu_domain *domain,
-					     dma_addr_t iova)
-{
-	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(domain);
-
-	return kvm_call_hyp_nvhe(__pkvm_host_iommu_iova_to_phys, kvm_smmu_domain->id, iova);
 }
 
 static int kvm_arm_smmu_def_domain_type(struct device *dev)
@@ -549,14 +481,152 @@ static bool kvm_arm_smmu_capable(struct device *dev, enum iommu_cap cap)
 
 	switch (cap) {
 	case IOMMU_CAP_CACHE_COHERENCY:
-		/* Assume that a coherent TCU implies coherent TBUs */
 		return master->smmu->features & ARM_SMMU_FEAT_COHERENCY;
 	case IOMMU_CAP_NOEXEC:
-	case IOMMU_CAP_DEFERRED_FLUSH:
-		return true;
 	default:
 		return false;
 	}
+}
+
+static int kvm_arm_smmu_map_pages(struct iommu_domain *domain,
+				  unsigned long iova, phys_addr_t paddr,
+				  size_t pgsize, size_t pgcount, int prot,
+				  gfp_t gfp, size_t *total_mapped)
+{
+	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(domain);
+
+	if (!kvm_smmu_domain->smmu)
+		return -ENODEV;
+
+	return kvm_iommu_map_pages(kvm_smmu_domain->id, iova, paddr, pgsize,
+				   pgcount, prot, gfp, total_mapped);
+}
+
+static size_t kvm_arm_smmu_unmap_pages(struct iommu_domain *domain,
+				       unsigned long iova, size_t pgsize,
+				       size_t pgcount,
+				       struct iommu_iotlb_gather *iotlb_gather)
+{
+	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(domain);
+
+	if (!kvm_smmu_domain->smmu)
+		return 0;
+
+	return kvm_iommu_unmap_pages(kvm_smmu_domain->id, iova, pgsize, pgcount);
+}
+
+static phys_addr_t kvm_arm_smmu_iova_to_phys(struct iommu_domain *domain,
+					     dma_addr_t iova)
+{
+	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(domain);
+
+	if (!kvm_smmu_domain->smmu)
+		return 0;
+
+	return kvm_iommu_iova_to_phys(kvm_smmu_domain->id, iova);
+}
+
+struct kvm_arm_smmu_map_sg {
+	struct iommu_map_cookie_sg cookie;
+	struct kvm_iommu_sg *sg;
+	unsigned int ptr;
+	unsigned long iova;
+	int prot;
+	gfp_t gfp;
+	unsigned int nents;
+	size_t total_mapped;
+	size_t size; /* Total size of entries not mapped yet. */
+};
+
+static struct iommu_map_cookie_sg *kvm_arm_smmu_alloc_cookie_sg(unsigned long iova,
+								int prot,
+								unsigned int nents,
+								gfp_t gfp)
+{
+	int ret;
+	struct kvm_arm_smmu_map_sg *map_sg = kzalloc(sizeof(*map_sg), gfp);
+
+	if (!map_sg)
+		return NULL;
+
+	/* Rounds nents to allocate to page aligned size. */
+	map_sg->nents = kvm_iommu_sg_nents_round(nents);
+	map_sg->sg = kvm_iommu_sg_alloc(map_sg->nents, gfp);
+	if (!map_sg->sg) {
+		kfree(map_sg);
+		return NULL;
+	}
+	map_sg->iova = iova;
+	map_sg->prot = prot;
+	map_sg->gfp = gfp;
+	ret = kvm_iommu_share_hyp_sg(map_sg->sg, map_sg->nents);
+	if (ret) {
+		kvm_iommu_sg_free(map_sg->sg, map_sg->nents);
+		kfree(map_sg);
+		return NULL;
+	}
+
+	return &map_sg->cookie;
+}
+
+static int kvm_arm_smmu_add_deferred_map_sg(struct iommu_map_cookie_sg *cookie,
+					    phys_addr_t paddr, size_t pgsize, size_t pgcount)
+{
+	struct kvm_arm_smmu_map_sg *map_sg = container_of(cookie, struct kvm_arm_smmu_map_sg,
+							  cookie);
+	struct kvm_iommu_sg *sg = map_sg->sg;
+	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(map_sg->cookie.domain);
+	size_t mapped;
+
+	/* Out of space, flush the list. */
+	if (map_sg->nents == map_sg->ptr) {
+		mapped = kvm_iommu_map_sg(kvm_smmu_domain->id, sg, map_sg->iova,
+					  map_sg->ptr, map_sg->prot, map_sg->gfp);
+		/*
+		 * Something went wrong, undo the mappings from the current sg list,
+		 * leaving total mapped as it would be unmapped from core code as
+		 * kvm_arm_smmu_consume_deferred_map_sg() would return total_mapped.
+		 */
+		if (mapped != map_sg->size) {
+			iommu_unmap(&kvm_smmu_domain->domain, map_sg->iova, mapped);
+			/*
+			 * The core code will try to consume the list in the error path
+			 * don't attempt to map this list again as it already failed, so
+			 * no need to waste time.
+			 */
+			map_sg->ptr = 0;
+			return -EINVAL;
+		}
+		map_sg->ptr = 0;
+		map_sg->iova += mapped;
+		map_sg->total_mapped += mapped;
+		map_sg->size = 0;
+	}
+
+	sg[map_sg->ptr].phys = paddr;
+	sg[map_sg->ptr].pgsize = pgsize;
+	sg[map_sg->ptr].pgcount = pgcount;
+	map_sg->size += pgsize * pgcount;
+	map_sg->ptr++;
+	return 0;
+}
+
+static size_t kvm_arm_smmu_consume_deferred_map_sg(struct iommu_map_cookie_sg *cookie)
+{
+	struct kvm_arm_smmu_map_sg *map_sg = container_of(cookie, struct kvm_arm_smmu_map_sg,
+							  cookie);
+	struct kvm_iommu_sg *sg = map_sg->sg;
+	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(map_sg->cookie.domain);
+	size_t total_mapped = map_sg->total_mapped;
+
+	/* Might be cleared from error path. */
+	if (map_sg->ptr)
+		total_mapped += kvm_iommu_map_sg(kvm_smmu_domain->id, sg, map_sg->iova,
+						 map_sg->ptr, map_sg->prot, map_sg->gfp);
+	kvm_iommu_unshare_hyp_sg(sg, map_sg->nents);
+	kvm_iommu_sg_free(sg, map_sg->nents);
+	kfree(map_sg);
+	return total_mapped;
 }
 
 static struct iommu_ops kvm_arm_smmu_ops = {
@@ -578,6 +648,9 @@ static struct iommu_ops kvm_arm_smmu_ops = {
 		.unmap_pages	= kvm_arm_smmu_unmap_pages,
 		.iova_to_phys	= kvm_arm_smmu_iova_to_phys,
 		.set_dev_pasid	= kvm_arm_smmu_set_dev_pasid,
+		.alloc_cookie_sg = kvm_arm_smmu_alloc_cookie_sg,
+		.add_deferred_map_sg = kvm_arm_smmu_add_deferred_map_sg,
+		.consume_deferred_map_sg = kvm_arm_smmu_consume_deferred_map_sg,
 	}
 };
 
@@ -620,33 +693,112 @@ static bool kvm_arm_smmu_validate_features(struct arm_smmu_device *smmu)
 	return true;
 }
 
+static struct kvm_arm_smmu_master *kvm_arm_smmu_find_master(struct arm_smmu_device *smmu, u32 sid)
+{
+	struct rb_node *node;
+
+	lockdep_assert_held(&smmu->streams_mutex);
+
+	node = rb_find(&sid, &smmu->streams, kvm_arm_smmu_streams_cmp_key);
+	if (!node)
+		return NULL;
+	return rb_entry(node, struct kvm_arm_smmu_stream, node)->master;
+}
+
+static void kvm_arm_smmu_decode_event(struct arm_smmu_device *smmu, u64 *raw,
+				      struct arm_smmu_event *event)
+{
+	struct kvm_arm_smmu_master *master;
+
+	event->id = FIELD_GET(EVTQ_0_ID, raw[0]);
+	event->sid = FIELD_GET(EVTQ_0_SID, raw[0]);
+	event->ssv = FIELD_GET(EVTQ_0_SSV, raw[0]);
+	event->ssid = event->ssv ? FIELD_GET(EVTQ_0_SSID, raw[0]) : IOMMU_NO_PASID;
+	event->read = FIELD_GET(EVTQ_1_RnW, raw[1]);
+	event->iova = FIELD_GET(EVTQ_2_ADDR, raw[2]);
+	event->dev = NULL;
+
+	mutex_lock(&smmu->streams_mutex);
+	master = kvm_arm_smmu_find_master(smmu, event->sid);
+	if (master)
+		event->dev = get_device(master->dev);
+	mutex_unlock(&smmu->streams_mutex);
+}
+
+static int kvm_arm_smmu_handle_event(struct arm_smmu_device *smmu, u64 *evt,
+				     struct arm_smmu_event *event)
+{
+	int ret = 0;
+	struct kvm_arm_smmu_master *master;
+	struct kvm_arm_smmu_domain *smmu_domain;
+
+	switch (event->id) {
+	case EVT_ID_TRANSLATION_FAULT:
+	case EVT_ID_ADDR_SIZE_FAULT:
+	case EVT_ID_ACCESS_FAULT:
+	case EVT_ID_PERMISSION_FAULT:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	mutex_lock(&smmu->streams_mutex);
+	master = kvm_arm_smmu_find_master(smmu, event->sid);
+	if (!master) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	smmu_domain = xa_load(&master->domains, event->ssid);
+	if (!smmu_domain) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	ret = report_iommu_fault(&smmu_domain->domain, master->dev, event->iova,
+				 event->read ? IOMMU_FAULT_READ : IOMMU_FAULT_WRITE);
+
+out_unlock:
+	mutex_unlock(&smmu->streams_mutex);
+	return ret;
+}
+
+static void kvm_arm_smmu_dump_event(struct arm_smmu_device *smmu, u64 *raw,
+				    struct arm_smmu_event *evt, struct ratelimit_state *rs)
+{
+
+	int i;
+
+	if (!__ratelimit(rs))
+		return;
+
+	dev_info(smmu->dev, "event 0x%02x received:\n", evt->id);
+	for (i = 0; i < EVTQ_ENT_DWORDS; ++i)
+		dev_info(smmu->dev, "\t0x%016llx\n", (unsigned long long)raw[i]);
+}
+
 static irqreturn_t kvm_arm_smmu_evt_handler(int irq, void *dev)
 {
-	int i;
 	struct arm_smmu_device *smmu = dev;
 	struct arm_smmu_queue *q = &smmu->evtq.q;
 	struct arm_smmu_ll_queue *llq = &q->llq;
 	static DEFINE_RATELIMIT_STATE(rs, DEFAULT_RATELIMIT_INTERVAL,
 				      DEFAULT_RATELIMIT_BURST);
 	u64 evt[EVTQ_ENT_DWORDS];
+	struct arm_smmu_event event = {0};
 
-	if (pm_runtime_get_if_in_use(smmu->dev) != 1) {
-		dev_err(smmu->dev,"Skip EVTQ as device is OFF\n");
-		return IRQ_HANDLED;
+	if (pm_runtime_get_if_active(smmu->dev) == 0) {
+		dev_err(smmu->dev, "Unable to handle event interrupt because device not runtime active\n");
+		return IRQ_NONE;
 	}
 
 	do {
 		while (!queue_remove_raw(q, evt)) {
-			u8 id = FIELD_GET(EVTQ_0_ID, evt[0]);
+			kvm_arm_smmu_decode_event(smmu, evt, &event);
+			if (kvm_arm_smmu_handle_event(smmu, evt, &event))
+				kvm_arm_smmu_dump_event(smmu, evt, &event, &rs);
 
-			if (!__ratelimit(&rs))
-				continue;
-
-			dev_info(smmu->dev, "event 0x%02x received:\n", id);
-			for (i = 0; i < ARRAY_SIZE(evt); ++i)
-				dev_info(smmu->dev, "\t0x%016llx\n",
-					 (unsigned long long)evt[i]);
-
+			put_device(event.dev);
 			cond_resched();
 		}
 
@@ -669,9 +821,9 @@ static irqreturn_t kvm_arm_smmu_gerror_handler(int irq, void *dev)
 	u32 gerror, gerrorn, active;
 	struct arm_smmu_device *smmu = dev;
 
-	if (pm_runtime_get_if_in_use(smmu->dev) != 1) {
-		dev_err(smmu->dev,"Skip GERROR as device is OFF\n");
-		return IRQ_HANDLED;
+	if (pm_runtime_get_if_active(smmu->dev) == 0) {
+		dev_err(smmu->dev, "Unable to handle global error interrupt because device not runtime active\n");
+		return IRQ_NONE;
 	}
 
 	gerror = readl_relaxed(smmu->base + ARM_SMMU_GERROR);
@@ -710,12 +862,11 @@ static irqreturn_t kvm_arm_smmu_gerror_handler(int irq, void *dev)
 		dev_err(smmu->dev, "EVTQ write aborted -- events may have been lost\n");
 
 	if (active & GERROR_CMDQ_ERR) {
-		dev_err(smmu->dev, "CMDQ ERR -- Hypervisor corruption\n");
+		dev_err(smmu->dev, "CMDQ ERR -- Hypervisor cmdq corrupted?\n");
 		BUG();
 	}
 
 	writel(gerror, smmu->base + ARM_SMMU_GERRORN);
-
 	pm_runtime_put(smmu->dev);
 	return IRQ_HANDLED;
 }
@@ -751,10 +902,7 @@ static int kvm_arm_smmu_device_reset(struct host_arm_smmu_device *host_smmu)
 		return ret;
 
 	/* Stream table */
-	writeq_relaxed(smmu->strtab_cfg.strtab_base,
-		       smmu->base + ARM_SMMU_STRTAB_BASE);
-	writel_relaxed(smmu->strtab_cfg.strtab_base_cfg,
-		       smmu->base + ARM_SMMU_STRTAB_BASE_CFG);
+	arm_smmu_write_strtab(smmu);
 
 	/* Command queue */
 	writeq_relaxed(smmu->cmdq.q.q_base, smmu->base + ARM_SMMU_CMDQ_BASE);
@@ -795,38 +943,87 @@ static int kvm_arm_smmu_device_reset(struct host_arm_smmu_device *host_smmu)
 	return 0;
 }
 
+static int kvm_arm_probe_scmi_pd(struct device_node *scmi_node,
+				 struct kvm_power_domain *pd)
+{
+	int ret;
+	struct resource res;
+	struct of_phandle_args args;
+
+	pd->type = KVM_POWER_DOMAIN_ARM_SCMI;
+
+	ret = of_parse_phandle_with_args(scmi_node, "shmem", NULL, 0, &args);
+	if (ret)
+		return ret;
+
+	ret = of_address_to_resource(args.np, 0, &res);
+	if (ret)
+		goto out_put_nodes;
+
+	ret = of_property_read_u32(scmi_node, "arm,smc-id",
+				   &pd->arm_scmi.smc_id);
+	if (ret)
+		goto out_put_nodes;
+
+	/*
+	 * The shared buffer is unmapped from the host while a request is in
+	 * flight, so it has to be on its own page.
+	 */
+	if (!IS_ALIGNED(res.start, SZ_64K) || resource_size(&res) < SZ_64K) {
+		ret = -EINVAL;
+		goto out_put_nodes;
+	}
+
+	pd->arm_scmi.shmem_base = res.start;
+	pd->arm_scmi.shmem_size = resource_size(&res);
+
+out_put_nodes:
+	of_node_put(args.np);
+	return ret;
+}
+
 /* TODO: Move this. None of it is specific to SMMU */
 static int kvm_arm_probe_power_domain(struct device *dev,
 				      struct kvm_power_domain *pd)
 {
-	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
-	struct host_arm_smmu_device *host_smmu = smmu_to_host(smmu);
+	int ret;
+	struct device_node *parent;
+	struct of_phandle_args args;
 
-	if (!of_get_property(dev->of_node, "power-domains", NULL)) {
-		/* SMMU MUST RESET TO BLOCK DMA. */
-		dev_warn(dev, "No power-domains assuming host control\n");
+	if (!of_get_property(dev->of_node, "power-domains", NULL))
+		return 0;
+
+	ret = of_parse_phandle_with_args(dev->of_node, "power-domains",
+					 "#power-domain-cells", 0, &args);
+	if (ret)
+		return ret;
+
+	parent = of_get_parent(args.np);
+	if (parent && of_device_is_compatible(parent, "arm,scmi-smc") &&
+	    args.args_count > 0) {
+		pd->arm_scmi.domain_id = args.args[0];
+		ret = kvm_arm_probe_scmi_pd(parent, pd);
+	} else {
+		dev_warn(dev, "Unknown PM method for %pOF, using HVC\n",
+			 args.np);
+		pd->type = KVM_POWER_DOMAIN_HOST_HVC;
+		pd->device_id = kvm_arm_smmu_cur;
 	}
-
-	pd->type = KVM_POWER_DOMAIN_HOST_HVC;
-	pd->device_id = kvm_arm_smmu_cur;
-	host_smmu->hvc_pd = true;
-	return 0;
+	of_node_put(parent);
+	of_node_put(args.np);
+	return ret;
 }
 
 static int kvm_arm_smmu_probe(struct platform_device *pdev)
 {
 	int ret;
-	bool bypass;
+	size_t size;
+	phys_addr_t ioaddr;
 	struct resource *res;
-	phys_addr_t mmio_addr;
-	struct io_pgtable_cfg cfg_s1, cfg_s2;
-	size_t mmio_size, pgd_size;
 	struct arm_smmu_device *smmu;
 	struct device *dev = &pdev->dev;
 	struct host_arm_smmu_device *host_smmu;
 	struct hyp_arm_smmu_v3_device *hyp_smmu;
-	struct kvm_power_domain power_domain = {};
-	unsigned long ias;
 
 	if (kvm_arm_smmu_cur >= kvm_arm_smmu_count)
 		return -ENOSPC;
@@ -840,23 +1037,24 @@ static int kvm_arm_smmu_probe(struct platform_device *pdev)
 	smmu = &host_smmu->smmu;
 	smmu->dev = dev;
 
-	ret = arm_smmu_fw_probe(pdev, smmu, &bypass);
-	if (ret || bypass)
-		return ret ?: -EINVAL;
+	ret = arm_smmu_fw_probe(pdev, smmu);
+	if (ret)
+		return ret;
 
-	platform_set_drvdata(pdev, smmu);
+	mutex_init(&smmu->streams_mutex);
+	smmu->streams = RB_ROOT;
 
-	ret = kvm_arm_probe_power_domain(dev, &power_domain);
+	ret = kvm_arm_probe_power_domain(dev, &host_smmu->power_domain);
 	if (ret)
 		return ret;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	mmio_size = resource_size(res);
-	if (mmio_size < SZ_128K) {
+	size = resource_size(res);
+	if (size < SZ_128K) {
 		dev_err(dev, "unsupported MMIO region size (%pr)\n", res);
 		return -EINVAL;
 	}
-	mmio_addr = res->start;
+	ioaddr = res->start;
 	host_smmu->id = kvm_arm_smmu_cur;
 
 	smmu->base = devm_ioremap_resource(dev, res);
@@ -864,9 +1062,6 @@ static int kvm_arm_smmu_probe(struct platform_device *pdev)
 		return PTR_ERR(smmu->base);
 
 	arm_smmu_probe_irq(pdev, smmu);
-
-	/* Use one page per level-2 table */
-	smmu->strtab_cfg.split = PAGE_SHIFT - (ilog2(STRTAB_STE_DWORDS) + 3);
 
 	ret = arm_smmu_device_hw_probe(smmu);
 	if (ret)
@@ -880,43 +1075,6 @@ static int kvm_arm_smmu_probe(struct platform_device *pdev)
 	else
 		kvm_arm_smmu_ops.pgsize_bitmap |= smmu->pgsize_bitmap;
 
-	ias = (smmu->features & ARM_SMMU_FEAT_VAX) ? 52 : 48;
-
-	/*
-	 * SMMU will hold possible configuration for both S1 and S2 as any of
-	 * them can be chosen when a device is attached.
-	 */
-	cfg_s1 = (struct io_pgtable_cfg) {
-		.fmt = ARM_64_LPAE_S1,
-		.pgsize_bitmap = smmu->pgsize_bitmap,
-		.ias = min_t(unsigned long, ias, VA_BITS),
-		.oas = smmu->ias,
-		.coherent_walk = smmu->features & ARM_SMMU_FEAT_COHERENCY,
-	};
-	cfg_s2 = (struct io_pgtable_cfg) {
-		  .fmt = ARM_64_LPAE_S2,
-		  .pgsize_bitmap = smmu->pgsize_bitmap,
-		  .ias = smmu->ias,
-		  .oas = smmu->oas,
-		  .coherent_walk = smmu->features & ARM_SMMU_FEAT_COHERENCY,
-	};
-
-	/*
-	 * Choose the page and address size. Compute the PGD size as well, so we
-	 * know how much memory to pre-allocate.
-	 */
-	if (smmu->features & ARM_SMMU_FEAT_TRANS_S1) {
-		ret = io_pgtable_configure(&cfg_s1, &pgd_size);
-		if (ret)
-			return ret;
-		host_smmu->cfg_s1 = cfg_s1;
-	}
-	if (smmu->features & ARM_SMMU_FEAT_TRANS_S2) {
-		ret = io_pgtable_configure(&cfg_s2, &pgd_size);
-		if (ret)
-			return ret;
-		host_smmu->cfg_s2 = cfg_s2;
-	}
 	ret = arm_smmu_init_one_queue(smmu, &smmu->cmdq.q, smmu->base,
 				      ARM_SMMU_CMDQ_PROD, ARM_SMMU_CMDQ_CONS,
 				      CMDQ_ENT_DWORDS, "cmdq");
@@ -938,36 +1096,19 @@ static int kvm_arm_smmu_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = arm_smmu_register_iommu(smmu, &kvm_arm_smmu_ops, mmio_addr);
-	if (ret)
-		return ret;
+	platform_set_drvdata(pdev, smmu);
 
 	/* Hypervisor parameters */
-	hyp_smmu->mmio_addr = mmio_addr;
-	hyp_smmu->mmio_size = mmio_size;
+	hyp_smmu->pgsize_bitmap = smmu->pgsize_bitmap;
+	hyp_smmu->oas = smmu->oas;
+	hyp_smmu->ias = smmu->ias;
+	hyp_smmu->mmio_addr = ioaddr;
+	hyp_smmu->mmio_size = size;
 	hyp_smmu->features = smmu->features;
-	hyp_smmu->pgtable_cfg_s1 = cfg_s1;
-	hyp_smmu->pgtable_cfg_s2 = cfg_s2;
-	hyp_smmu->iommu.power_domain = power_domain;
+	hyp_smmu->iommu.power_domain = host_smmu->power_domain;
 	hyp_smmu->ssid_bits = smmu->ssid_bits;
 
 	kvm_arm_smmu_cur++;
-
-	/*
-	 * The state of endpoints dictates when the SMMU is powered off. To turn
-	 * the SMMU on and off, a genpd driver uses SCMI over the SMC transport,
-	 * or some other platform-specific SMC. Those power requests are caught
-	 * by the hypervisor, so that the hyp driver doesn't touch the hardware
-	 * state while it is off.
-	 *
-	 * We are making a big assumption here, that TLBs and caches are invalid
-	 * on power on, and therefore we don't need to wake the SMMU when
-	 * modifying page tables, stream tables and context tables. If this
-	 * assumption does not hold on some systems, then we'll need to grab RPM
-	 * reference in map(), attach(), etc, so the hyp driver can send
-	 * invalidations.
-	 */
-	hyp_smmu->caches_clean_on_power_on = true;
 
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
@@ -977,24 +1118,23 @@ static int kvm_arm_smmu_probe(struct platform_device *pdev)
 	 */
 	pm_runtime_resume_and_get(dev);
 
-	return 0;
+	return arm_smmu_register_iommu(smmu, &kvm_arm_smmu_ops, ioaddr);
 }
 
-static int kvm_arm_smmu_remove(struct platform_device *pdev)
+static void kvm_arm_smmu_remove(struct platform_device *pdev)
 {
 	struct arm_smmu_device *smmu = platform_get_drvdata(pdev);
 	struct host_arm_smmu_device *host_smmu = smmu_to_host(smmu);
 
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_set_suspended(&pdev->dev);
 	/*
 	 * There was an error during hypervisor setup. The hyp driver may
 	 * have already enabled the device, so disable it.
 	 */
-	pm_runtime_disable(&pdev->dev);
-	pm_runtime_set_suspended(&pdev->dev);
-	arm_smmu_unregister_iommu(smmu);
 	arm_smmu_device_disable(smmu);
 	arm_smmu_update_gbpa(smmu, host_smmu->boot_gbpa, GBPA_ABORT);
-	return 0;
+	arm_smmu_unregister_iommu(smmu);
 }
 
 static int kvm_arm_smmu_suspend(struct device *dev)
@@ -1002,7 +1142,7 @@ static int kvm_arm_smmu_suspend(struct device *dev)
 	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
 	struct host_arm_smmu_device *host_smmu = smmu_to_host(smmu);
 
-	if (host_smmu->hvc_pd)
+	if (host_smmu->power_domain.type == KVM_POWER_DOMAIN_HOST_HVC)
 		return pkvm_iommu_suspend(dev);
 	return 0;
 }
@@ -1012,7 +1152,7 @@ static int kvm_arm_smmu_resume(struct device *dev)
 	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
 	struct host_arm_smmu_device *host_smmu = smmu_to_host(smmu);
 
-	if (host_smmu->hvc_pd)
+	if (host_smmu->power_domain.type == KVM_POWER_DOMAIN_HOST_HVC)
 		return pkvm_iommu_resume(dev);
 	return 0;
 }
@@ -1057,17 +1197,17 @@ static int kvm_arm_smmu_array_alloc(void)
 	return 0;
 }
 
-static int smmu_put_device(struct device *dev, void *data)
+static void kvm_arm_smmu_array_free(void)
 {
-	pm_runtime_put_noidle(dev);
-	return 0;
+	int order;
+
+	order = get_order(kvm_arm_smmu_count * sizeof(*kvm_arm_smmu_array));
+	free_pages((unsigned long)kvm_arm_smmu_array, order);
 }
 
-static int smmu_unregister_smmu(struct device *dev, void *data)
+static int smmu_put_device(struct device *dev, void *data)
 {
-	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
-
-	arm_smmu_unregister_iommu(smmu);
+	pm_runtime_put(dev);
 	return 0;
 }
 
@@ -1110,15 +1250,24 @@ static int smmu_alloc_atomic_mc(struct kvm_hyp_memcache *atomic_mc)
 	return ret;
 }
 
-/**
- * kvm_arm_smmu_v3_init() - Reserve the SMMUv3 for KVM
- * Return 0 if all present SMMUv3 were probed successfully, or an error.
- *   If no SMMU was found, return 0, with a count of 0.
+/*
+ * Drop the PM references of the SMMU taken at probe
+ * after it's guaranteed the hypervisor as initialized the SMMUs.
  */
-static int kvm_arm_smmu_v3_init(void)
+static int kvm_arm_smmu_v3_post_init(void)
 {
+	if (!kvm_arm_smmu_count)
+		return 0;
+
+	WARN_ON(driver_for_each_device(&kvm_arm_smmu_driver.driver, NULL,
+				       NULL, smmu_put_device));
+	return 0;
+}
+
+static int kvm_arm_smmu_v3_init_drv(void)
+{
+	struct kvm_hyp_memcache atomic_mc;
 	int ret;
-	struct kvm_hyp_memcache atomic_mc = {};
 
 	/*
 	 * Check whether any device owned by the host is behind an SMMU.
@@ -1129,12 +1278,12 @@ static int kvm_arm_smmu_v3_init(void)
 
 	ret = platform_driver_probe(&kvm_arm_smmu_driver, kvm_arm_smmu_probe);
 	if (ret)
-		goto err_unregister;
+		goto err_free;
 
 	if (kvm_arm_smmu_cur != kvm_arm_smmu_count) {
 		/* A device exists but failed to probe */
 		ret = -EUNATCH;
-		goto err_unregister;
+		goto err_free;
 	}
 
 #ifdef MODULE
@@ -1143,51 +1292,42 @@ static int kvm_arm_smmu_v3_init(void)
 
 	if (ret) {
 		pr_err("Failed to load SMMUv3 IOMMU EL2 module: %d\n", ret);
-		goto err_unregister;
+		return ret;
 	}
 #endif
 	/*
 	 * These variables are stored in the nVHE image, and won't be accessible
 	 * after KVM initialization. Ownership of kvm_arm_smmu_array will be
 	 * transferred to the hypervisor as well.
-	 *
-	 * kvm_arm_smmu_memcache is shared between hypervisor and host.
 	 */
 	kvm_hyp_arm_smmu_v3_smmus = kvm_arm_smmu_array;
 	kvm_hyp_arm_smmu_v3_count = kvm_arm_smmu_count;
 
+	init_hyp_memcache(&atomic_mc);
+
 	ret = smmu_alloc_atomic_mc(&atomic_mc);
 	if (ret)
-		goto err_free_mc;
+		goto err_free;
 
-	ret = kvm_iommu_init_hyp(ksym_ref_addr_nvhe(smmu_ops), &atomic_mc, 0);
+	ret = kvm_iommu_init_hyp(ksym_ref_addr_nvhe(smmu_ops), &atomic_mc);
 	if (ret)
-		goto err_free_mc;
+		return ret;
 
 	/* Preemptively allocate the identity domain. */
 	if (atomic_pages) {
-		ret = kvm_call_hyp_nvhe_mc(__pkvm_host_iommu_alloc_domain,
-					   KVM_IOMMU_DOMAIN_IDMAP_ID,
-					   KVM_IOMMU_DOMAIN_IDMAP_TYPE);
-		if (ret) {
-			pr_err("pKVM SMMUv3 identity domain failed allocation %d\n", ret);
+		ret = kvm_iommu_alloc_domain(KVM_IOMMU_DOMAIN_IDMAP_ID,
+					     KVM_IOMMU_DOMAIN_IDMAP_TYPE);
+		if (ret)
 			return ret;
-		}
 	}
+	return kvm_arm_smmu_v3_post_init();
 
-	WARN_ON(driver_for_each_device(&kvm_arm_smmu_driver.driver, NULL,
-				       NULL, smmu_put_device));
-	return 0;
-err_free_mc:
-	free_hyp_memcache(&atomic_mc);
-err_unregister:
-	pr_err("pKVM SMMUv3 init failed with %d\n", ret);
-	WARN_ON(driver_for_each_device(&kvm_arm_smmu_driver.driver, NULL,
-				       NULL, smmu_unregister_smmu));
-	return 0;
+err_free:
+	kvm_arm_smmu_array_free();
+	return ret;
 }
 
-static void kvm_arm_smmu_v3_remove(void)
+static void kvm_arm_smmu_v3_remove_drv(void)
 {
 	platform_driver_unregister(&kvm_arm_smmu_driver);
 }
@@ -1200,16 +1340,60 @@ static pkvm_handle_t kvm_arm_smmu_v3_id(struct device *dev)
 	return host_smmu->id;
 }
 
+static pkvm_handle_t kvm_arm_v3_id_by_of(struct device_node *np)
+{
+	struct device *dev;
+
+	dev = driver_find_device_by_of_node(&kvm_arm_smmu_driver.driver, np);
+	if (!dev)
+		return 0;
+
+	put_device(dev);
+
+	return kvm_arm_smmu_v3_id(dev);
+}
+
+static int kvm_arm_smmu_v3_num_ids(struct device *dev)
+{
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+
+	if (!fwspec)
+		return -ENODEV;
+
+	return fwspec->num_ids;
+}
+
+static int kvm_arm_smmu_v3_device_id(struct device *dev, u32 idx,
+				     pkvm_handle_t *out_iommu, u32 *out_sid)
+{
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+	struct kvm_arm_smmu_master *master = dev_iommu_priv_get(dev);
+
+	if (!fwspec || !master)
+		return -ENODEV;
+	if (idx >= fwspec->num_ids)
+		return -ENOENT;
+	*out_sid = fwspec->ids[idx];
+	*out_iommu = kvm_arm_smmu_v3_id(master->smmu->dev);
+
+	return 0;
+}
+
 static struct kvm_iommu_driver kvm_smmu_v3_ops = {
-	.init_driver = kvm_arm_smmu_v3_init,
-	.remove_driver = kvm_arm_smmu_v3_remove,
-	.get_iommu_id = kvm_arm_smmu_v3_id,
+	.init_driver = kvm_arm_smmu_v3_init_drv,
+	.remove_driver = kvm_arm_smmu_v3_remove_drv,
+	.get_iommu_id_by_of = kvm_arm_v3_id_by_of,
+	.get_device_iommu_num_ids = kvm_arm_smmu_v3_num_ids,
+	.get_device_iommu_id = kvm_arm_smmu_v3_device_id,
 };
 
 static int kvm_arm_smmu_v3_register(void)
 {
+	if (!is_protected_kvm_enabled())
+		return 0;
+
 	return kvm_iommu_register_driver(&kvm_smmu_v3_ops);
-}
+};
 
 /*
  * Register must be run before de-privliage before kvm_iommu_init_driver
@@ -1222,5 +1406,4 @@ module_init(kvm_arm_smmu_v3_register);
 #else
 core_initcall(kvm_arm_smmu_v3_register);
 #endif
-
 MODULE_LICENSE("GPL v2");

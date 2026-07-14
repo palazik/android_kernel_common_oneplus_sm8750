@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2025 Google */
 
-#define _GNU_SOURCE
 #include <test_progs.h>
 #include <bpf/libbpf.h>
 #include <bpf/btf.h>

@@ -13,6 +13,7 @@
 #ifndef __DMA_BUF_H__
 #define __DMA_BUF_H__
 
+#include <linux/android_kabi.h>
 #include <linux/iosys-map.h>
 #include <linux/file.h>
 #include <linux/err.h>
@@ -422,16 +423,19 @@ struct dma_buf {
 	/**
 	 * @exp_name:
 	 *
-	 * Name of the exporter; useful for debugging. See the
-	 * DMA_BUF_SET_NAME IOCTL.
+	 * Name of the exporter; useful for debugging. Must not be NULL
 	 */
 	const char *exp_name;
 
 	/**
 	 * @name:
 	 *
-	 * Userspace-provided name; useful for accounting and debugging,
-	 * protected by dma_resv_lock() on @resv and @name_lock for read access.
+	 * Userspace-provided name. Default value is NULL. If not NULL,
+	 * length cannot be longer than DMA_BUF_NAME_LEN, including NIL
+	 * char. Useful for accounting and debugging. Read/Write accesses
+	 * are protected by @name_lock
+	 *
+	 * See the IOCTLs DMA_BUF_SET_NAME or DMA_BUF_SET_NAME_A/B
 	 */
 	const char *name;
 
@@ -534,14 +538,14 @@ struct dma_buf {
 	} *sysfs_entry;
 #endif
 
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
 	/**
 	 * @nr_task_refs:
 	 *
 	 * The number of tasks that reference this buffer. For calculating PSS.
 	 */
-	ANDROID_KABI_USE(1, atomic64_t nr_task_refs);
-
-	ANDROID_KABI_RESERVE(2);
+	ANDROID_BACKPORT_USE(1, atomic64_t nr_task_refs);
 };
 
 /**
@@ -642,24 +646,15 @@ struct dma_buf_export_info {
 	int flags;
 	struct dma_resv *resv;
 	void *priv;
-	unsigned long dma_map_attrs;
 
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 };
 
-/**
- * struct task_dma_buf_record and struct task_dma_buf_info will NEVER be exposed
- * to vendor modules, except possibly via an opaque pointer. Their definitions
- * can therefore be hidden from MODVERSIONS CRC machinery, allowing arbitrary
- * future changes.
- */
-#ifdef __GENKSYMS__
-
-struct task_dma_buf_record;
-struct task_dma_buf_info;
-
-#else
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+int get_dmabuf_debugfs_data(int (*fn)(const struct dma_buf *, void *),
+			void *private);
+#endif
 
 /**
  * struct task_dma_buf_record - Holds the number of (VMA and FD) references to a
@@ -702,8 +697,6 @@ struct task_dma_buf_info {
 	struct list_head dmabufs;
 	unsigned int dmabuf_count;
 };
-
-#endif
 
 /**
  * DEFINE_DMA_BUF_EXPORT_INFO - helper macro for exporters
@@ -757,8 +750,6 @@ dma_buf_attachment_is_dynamic(struct dma_buf_attachment *attach)
 	return !!attach->importer_ops;
 }
 
-int dma_buf_get_each(int (*callback)(const struct dma_buf *dmabuf,
-		     void *private), void *private);
 struct dma_buf_attachment *dma_buf_attach(struct dma_buf *dmabuf,
 					  struct device *dev);
 struct dma_buf_attachment *

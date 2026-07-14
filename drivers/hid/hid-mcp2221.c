@@ -1054,7 +1054,7 @@ static int mcp_iio_channels(struct mcp2221 *mcp)
 			break;
 		default:
 			continue;
-		};
+		}
 
 		chan->type = IIO_VOLTAGE;
 		chan->indexed = 1;
@@ -1191,6 +1191,7 @@ static int mcp2221_probe(struct hid_device *hdev,
 	mcp->adapter.algo = &mcp_i2c_algo;
 	mcp->adapter.retries = 1;
 	mcp->adapter.dev.parent = &hdev->dev;
+	ACPI_COMPANION_SET(&mcp->adapter.dev, ACPI_COMPANION(hdev->dev.parent));
 	snprintf(mcp->adapter.name, sizeof(mcp->adapter.name),
 			"MCP2221 usb-i2c bridge");
 

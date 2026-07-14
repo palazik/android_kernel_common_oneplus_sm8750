@@ -17,13 +17,13 @@ int snd_usb_audioformat_set_sync_ep(struct snd_usb_audio *chip,
 
 const struct audioformat *
 snd_usb_find_format(struct list_head *fmt_list_head, snd_pcm_format_t format,
-	    unsigned int rate, unsigned int channels, bool strict_match,
-	    struct snd_usb_substream *subs);
+		    unsigned int rate, unsigned int channels, bool strict_match,
+		    struct snd_usb_substream *subs);
 const struct audioformat *
 snd_usb_find_substream_format(struct snd_usb_substream *subs,
-		      const struct snd_pcm_hw_params *params);
+			      const struct snd_pcm_hw_params *params);
 
 int snd_usb_hw_params(struct snd_usb_substream *subs,
-				struct snd_pcm_hw_params *hw_params);
+		      struct snd_pcm_hw_params *hw_params);
 int snd_usb_hw_free(struct snd_usb_substream *subs);
 #endif /* __USBAUDIO_PCM_H */

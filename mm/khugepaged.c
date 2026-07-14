@@ -17,6 +17,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/page_idle.h>
 #include <linux/page_table_check.h>
+#include <linux/rcupdate_wait.h>
 #include <linux/swapops.h>
 #include <linux/shmem_fs.h>
 #include <linux/ksm.h>
@@ -91,7 +92,7 @@ static unsigned int khugepaged_max_ptes_shared __read_mostly;
 #define MM_SLOTS_HASH_BITS 10
 static DEFINE_READ_MOSTLY_HASHTABLE(mm_slots_hash, MM_SLOTS_HASH_BITS);
 
-static struct kmem_cache *mm_slot_cache __read_mostly;
+static struct kmem_cache *mm_slot_cache __ro_after_init;
 
 struct collapse_control {
 	bool is_khugepaged;
@@ -384,10 +385,7 @@ int hugepage_madvise(struct vm_area_struct *vma,
 
 int __init khugepaged_init(void)
 {
-	mm_slot_cache = kmem_cache_create("khugepaged_mm_slot",
-					  sizeof(struct khugepaged_mm_slot),
-					  __alignof__(struct khugepaged_mm_slot),
-					  0, NULL);
+	mm_slot_cache = KMEM_CACHE(khugepaged_mm_slot, 0);
 	if (!mm_slot_cache)
 		return -ENOMEM;
 
@@ -407,6 +405,32 @@ void __init khugepaged_destroy(void)
 static inline int hpage_collapse_test_exit(struct mm_struct *mm)
 {
 	return atomic_read(&mm->mm_users) == 0;
+}
+
+static inline int hpage_collapse_test_exit_or_disable(struct mm_struct *mm)
+{
+	return hpage_collapse_test_exit(mm) ||
+	       test_bit(MMF_DISABLE_THP, &mm->flags);
+}
+
+static bool hugepage_pmd_enabled(void)
+{
+	/*
+	 * We cover both the anon and the file-backed case here; file-backed
+	 * hugepages, when configured in, are determined by the global control.
+	 * Anon pmd-sized hugepages are determined by the pmd-size control.
+	 */
+	if (IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS) &&
+	    hugepage_global_enabled())
+		return true;
+	if (test_bit(PMD_ORDER, &huge_anon_orders_always))
+		return true;
+	if (test_bit(PMD_ORDER, &huge_anon_orders_madvise))
+		return true;
+	if (test_bit(PMD_ORDER, &huge_anon_orders_inherit) &&
+	    hugepage_global_enabled())
+		return true;
+	return false;
 }
 
 void __khugepaged_enter(struct mm_struct *mm)
@@ -445,7 +469,7 @@ void khugepaged_enter_vma(struct vm_area_struct *vma,
 			  unsigned long vm_flags)
 {
 	if (!test_bit(MMF_VM_HUGEPAGE, &vma->vm_mm->flags) &&
-	    hugepage_flags_enabled()) {
+	    hugepage_pmd_enabled()) {
 		if (thp_vma_allowable_order(vma, vm_flags, TVA_ENFORCE_SYSFS,
 					    PMD_ORDER))
 			__khugepaged_enter(vma->vm_mm);
@@ -522,11 +546,13 @@ static void release_pte_pages(pte_t *pte, pte_t *_pte,
 
 static bool is_refcount_suitable(struct folio *folio)
 {
-	int expected_refcount;
+	int expected_refcount = folio_mapcount(folio);
 
-	expected_refcount = folio_mapcount(folio);
-	if (folio_test_swapcache(folio))
+	if (!folio_test_anon(folio) || folio_test_swapcache(folio))
 		expected_refcount += folio_nr_pages(folio);
+
+	if (folio_test_private(folio))
+		expected_refcount++;
 
 	return folio_ref_count(folio) == expected_refcount;
 }
@@ -576,7 +602,8 @@ static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
 		folio = page_folio(page);
 		VM_BUG_ON_FOLIO(!folio_test_anon(folio), folio);
 
-		if (page_mapcount(page) > 1) {
+		/* See hpage_collapse_scan_pmd(). */
+		if (folio_likely_mapped_shared(folio)) {
 			++shared;
 			if (cc->is_khugepaged &&
 			    shared > khugepaged_max_ptes_shared) {
@@ -600,8 +627,8 @@ static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
 		}
 
 		/*
-		 * We can do it before isolate_lru_page because the
-		 * page can't be freed from under us. NOTE: PG_lock
+		 * We can do it before folio_isolate_lru because the
+		 * folio can't be freed from under us. NOTE: PG_lock
 		 * is needed to serialize against split_huge_page
 		 * when invoked from the VM.
 		 */
@@ -682,9 +709,7 @@ static void __collapse_huge_page_copy_succeeded(pte_t *pte,
 						spinlock_t *ptl,
 						struct list_head *compound_pagelist)
 {
-	struct folio *src_folio;
-	struct page *src_page;
-	struct page *tmp;
+	struct folio *src, *tmp;
 	pte_t *_pte;
 	pte_t pteval;
 
@@ -703,10 +728,11 @@ static void __collapse_huge_page_copy_succeeded(pte_t *pte,
 				ksm_might_unmap_zero_page(vma->vm_mm, pteval);
 			}
 		} else {
-			src_page = pte_page(pteval);
-			src_folio = page_folio(src_page);
-			if (!folio_test_large(src_folio))
-				release_pte_folio(src_folio);
+			struct page *src_page = pte_page(pteval);
+
+			src = page_folio(src_page);
+			if (!folio_test_large(src))
+				release_pte_folio(src);
 			/*
 			 * ptl mostly unnecessary, but preempt has to
 			 * be disabled to update the per-cpu stats
@@ -714,20 +740,19 @@ static void __collapse_huge_page_copy_succeeded(pte_t *pte,
 			 */
 			spin_lock(ptl);
 			ptep_clear(vma->vm_mm, address, _pte);
-			folio_remove_rmap_pte(src_folio, src_page, vma);
+			folio_remove_rmap_pte(src, src_page, vma);
 			spin_unlock(ptl);
 			free_page_and_swap_cache(src_page);
 		}
 	}
 
-	list_for_each_entry_safe(src_page, tmp, compound_pagelist, lru) {
-		list_del(&src_page->lru);
-		mod_node_page_state(page_pgdat(src_page),
-				    NR_ISOLATED_ANON + page_is_file_lru(src_page),
-				    -compound_nr(src_page));
-		unlock_page(src_page);
-		free_swap_cache(src_page);
-		putback_lru_page(src_page);
+	list_for_each_entry_safe(src, tmp, compound_pagelist, lru) {
+		list_del(&src->lru);
+		node_stat_sub_folio(src, NR_ISOLATED_ANON +
+				folio_is_file_lru(src));
+		folio_unlock(src);
+		free_swap_cache(src);
+		folio_putback_lru(src);
 	}
 }
 
@@ -762,7 +787,7 @@ static void __collapse_huge_page_copy_failed(pte_t *pte,
  * Returns SCAN_SUCCEED if copying succeeds, otherwise returns SCAN_COPY_MC.
  *
  * @pte: starting of the PTEs to copy from
- * @page: the new hugepage to copy contents to
+ * @folio: the new hugepage to copy contents to
  * @pmd: pointer to the new hugepage's PMD
  * @orig_pmd: the original raw pages' PMD
  * @vma: the original raw pages' virtual memory area
@@ -770,33 +795,29 @@ static void __collapse_huge_page_copy_failed(pte_t *pte,
  * @ptl: lock on raw pages' PTEs
  * @compound_pagelist: list that stores compound pages
  */
-static int __collapse_huge_page_copy(pte_t *pte,
-				     struct page *page,
-				     pmd_t *pmd,
-				     pmd_t orig_pmd,
-				     struct vm_area_struct *vma,
-				     unsigned long address,
-				     spinlock_t *ptl,
-				     struct list_head *compound_pagelist)
+static int __collapse_huge_page_copy(pte_t *pte, struct folio *folio,
+		pmd_t *pmd, pmd_t orig_pmd, struct vm_area_struct *vma,
+		unsigned long address, spinlock_t *ptl,
+		struct list_head *compound_pagelist)
 {
-	struct page *src_page;
-	pte_t *_pte;
-	pte_t pteval;
-	unsigned long _address;
+	unsigned int i;
 	int result = SCAN_SUCCEED;
 
 	/*
 	 * Copying pages' contents is subject to memory poison at any iteration.
 	 */
-	for (_pte = pte, _address = address; _pte < pte + HPAGE_PMD_NR;
-	     _pte++, page++, _address += PAGE_SIZE) {
-		pteval = ptep_get(_pte);
+	for (i = 0; i < HPAGE_PMD_NR; i++) {
+		pte_t pteval = ptep_get(pte + i);
+		struct page *page = folio_page(folio, i);
+		unsigned long src_addr = address + i * PAGE_SIZE;
+		struct page *src_page;
+
 		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
-			clear_user_highpage(page, _address);
+			clear_user_highpage(page, src_addr);
 			continue;
 		}
 		src_page = pte_page(pteval);
-		if (copy_mc_user_highpage(page, src_page, _address, vma) > 0) {
+		if (copy_mc_user_highpage(page, src_page, src_addr, vma) > 0) {
 			result = SCAN_COPY_MC;
 			break;
 		}
@@ -900,7 +921,7 @@ static int hugepage_vma_revalidate(struct mm_struct *mm, unsigned long address,
 	struct vm_area_struct *vma;
 	unsigned long tva_flags = cc->is_khugepaged ? TVA_ENFORCE_SYSFS : 0;
 
-	if (unlikely(hpage_collapse_test_exit(mm)))
+	if (unlikely(hpage_collapse_test_exit_or_disable(mm)))
 		return SCAN_ANY_PROCESS;
 
 	*vmap = vma = find_vma(mm, address);
@@ -923,17 +944,10 @@ static int hugepage_vma_revalidate(struct mm_struct *mm, unsigned long address,
 	return SCAN_SUCCEED;
 }
 
-static int find_pmd_or_thp_or_none(struct mm_struct *mm,
-				   unsigned long address,
-				   pmd_t **pmd)
+static inline int check_pmd_state(pmd_t *pmd)
 {
-	pmd_t pmde;
+	pmd_t pmde = pmdp_get_lockless(pmd);
 
-	*pmd = mm_find_pmd(mm, address);
-	if (!*pmd)
-		return SCAN_PMD_NULL;
-
-	pmde = pmdp_get_lockless(*pmd);
 	if (pmd_none(pmde))
 		return SCAN_PMD_NONE;
 	if (!pmd_present(pmde))
@@ -945,6 +959,17 @@ static int find_pmd_or_thp_or_none(struct mm_struct *mm,
 	if (pmd_bad(pmde))
 		return SCAN_PMD_NULL;
 	return SCAN_SUCCEED;
+}
+
+static int find_pmd_or_thp_or_none(struct mm_struct *mm,
+				   unsigned long address,
+				   pmd_t **pmd)
+{
+	*pmd = mm_find_pmd(mm, address);
+	if (!*pmd)
+		return SCAN_PMD_NULL;
+
+	return check_pmd_state(*pmd);
 }
 
 static int check_pmd_still_valid(struct mm_struct *mm,
@@ -990,7 +1015,11 @@ static int __collapse_huge_page_swapin(struct mm_struct *mm,
 		};
 
 		if (!pte++) {
-			pte = pte_offset_map_nolock(mm, pmd, address, &ptl);
+			/*
+			 * Here the ptl is only used to check pte_same() in
+			 * do_swap_page(), so readonly version is enough.
+			 */
+			pte = pte_offset_map_ro_nolock(mm, pmd, address, &ptl);
 			if (!pte) {
 				mmap_read_unlock(mm);
 				result = SCAN_PMD_NULL;
@@ -1077,7 +1106,6 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
 	pte_t *pte;
 	pgtable_t pgtable;
 	struct folio *folio;
-	struct page *hpage;
 	spinlock_t *pmd_ptl, *pte_ptl;
 	int result = SCAN_FAIL;
 	struct vm_area_struct *vma;
@@ -1094,7 +1122,6 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
 	mmap_read_unlock(mm);
 
 	result = alloc_charge_folio(&folio, mm, cc);
-	hpage = &folio->page;
 	if (result != SCAN_SUCCEED)
 		goto out_nolock;
 
@@ -1154,7 +1181,7 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
 	 * huge and small TLB entries for the same virtual address to
 	 * avoid the risk of CPU bugs in that area.
 	 *
-	 * Parallel fast GUP is fine since fast GUP will back off when
+	 * Parallel GUP-fast is fine since GUP-fast will back off when
 	 * it detects PMD is changed.
 	 */
 	_pmd = pmdp_collapse_flush(vma, address, pmd);
@@ -1193,7 +1220,7 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
 	 */
 	anon_vma_unlock_write(vma->anon_vma);
 
-	result = __collapse_huge_page_copy(pte, hpage, pmd, _pmd,
+	result = __collapse_huge_page_copy(pte, folio, pmd, _pmd,
 					   vma, address, pte_ptl,
 					   &compound_pagelist);
 	pte_unmap(pte);
@@ -1208,7 +1235,7 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
 	__folio_mark_uptodate(folio);
 	pgtable = pmd_pgtable(_pmd);
 
-	_pmd = mk_huge_pmd(hpage, vma->vm_page_prot);
+	_pmd = mk_huge_pmd(&folio->page, vma->vm_page_prot);
 	_pmd = maybe_pmd_mkwrite(pmd_mkdirty(_pmd), vma);
 
 	spin_lock(pmd_ptl);
@@ -1221,14 +1248,14 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
 	deferred_split_folio(folio, false);
 	spin_unlock(pmd_ptl);
 
-	hpage = NULL;
+	folio = NULL;
 
 	result = SCAN_SUCCEED;
 out_up_write:
 	mmap_write_unlock(mm);
 out_nolock:
-	if (hpage)
-		put_page(hpage);
+	if (folio)
+		folio_put(folio);
 	trace_mm_collapse_huge_page(mm, result == SCAN_SUCCEED, result);
 	return result;
 }
@@ -1319,8 +1346,20 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
 			result = SCAN_PAGE_NULL;
 			goto out_unmap;
 		}
+		folio = page_folio(page);
 
-		if (page_mapcount(page) > 1) {
+		if (!folio_test_anon(folio)) {
+			result = SCAN_PAGE_ANON;
+			goto out_unmap;
+		}
+
+		/*
+		 * We treat a single page as shared if any part of the THP
+		 * is shared. "False negatives" from
+		 * folio_likely_mapped_shared() are not expected to matter
+		 * much in practice.
+		 */
+		if (folio_likely_mapped_shared(folio)) {
 			++shared;
 			if (cc->is_khugepaged &&
 			    shared > khugepaged_max_ptes_shared) {
@@ -1330,7 +1369,6 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
 			}
 		}
 
-		folio = page_folio(page);
 		/*
 		 * Record which node the original page is from and save this
 		 * information to cc->node_load[].
@@ -1351,16 +1389,12 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
 			result = SCAN_PAGE_LOCK;
 			goto out_unmap;
 		}
-		if (!folio_test_anon(folio)) {
-			result = SCAN_PAGE_ANON;
-			goto out_unmap;
-		}
 
 		/*
 		 * Check if the page has any GUP (or other external) pins.
 		 *
 		 * Here the check may be racy:
-		 * it may see total_mapcount > refcount in some cases?
+		 * it may see folio_mapcount() > folio_ref_count().
 		 * But such case is ephemeral we could always retry collapse
 		 * later.  However it may report false positive if the page
 		 * has excessive GUP pins (i.e. 512).  Anyway the same check
@@ -1575,13 +1609,16 @@ int collapse_pte_mapped_thp(struct mm_struct *mm, unsigned long addr,
 	if (userfaultfd_armed(vma) && !(vma->vm_flags & VM_SHARED))
 		pml = pmd_lock(mm, pmd);
 
-	start_pte = pte_offset_map_nolock(mm, pmd, haddr, &ptl);
+	start_pte = pte_offset_map_rw_nolock(mm, pmd, haddr, &pgt_pmd, &ptl);
 	if (!start_pte)		/* mmap_lock + page lock should prevent this */
 		goto abort;
 	if (!pml)
 		spin_lock(ptl);
 	else if (ptl != pml)
 		spin_lock_nested(ptl, SINGLE_DEPTH_NESTING);
+
+	if (unlikely(!pmd_same(pgt_pmd, pmdp_get_lockless(pmd))))
+		goto abort;
 
 	/* step 2: clear page table and adjust rmap */
 	for (i = 0, addr = haddr, pte = start_pte;
@@ -1615,7 +1652,6 @@ int collapse_pte_mapped_thp(struct mm_struct *mm, unsigned long addr,
 		nr_ptes++;
 	}
 
-	pte_unmap(start_pte);
 	if (!pml)
 		spin_unlock(ptl);
 
@@ -1628,14 +1664,19 @@ int collapse_pte_mapped_thp(struct mm_struct *mm, unsigned long addr,
 	/* step 4: remove empty page table */
 	if (!pml) {
 		pml = pmd_lock(mm, pmd);
-		if (ptl != pml)
+		if (ptl != pml) {
 			spin_lock_nested(ptl, SINGLE_DEPTH_NESTING);
+			if (unlikely(!pmd_same(pgt_pmd, pmdp_get_lockless(pmd)))) {
+				flush_tlb_mm(mm);
+				goto unlock;
+			}
+		}
 	}
 	pgt_pmd = pmdp_collapse_flush(vma, haddr, pmd);
 	pmdp_get_lockless_sync();
+	pte_unmap_unlock(start_pte, ptl);
 	if (ptl != pml)
-		spin_unlock(ptl);
-	spin_unlock(pml);
+		spin_unlock(pml);
 
 	mmu_notifier_invalidate_range_end(&range);
 
@@ -1655,6 +1696,7 @@ abort:
 		folio_ref_sub(folio, nr_ptes);
 		add_mm_counter(mm, mm_counter_file(folio), -nr_ptes);
 	}
+unlock:
 	if (start_pte)
 		pte_unmap_unlock(start_pte, ptl);
 	if (pml && pml != ptl)
@@ -1679,7 +1721,7 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
 		pmd_t *pmd, pgt_pmd;
 		spinlock_t *pml;
 		spinlock_t *ptl;
-		bool skipped_uffd = false;
+		bool success = false;
 
 		/*
 		 * Check vma->anon_vma to exclude MAP_PRIVATE mappings that
@@ -1716,6 +1758,19 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
 		mmu_notifier_invalidate_range_start(&range);
 
 		pml = pmd_lock(mm, pmd);
+		/*
+		 * The lock of new_folio is still held, we will be blocked in
+		 * the page fault path, which prevents the pte entries from
+		 * being set again. So even though the old empty PTE page may be
+		 * concurrently freed and a new PTE page is filled into the pmd
+		 * entry, it is still empty and can be removed.
+		 *
+		 * So here we only need to recheck if the state of pmd entry
+		 * still meets our requirements, rather than checking pmd_same()
+		 * like elsewhere.
+		 */
+		if (check_pmd_state(pmd) != SCAN_SUCCEED)
+			goto drop_pml;
 		ptl = pte_lockptr(mm, pmd);
 		if (ptl != pml)
 			spin_lock_nested(ptl, SINGLE_DEPTH_NESTING);
@@ -1729,20 +1784,20 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
 		 * repeating the anon_vma check protects from one category,
 		 * and repeating the userfaultfd_wp() check from another.
 		 */
-		if (unlikely(vma->anon_vma || userfaultfd_wp(vma))) {
-			skipped_uffd = true;
-		} else {
+		if (likely(!vma->anon_vma && !userfaultfd_wp(vma))) {
 			pgt_pmd = pmdp_collapse_flush(vma, addr, pmd);
 			pmdp_get_lockless_sync();
+			success = true;
 		}
 
 		if (ptl != pml)
 			spin_unlock(ptl);
+drop_pml:
 		spin_unlock(pml);
 
 		mmu_notifier_invalidate_range_end(&range);
 
-		if (!skipped_uffd) {
+		if (success) {
 			mm_dec_nr_ptes(mm);
 			page_table_check_pte_clear_range(mm, addr, pgt_pmd);
 			pte_free_defer(mm, pmd_pgtable(pgt_pmd));
@@ -1781,9 +1836,8 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
 			 struct collapse_control *cc)
 {
 	struct address_space *mapping = file->f_mapping;
-	struct page *page;
-	struct page *tmp, *dst;
-	struct folio *folio, *new_folio;
+	struct page *dst;
+	struct folio *folio, *tmp, *new_folio;
 	pgoff_t index = 0, end = start + HPAGE_PMD_NR;
 	LIST_HEAD(pagelist);
 	XA_STATE_ORDER(xas, &mapping->i_pages, start, HPAGE_PMD_ORDER);
@@ -1819,13 +1873,13 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
 		}
 	} while (1);
 
-	for (index = start; index < end; index++) {
+	for (index = start; index < end;) {
 		xas_set(&xas, index);
-		page = xas_load(&xas);
+		folio = xas_load(&xas);
 
 		VM_BUG_ON(index != xas.xa_index);
 		if (is_shmem) {
-			if (!page) {
+			if (!folio) {
 				/*
 				 * Stop if extent has been truncated or
 				 * hole-punched, and is now completely
@@ -1838,41 +1892,41 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
 					}
 				}
 				nr_none++;
+				index++;
 				continue;
 			}
 
-			if (xa_is_value(page) || !PageUptodate(page)) {
+			if (xa_is_value(folio) || !folio_test_uptodate(folio)) {
 				xas_unlock_irq(&xas);
 				/* swap in or instantiate fallocated page */
-				if (shmem_get_folio(mapping->host, index,
+				if (shmem_get_folio(mapping->host, index, 0,
 						&folio, SGP_NOALLOC)) {
 					result = SCAN_FAIL;
 					goto xa_unlocked;
 				}
-				/* drain lru cache to help isolate_lru_page() */
+				/* drain lru cache to help folio_isolate_lru() */
 				lru_add_drain();
-				page = folio_file_page(folio, index);
-			} else if (trylock_page(page)) {
-				get_page(page);
+			} else if (folio_trylock(folio)) {
+				folio_get(folio);
 				xas_unlock_irq(&xas);
 			} else {
 				result = SCAN_PAGE_LOCK;
 				goto xa_locked;
 			}
 		} else {	/* !is_shmem */
-			if (!page || xa_is_value(page)) {
+			if (!folio || xa_is_value(folio)) {
 				xas_unlock_irq(&xas);
 				page_cache_sync_readahead(mapping, &file->f_ra,
 							  file, index,
 							  end - index);
-				/* drain lru cache to help isolate_lru_page() */
+				/* drain lru cache to help folio_isolate_lru() */
 				lru_add_drain();
-				page = find_lock_page(mapping, index);
-				if (unlikely(page == NULL)) {
+				folio = filemap_lock_folio(mapping, index);
+				if (IS_ERR(folio)) {
 					result = SCAN_FAIL;
 					goto xa_unlocked;
 				}
-			} else if (PageDirty(page)) {
+			} else if (folio_test_dirty(folio)) {
 				/*
 				 * khugepaged only works on read-only fd,
 				 * so this page is dirty because it hasn't
@@ -1890,12 +1944,12 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
 				filemap_flush(mapping);
 				result = SCAN_FAIL;
 				goto xa_unlocked;
-			} else if (PageWriteback(page)) {
+			} else if (folio_test_writeback(folio)) {
 				xas_unlock_irq(&xas);
 				result = SCAN_FAIL;
 				goto xa_unlocked;
-			} else if (trylock_page(page)) {
-				get_page(page);
+			} else if (folio_trylock(folio)) {
+				folio_get(folio);
 				xas_unlock_irq(&xas);
 			} else {
 				result = SCAN_PAGE_LOCK;
@@ -1904,34 +1958,28 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
 		}
 
 		/*
-		 * The page must be locked, so we can drop the i_pages lock
+		 * The folio must be locked, so we can drop the i_pages lock
 		 * without racing with truncate.
 		 */
-		VM_BUG_ON_PAGE(!PageLocked(page), page);
+		VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 
-		/* make sure the page is up to date */
-		if (unlikely(!PageUptodate(page))) {
+		/* make sure the folio is up to date */
+		if (unlikely(!folio_test_uptodate(folio))) {
 			result = SCAN_FAIL;
 			goto out_unlock;
 		}
 
 		/*
 		 * If file was truncated then extended, or hole-punched, before
-		 * we locked the first page, then a THP might be there already.
+		 * we locked the first folio, then a THP might be there already.
 		 * This will be discovered on the first iteration.
 		 */
-		if (PageTransCompound(page)) {
-			struct page *head = compound_head(page);
-
-			result = compound_order(head) == HPAGE_PMD_ORDER &&
-					head->index == start
-					/* Maybe PMD-mapped */
-					? SCAN_PTE_MAPPED_HUGEPAGE
-					: SCAN_PAGE_COMPOUND;
+		if (folio_order(folio) == HPAGE_PMD_ORDER &&
+		    folio->index == start) {
+			/* Maybe PMD-mapped */
+			result = SCAN_PTE_MAPPED_HUGEPAGE;
 			goto out_unlock;
 		}
-
-		folio = page_folio(page);
 
 		if (folio_mapping(folio) != mapping) {
 			result = SCAN_TRUNCATED;
@@ -1942,7 +1990,7 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
 				  folio_test_writeback(folio))) {
 			/*
 			 * khugepaged only works on read-only fd, so this
-			 * page is dirty because it hasn't been flushed
+			 * folio is dirty because it hasn't been flushed
 			 * since first write.
 			 */
 			result = SCAN_FAIL;
@@ -1966,42 +2014,44 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
 
 		xas_lock_irq(&xas);
 
-		VM_BUG_ON_PAGE(page != xa_load(xas.xa, index), page);
+		VM_BUG_ON_FOLIO(folio != xa_load(xas.xa, index), folio);
 
 		/*
-		 * We control three references to the page:
+		 * We control 2 + nr_pages references to the folio:
 		 *  - we hold a pin on it;
-		 *  - one reference from page cache;
-		 *  - one from isolate_lru_page;
-		 * If those are the only references, then any new usage of the
-		 * page will have to fetch it from the page cache. That requires
-		 * locking the page to handle truncate, so any new usage will be
-		 * blocked until we unlock page after collapse/during rollback.
+		 *  - nr_pages reference from page cache;
+		 *  - one from lru_isolate_folio;
+		 * If those are the only references, then any new usage
+		 * of the folio will have to fetch it from the page
+		 * cache. That requires locking the folio to handle
+		 * truncate, so any new usage will be blocked until we
+		 * unlock folio after collapse/during rollback.
 		 */
-		if (page_count(page) != 3) {
+		if (folio_ref_count(folio) != 2 + folio_nr_pages(folio)) {
 			result = SCAN_PAGE_COUNT;
 			xas_unlock_irq(&xas);
-			putback_lru_page(page);
+			folio_putback_lru(folio);
 			goto out_unlock;
 		}
 
 		/*
-		 * Accumulate the pages that are being collapsed.
+		 * Accumulate the folios that are being collapsed.
 		 */
-		list_add_tail(&page->lru, &pagelist);
+		list_add_tail(&folio->lru, &pagelist);
+		index += folio_nr_pages(folio);
 		continue;
 out_unlock:
-		unlock_page(page);
-		put_page(page);
+		folio_unlock(folio);
+		folio_put(folio);
 		goto xa_unlocked;
 	}
 
 	if (!is_shmem) {
 		filemap_nr_thps_inc(mapping);
 		/*
-		 * Paired with smp_mb() in do_dentry_open() to ensure
-		 * i_writecount is up to date and the update to nr_thps is
-		 * visible. Ensures the page cache will be truncated if the
+		 * Paired with the fence in do_dentry_open() -> get_write_access()
+		 * to ensure i_writecount is up to date and the update to nr_thps
+		 * is visible. Ensures the page cache will be truncated if the
 		 * file is opened writable.
 		 */
 		smp_mb();
@@ -2031,22 +2081,27 @@ xa_unlocked:
 	}
 
 	/*
-	 * The old pages are locked, so they won't change anymore.
+	 * The old folios are locked, so they won't change anymore.
 	 */
 	index = start;
 	dst = folio_page(new_folio, 0);
-	list_for_each_entry(page, &pagelist, lru) {
-		while (index < page->index) {
+	list_for_each_entry(folio, &pagelist, lru) {
+		int i, nr_pages = folio_nr_pages(folio);
+
+		while (index < folio->index) {
 			clear_highpage(dst);
 			index++;
 			dst++;
 		}
-		if (copy_mc_highpage(dst, page) > 0) {
-			result = SCAN_COPY_MC;
-			goto rollback;
+
+		for (i = 0; i < nr_pages; i++) {
+			if (copy_mc_highpage(dst, folio_page(folio, i)) > 0) {
+				result = SCAN_COPY_MC;
+				goto rollback;
+			}
+			index++;
+			dst++;
 		}
-		index++;
-		dst++;
 	}
 	while (index < end) {
 		clear_highpage(dst);
@@ -2153,15 +2208,15 @@ immap_locked:
 	folio_unlock(new_folio);
 
 	/*
-	 * The collapse has succeeded, so free the old pages.
+	 * The collapse has succeeded, so free the old folios.
 	 */
-	list_for_each_entry_safe(page, tmp, &pagelist, lru) {
-		list_del(&page->lru);
-		page->mapping = NULL;
-		ClearPageActive(page);
-		ClearPageUnevictable(page);
-		unlock_page(page);
-		folio_put_refs(page_folio(page), 3);
+	list_for_each_entry_safe(folio, tmp, &pagelist, lru) {
+		list_del(&folio->lru);
+		folio->mapping = NULL;
+		folio_clear_active(folio);
+		folio_clear_unevictable(folio);
+		folio_unlock(folio);
+		folio_put_refs(folio, 2 + folio_nr_pages(folio));
 	}
 
 	goto out;
@@ -2175,11 +2230,11 @@ rollback:
 		shmem_uncharge(mapping->host, nr_none);
 	}
 
-	list_for_each_entry_safe(page, tmp, &pagelist, lru) {
-		list_del(&page->lru);
-		unlock_page(page);
-		putback_lru_page(page);
-		put_page(page);
+	list_for_each_entry_safe(folio, tmp, &pagelist, lru) {
+		list_del(&folio->lru);
+		folio_unlock(folio);
+		folio_putback_lru(folio);
+		folio_put(folio);
 	}
 	/*
 	 * Undo the updates of filemap_nr_thps_inc for non-SHMEM
@@ -2189,8 +2244,8 @@ rollback:
 	if (!is_shmem && result == SCAN_COPY_MC) {
 		filemap_nr_thps_dec(mapping);
 		/*
-		 * Paired with smp_mb() in do_dentry_open() to
-		 * ensure the update to nr_thps is visible.
+		 * Paired with the fence in do_dentry_open() -> get_write_access()
+		 * to ensure the update to nr_thps is visible.
 		 */
 		smp_mb();
 	}
@@ -2209,7 +2264,7 @@ static int hpage_collapse_scan_file(struct mm_struct *mm, unsigned long addr,
 				    struct file *file, pgoff_t start,
 				    struct collapse_control *cc)
 {
-	struct page *page = NULL;
+	struct folio *folio = NULL;
 	struct address_space *mapping = file->f_mapping;
 	XA_STATE(xas, &mapping->i_pages, start);
 	int present, swap;
@@ -2221,12 +2276,12 @@ static int hpage_collapse_scan_file(struct mm_struct *mm, unsigned long addr,
 	memset(cc->node_load, 0, sizeof(cc->node_load));
 	nodes_clear(cc->alloc_nmask);
 	rcu_read_lock();
-	xas_for_each(&xas, page, start + HPAGE_PMD_NR - 1) {
-		if (xas_retry(&xas, page))
+	xas_for_each(&xas, folio, start + HPAGE_PMD_NR - 1) {
+		if (xas_retry(&xas, folio))
 			continue;
 
-		if (xa_is_value(page)) {
-			++swap;
+		if (xa_is_value(folio)) {
+			swap += 1 << xas_get_order(&xas);
 			if (cc->is_khugepaged &&
 			    swap > khugepaged_max_ptes_swap) {
 				result = SCAN_EXCEED_SWAP_PTE;
@@ -2236,18 +2291,10 @@ static int hpage_collapse_scan_file(struct mm_struct *mm, unsigned long addr,
 			continue;
 		}
 
-		/*
-		 * TODO: khugepaged should compact smaller compound pages
-		 * into a PMD sized page
-		 */
-		if (PageTransCompound(page)) {
-			struct page *head = compound_head(page);
-
-			result = compound_order(head) == HPAGE_PMD_ORDER &&
-					head->index == start
-					/* Maybe PMD-mapped */
-					? SCAN_PTE_MAPPED_HUGEPAGE
-					: SCAN_PAGE_COMPOUND;
+		if (folio_order(folio) == HPAGE_PMD_ORDER &&
+		    folio->index == start) {
+			/* Maybe PMD-mapped */
+			result = SCAN_PTE_MAPPED_HUGEPAGE;
 			/*
 			 * For SCAN_PTE_MAPPED_HUGEPAGE, further processing
 			 * by the caller won't touch the page cache, and so
@@ -2257,31 +2304,31 @@ static int hpage_collapse_scan_file(struct mm_struct *mm, unsigned long addr,
 			break;
 		}
 
-		node = page_to_nid(page);
+		node = folio_nid(folio);
 		if (hpage_collapse_scan_abort(node, cc)) {
 			result = SCAN_SCAN_ABORT;
 			break;
 		}
 		cc->node_load[node]++;
 
-		if (!PageLRU(page)) {
+		if (!folio_test_lru(folio)) {
 			result = SCAN_PAGE_LRU;
 			break;
 		}
 
-		if (page_count(page) !=
-		    1 + page_mapcount(page) + page_has_private(page)) {
+		if (!is_refcount_suitable(folio)) {
 			result = SCAN_PAGE_COUNT;
 			break;
 		}
 
 		/*
-		 * We probably should check if the page is referenced here, but
-		 * nobody would transfer pte_young() to PageReferenced() for us.
-		 * And rmap walk here is just too costly...
+		 * We probably should check if the folio is referenced
+		 * here, but nobody would transfer pte_young() to
+		 * folio_test_referenced() for us.  And rmap walk here
+		 * is just too costly...
 		 */
 
-		present++;
+		present += folio_nr_pages(folio);
 
 		if (need_resched()) {
 			xas_pause(&xas);
@@ -2300,7 +2347,7 @@ static int hpage_collapse_scan_file(struct mm_struct *mm, unsigned long addr,
 		}
 	}
 
-	trace_mm_khugepaged_scan_file(mm, page, file, present, swap, result);
+	trace_mm_khugepaged_scan_file(mm, folio, file, present, swap, result);
 	return result;
 }
 #else
@@ -2350,7 +2397,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
 		goto breakouterloop_mmap_lock;
 
 	progress++;
-	if (unlikely(hpage_collapse_test_exit(mm)))
+	if (unlikely(hpage_collapse_test_exit_or_disable(mm)))
 		goto breakouterloop;
 
 	vma_iter_init(&vmi, mm, khugepaged_scan.address);
@@ -2358,7 +2405,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
 		unsigned long hstart, hend;
 
 		cond_resched();
-		if (unlikely(hpage_collapse_test_exit(mm))) {
+		if (unlikely(hpage_collapse_test_exit_or_disable(mm))) {
 			progress++;
 			break;
 		}
@@ -2380,7 +2427,7 @@ skip:
 			bool mmap_locked = true;
 
 			cond_resched();
-			if (unlikely(hpage_collapse_test_exit(mm)))
+			if (unlikely(hpage_collapse_test_exit_or_disable(mm)))
 				goto breakouterloop;
 
 			VM_BUG_ON(khugepaged_scan.address < hstart ||
@@ -2398,7 +2445,7 @@ skip:
 				fput(file);
 				if (*result == SCAN_PTE_MAPPED_HUGEPAGE) {
 					mmap_read_lock(mm);
-					if (hpage_collapse_test_exit(mm))
+					if (hpage_collapse_test_exit_or_disable(mm))
 						goto breakouterloop;
 					*result = collapse_pte_mapped_thp(mm,
 						khugepaged_scan.address, false);
@@ -2465,8 +2512,7 @@ breakouterloop_mmap_lock:
 
 static int khugepaged_has_work(void)
 {
-	return !list_empty(&khugepaged_scan.mm_head) &&
-		hugepage_flags_enabled();
+	return !list_empty(&khugepaged_scan.mm_head) && hugepage_pmd_enabled();
 }
 
 static int khugepaged_wait_event(void)
@@ -2487,7 +2533,7 @@ static void khugepaged_do_scan(struct collapse_control *cc)
 	while (true) {
 		cond_resched();
 
-		if (unlikely(kthread_should_stop() || try_to_freeze()))
+		if (unlikely(kthread_should_stop()))
 			break;
 
 		spin_lock(&khugepaged_mm_lock);
@@ -2539,7 +2585,7 @@ static void khugepaged_wait_work(void)
 		return;
 	}
 
-	if (hugepage_flags_enabled())
+	if (hugepage_pmd_enabled())
 		wait_event_freezable(khugepaged_wait, khugepaged_wait_event());
 }
 
@@ -2570,7 +2616,7 @@ static void set_recommended_min_free_kbytes(void)
 	int nr_zones = 0;
 	unsigned long recommended_min;
 
-	if (!hugepage_flags_enabled()) {
+	if (!hugepage_pmd_enabled()) {
 		calculate_min_free_kbytes();
 		goto update_wmarks;
 	}
@@ -2620,7 +2666,7 @@ int start_stop_khugepaged(void)
 	int err = 0;
 
 	mutex_lock(&khugepaged_mutex);
-	if (hugepage_flags_enabled()) {
+	if (hugepage_pmd_enabled()) {
 		if (!khugepaged_thread)
 			khugepaged_thread = kthread_run(khugepaged, NULL,
 							"khugepaged");
@@ -2646,7 +2692,7 @@ fail:
 void khugepaged_min_free_kbytes_update(void)
 {
 	mutex_lock(&khugepaged_mutex);
-	if (hugepage_flags_enabled() && khugepaged_thread)
+	if (hugepage_pmd_enabled() && khugepaged_thread)
 		set_recommended_min_free_kbytes();
 	mutex_unlock(&khugepaged_mutex);
 }

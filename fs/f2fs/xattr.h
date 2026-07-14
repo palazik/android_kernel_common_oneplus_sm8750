@@ -24,6 +24,7 @@
 #define F2FS_XATTR_REFCOUNT_MAX         1024
 
 /* Name indexes */
+#define F2FS_USER_FADVISE_NAME			"user.fadvise"
 #define F2FS_SYSTEM_ADVISE_NAME			"system.advise"
 #define F2FS_XATTR_INDEX_USER			1
 #define F2FS_XATTR_INDEX_POSIX_ACL_ACCESS	2
@@ -38,6 +39,11 @@
 
 #define F2FS_XATTR_NAME_ENCRYPTION_CONTEXT	"c"
 #define F2FS_XATTR_NAME_VERITY			"v"
+
+/* used for F2FS_USER_FADVISE_NAME */
+enum {
+	F2FS_XATTR_FADV_LARGEFOLIO,
+};
 
 struct f2fs_xattr_header {
 	__le32  h_magic;        /* magic number for identification */
@@ -127,7 +133,7 @@ extern const struct xattr_handler f2fs_xattr_trusted_handler;
 extern const struct xattr_handler f2fs_xattr_advise_handler;
 extern const struct xattr_handler f2fs_xattr_security_handler;
 
-extern const struct xattr_handler *f2fs_xattr_handlers[];
+extern const struct xattr_handler * const f2fs_xattr_handlers[];
 
 extern int f2fs_setxattr(struct inode *, int, const char *,
 				const void *, size_t, struct page *, int);

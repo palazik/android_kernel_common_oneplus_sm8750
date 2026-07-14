@@ -44,6 +44,7 @@ static int __read_mostly sysctl_hung_task_check_count = PID_MAX_LIMIT;
  * Zero means infinite timeout - no checking done:
  */
 unsigned long __read_mostly sysctl_hung_task_timeout_secs = CONFIG_DEFAULT_HUNG_TASK_TIMEOUT;
+EXPORT_SYMBOL_GPL(sysctl_hung_task_timeout_secs);
 
 /*
  * Zero (default value) means use sysctl_hung_task_timeout_secs:
@@ -88,6 +89,43 @@ static struct notifier_block panic_block = {
 	.notifier_call = hung_task_panic,
 };
 
+
+#ifdef CONFIG_DETECT_HUNG_TASK_BLOCKER
+static void debug_show_blocker(struct task_struct *task)
+{
+	struct task_struct *g, *t;
+	unsigned long owner;
+	struct mutex *lock;
+
+	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "No rcu lock held");
+
+	lock = READ_ONCE(task->blocker_mutex);
+	if (!lock)
+		return;
+
+	owner = mutex_get_owner(lock);
+	if (unlikely(!owner)) {
+		pr_err("INFO: task %s:%d is blocked on a mutex, but the owner is not found.\n",
+			task->comm, task->pid);
+		return;
+	}
+
+	/* Ensure the owner information is correct. */
+	for_each_process_thread(g, t) {
+		if ((unsigned long)t == owner) {
+			pr_err("INFO: task %s:%d is blocked on a mutex likely owned by task %s:%d.\n",
+				task->comm, task->pid, t->comm, t->pid);
+			sched_show_task(t);
+			return;
+		}
+	}
+}
+#else
+static inline void debug_show_blocker(struct task_struct *task)
+{
+}
+#endif
+
 static void check_hung_task(struct task_struct *t, unsigned long timeout)
 {
 	unsigned long switch_count = t->nvcsw + t->nivcsw;
@@ -127,7 +165,7 @@ static void check_hung_task(struct task_struct *t, unsigned long timeout)
 	 * Ok, the task did not get scheduled for more than 2 minutes,
 	 * complain:
 	 */
-	if (sysctl_hung_task_warnings) {
+	if (sysctl_hung_task_warnings || hung_task_call_panic) {
 		if (sysctl_hung_task_warnings > 0)
 			sysctl_hung_task_warnings--;
 		pr_err("INFO: task %s:%d blocked for more than %ld seconds.\n",
@@ -139,6 +177,7 @@ static void check_hung_task(struct task_struct *t, unsigned long timeout)
 		pr_err("\"echo 0 > /proc/sys/kernel/hung_task_timeout_secs\""
 			" disables this message.\n");
 		sched_show_task(t);
+		debug_show_blocker(t);
 		hung_task_show_lock = true;
 
 		if (sysctl_hung_task_all_cpu_backtrace)
@@ -244,7 +283,7 @@ static long hung_timeout_jiffies(unsigned long last_checked,
 /*
  * Process updating of timeout sysctl
  */
-static int proc_dohung_task_timeout_secs(struct ctl_table *table, int write,
+static int proc_dohung_task_timeout_secs(const struct ctl_table *table, int write,
 				  void *buffer,
 				  size_t *lenp, loff_t *ppos)
 {
@@ -319,7 +358,6 @@ static struct ctl_table hung_task_sysctls[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_NEG_ONE,
 	},
-	{}
 };
 
 static void __init hung_task_sysctl_init(void)

@@ -4,8 +4,6 @@
 
 #include <linux/io-pgtable.h>
 
-extern bool selftest_running;
-
 typedef u64 arm_lpae_iopte;
 
 struct arm_lpae_io_pgtable {
@@ -18,6 +16,16 @@ struct arm_lpae_io_pgtable {
 	void			*pgd;
 
 	bool			idmapped; /* Used by hypervisor */
+};
+
+struct io_pgtable_walk_data {
+	struct io_pgtable		*iop;
+	struct io_pgtable_walk_common	*data;
+	int (*visit)(struct io_pgtable_walk_data *walk_data, int lvl,
+		     arm_lpae_iopte *ptep, size_t size);
+	unsigned long			flags;
+	u64				addr;
+	const u64			end;
 };
 
 /* Struct accessors */
@@ -69,6 +77,7 @@ struct arm_lpae_io_pgtable {
 
 #define ARM_LPAE_PTE_NSTABLE		(((arm_lpae_iopte)1) << 63)
 #define ARM_LPAE_PTE_XN			(((arm_lpae_iopte)3) << 53)
+#define ARM_LPAE_PTE_DBM		(((arm_lpae_iopte)1) << 51)
 #define ARM_LPAE_PTE_AF			(((arm_lpae_iopte)1) << 10)
 #define ARM_LPAE_PTE_SH_NS		(((arm_lpae_iopte)0) << 8)
 #define ARM_LPAE_PTE_SH_OS		(((arm_lpae_iopte)2) << 8)
@@ -78,7 +87,7 @@ struct arm_lpae_io_pgtable {
 
 #define ARM_LPAE_PTE_ATTR_LO_MASK	(((arm_lpae_iopte)0x3ff) << 2)
 /* Ignore the contiguous bit for block splitting */
-#define ARM_LPAE_PTE_ATTR_HI_MASK	(((arm_lpae_iopte)6) << 52)
+#define ARM_LPAE_PTE_ATTR_HI_MASK	(ARM_LPAE_PTE_XN | ARM_LPAE_PTE_DBM)
 #define ARM_LPAE_PTE_ATTR_MASK		(ARM_LPAE_PTE_ATTR_LO_MASK |	\
 					 ARM_LPAE_PTE_ATTR_HI_MASK)
 /* Software bit for solving coherency races */
@@ -86,7 +95,11 @@ struct arm_lpae_io_pgtable {
 
 /* Stage-1 PTE */
 #define ARM_LPAE_PTE_AP_UNPRIV		(((arm_lpae_iopte)1) << 6)
-#define ARM_LPAE_PTE_AP_RDONLY		(((arm_lpae_iopte)2) << 6)
+#define ARM_LPAE_PTE_AP_RDONLY_BIT	7
+#define ARM_LPAE_PTE_AP_RDONLY		(((arm_lpae_iopte)1) << \
+					   ARM_LPAE_PTE_AP_RDONLY_BIT)
+#define ARM_LPAE_PTE_AP_WR_CLEAN_MASK	(ARM_LPAE_PTE_AP_RDONLY | \
+					 ARM_LPAE_PTE_DBM)
 #define ARM_LPAE_PTE_ATTRINDX_SHIFT	2
 #define ARM_LPAE_PTE_nG			(((arm_lpae_iopte)1) << 11)
 
@@ -102,6 +115,29 @@ struct arm_lpae_io_pgtable {
 #define ARM_LPAE_VTCR_SL0_MASK		0x3
 
 #define ARM_LPAE_TCR_T0SZ_SHIFT		0
+
+#define ARM_LPAE_VTCR_PS_SHIFT		16
+#define ARM_LPAE_VTCR_PS_MASK		0x7
+
+#define ARM_LPAE_MAIR_ATTR_SHIFT(n)	((n) << 3)
+#define ARM_LPAE_MAIR_ATTR_MASK		0xff
+#define ARM_LPAE_MAIR_ATTR_DEVICE	0x04
+#define ARM_LPAE_MAIR_ATTR_NC		0x44
+#define ARM_LPAE_MAIR_ATTR_INC_OWBRWA	0xf4
+#define ARM_LPAE_MAIR_ATTR_WBRWA	0xff
+#define ARM_LPAE_MAIR_ATTR_IDX_NC	0
+#define ARM_LPAE_MAIR_ATTR_IDX_CACHE	1
+#define ARM_LPAE_MAIR_ATTR_IDX_DEV	2
+#define ARM_LPAE_MAIR_ATTR_IDX_INC_OCACHE	3
+
+#define ARM_MALI_LPAE_TTBR_ADRMODE_TABLE (3u << 0)
+#define ARM_MALI_LPAE_TTBR_READ_INNER	BIT(2)
+#define ARM_MALI_LPAE_TTBR_SHARE_OUTER	BIT(4)
+
+#define ARM_MALI_LPAE_MEMATTR_IMP_DEF	0x88ULL
+#define ARM_MALI_LPAE_MEMATTR_WRITE_ALLOC 0x8DULL
+
+#define ARM_LPAE_MAX_LEVELS		4
 
 #define ARM_LPAE_TCR_TG0_4K		0
 #define ARM_LPAE_TCR_TG0_64K		1
@@ -128,33 +164,18 @@ struct arm_lpae_io_pgtable {
 #define ARM_LPAE_TCR_PS_48_BIT		0x5ULL
 #define ARM_LPAE_TCR_PS_52_BIT		0x6ULL
 
-#define ARM_LPAE_VTCR_PS_SHIFT		16
-#define ARM_LPAE_VTCR_PS_MASK		0x7
-
-#define ARM_LPAE_MAIR_ATTR_SHIFT(n)	((n) << 3)
-#define ARM_LPAE_MAIR_ATTR_MASK		0xff
-#define ARM_LPAE_MAIR_ATTR_DEVICE	0x04
-#define ARM_LPAE_MAIR_ATTR_NC		0x44
-#define ARM_LPAE_MAIR_ATTR_INC_OWBRWA	0xf4
-#define ARM_LPAE_MAIR_ATTR_WBRWA	0xff
-#define ARM_LPAE_MAIR_ATTR_IDX_NC	0
-#define ARM_LPAE_MAIR_ATTR_IDX_CACHE	1
-#define ARM_LPAE_MAIR_ATTR_IDX_DEV	2
-#define ARM_LPAE_MAIR_ATTR_IDX_INC_OCACHE	3
-
-#define ARM_MALI_LPAE_TTBR_ADRMODE_TABLE (3u << 0)
-#define ARM_MALI_LPAE_TTBR_READ_INNER	BIT(2)
-#define ARM_MALI_LPAE_TTBR_SHARE_OUTER	BIT(4)
-
-#define ARM_MALI_LPAE_MEMATTR_IMP_DEF	0x88ULL
-#define ARM_MALI_LPAE_MEMATTR_WRITE_ALLOC 0x8DULL
-
-#define ARM_LPAE_MAX_LEVELS		4
-
+/* IOPTE accessors */
 #define iopte_type(pte)					\
 	(((pte) >> ARM_LPAE_PTE_TYPE_SHIFT) & ARM_LPAE_PTE_TYPE_MASK)
 
 #define iopte_prot(pte)	((pte) & ARM_LPAE_PTE_ATTR_MASK)
+
+#define iopte_writeable_dirty(pte)				\
+	(((pte) & ARM_LPAE_PTE_AP_WR_CLEAN_MASK) == ARM_LPAE_PTE_DBM)
+
+#define iopte_set_writeable_clean(ptep)				\
+	set_bit(ARM_LPAE_PTE_AP_RDONLY_BIT, (unsigned long *)(ptep))
+
 
 static inline bool iopte_leaf(arm_lpae_iopte pte, int lvl,
 			      enum io_pgtable_fmt fmt)
@@ -165,10 +186,27 @@ static inline bool iopte_leaf(arm_lpae_iopte pte, int lvl,
 	return iopte_type(pte) == ARM_LPAE_PTE_TYPE_BLOCK;
 }
 
+static inline bool iopte_table(arm_lpae_iopte pte, int lvl)
+{
+	if (lvl == (ARM_LPAE_MAX_LEVELS - 1))
+		return false;
+	return iopte_type(pte) == ARM_LPAE_PTE_TYPE_TABLE;
+}
+
+static inline bool iopte_valid(arm_lpae_iopte pte)
+{
+	return pte & ARM_LPAE_PTE_VALID;
+}
+
 #ifdef __KVM_NVHE_HYPERVISOR__
 #include <nvhe/memory.h>
 #define __arm_lpae_virt_to_phys	hyp_virt_to_phys
 #define __arm_lpae_phys_to_virt	hyp_phys_to_virt
+
+struct io_pgtable *kvm_arm_io_pgtable_alloc(struct io_pgtable_cfg *cfg,
+					    void *cookie,
+					    int *out_ret);
+int kvm_arm_io_pgtable_free(struct io_pgtable *iop);
 #else
 #define __arm_lpae_virt_to_phys	__pa
 #define __arm_lpae_phys_to_virt	__va
@@ -185,12 +223,15 @@ int arm_lpae_init_pgtable_s1(struct io_pgtable_cfg *cfg,
 int arm_lpae_init_pgtable_s2(struct io_pgtable_cfg *cfg,
 			     struct arm_lpae_io_pgtable *data);
 
+int __arm_lpae_iopte_walk(struct arm_lpae_io_pgtable *data,
+			  struct io_pgtable_walk_data *walk_data,
+			  arm_lpae_iopte *ptep,
+			  int lvl);
 /* Host/hyp-specific functions */
-void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp, struct io_pgtable_cfg *cfg);
-void __arm_lpae_free_pages(void *pages, size_t size, struct io_pgtable_cfg *cfg);
+void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp, struct io_pgtable_cfg *cfg, void *cookie);
+void __arm_lpae_free_pages(void *pages, size_t size, struct io_pgtable_cfg *cfg, void *cookie);
 void __arm_lpae_sync_pte(arm_lpae_iopte *ptep, int num_entries,
 			 struct io_pgtable_cfg *cfg);
-int arm_lpae_mapping_exists(struct arm_lpae_io_pgtable *data);
-void arm_lpae_mapping_missing(struct arm_lpae_io_pgtable *data);
-
+int arm_lpae_map_exists(void);
+void arm_lpae_unmap_empty(void);
 #endif /* IO_PGTABLE_H_ */

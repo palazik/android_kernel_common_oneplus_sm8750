@@ -24,6 +24,10 @@
 #include "pci.h"
 #include "pcie/portdrv.h"
 
+#include <trace/hooks/pci.h>
+#include <linux/android_kabi.h>
+ANDROID_KABI_DECLONLY(trace_eval_map);
+
 struct pci_dynid {
 	struct list_head node;
 	struct pci_device_id id;
@@ -419,15 +423,6 @@ static int __pci_device_probe(struct pci_driver *drv, struct pci_dev *pci_dev)
 	return error;
 }
 
-int __weak pcibios_alloc_irq(struct pci_dev *dev)
-{
-	return 0;
-}
-
-void __weak pcibios_free_irq(struct pci_dev *dev)
-{
-}
-
 #ifdef CONFIG_PCI_IOV
 static inline bool pci_device_can_probe(struct pci_dev *pdev)
 {
@@ -564,17 +559,28 @@ static void pci_pm_default_resume(struct pci_dev *pci_dev)
 	pci_enable_wake(pci_dev, PCI_D0, false);
 }
 
-static void pci_pm_power_up_and_verify_state(struct pci_dev *pci_dev)
+static int pci_pm_power_up_and_verify_state(struct pci_dev *pci_dev)
 {
-	pci_power_up(pci_dev);
+	int ret, state_ret = 0;
+
+	ret = pci_power_up(pci_dev);
 	pci_update_current_state(pci_dev, PCI_D0);
+
+	trace_android_vh_pci_pm_verify_state(&state_ret, &pci_dev->current_state);
+	if (ret && state_ret) {
+		dev_err(&pci_dev->dev, "Failed to power up device: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
 }
 
 static void pci_pm_default_resume_early(struct pci_dev *pci_dev)
 {
-	pci_pm_power_up_and_verify_state(pci_dev);
-	pci_restore_state(pci_dev);
-	pci_pme_restore(pci_dev);
+	if (!pci_pm_power_up_and_verify_state(pci_dev)) {
+		pci_restore_state(pci_dev);
+		pci_pme_restore(pci_dev);
+	}
 }
 
 static void pci_pm_bridge_power_up_actions(struct pci_dev *pci_dev)
@@ -1117,8 +1123,8 @@ static int pci_pm_thaw_noirq(struct device *dev)
 	 * in case the driver's "freeze" callbacks put it into a low-power
 	 * state.
 	 */
-	pci_pm_power_up_and_verify_state(pci_dev);
-	pci_restore_state(pci_dev);
+	if (!pci_pm_power_up_and_verify_state(pci_dev))
+		pci_restore_state(pci_dev);
 
 	if (pci_has_legacy_pm_support(pci_dev))
 		return 0;
@@ -1393,10 +1399,7 @@ static int pci_pm_runtime_idle(struct device *dev)
 	if (!pci_dev->driver)
 		return 0;
 
-	if (!pm)
-		return -ENOSYS;
-
-	if (pm->runtime_idle)
+	if (pm && pm->runtime_idle)
 		return pm->runtime_idle(dev);
 
 	return 0;
@@ -1519,7 +1522,7 @@ EXPORT_SYMBOL(pci_dev_driver);
  * system is in its list of supported devices. Returns the matching
  * pci_device_id structure or %NULL if there is no match.
  */
-static int pci_bus_match(struct device *dev, struct device_driver *drv)
+static int pci_bus_match(struct device *dev, const struct device_driver *drv)
 {
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 	struct pci_driver *pci_drv;
@@ -1528,7 +1531,7 @@ static int pci_bus_match(struct device *dev, struct device_driver *drv)
 	if (!pci_dev->match_driver)
 		return 0;
 
-	pci_drv = to_pci_driver(drv);
+	pci_drv = (struct pci_driver *)to_pci_driver(drv);
 	found_id = pci_match_device(pci_drv, pci_dev);
 	if (found_id)
 		return 1;
@@ -1687,7 +1690,7 @@ static void pci_dma_cleanup(struct device *dev)
 		iommu_device_unuse_default_domain(dev);
 }
 
-struct bus_type pci_bus_type = {
+const struct bus_type pci_bus_type = {
 	.name		= "pci",
 	.match		= pci_bus_match,
 	.uevent		= pci_uevent,
@@ -1705,10 +1708,10 @@ struct bus_type pci_bus_type = {
 EXPORT_SYMBOL(pci_bus_type);
 
 #ifdef CONFIG_PCIEPORTBUS
-static int pcie_port_bus_match(struct device *dev, struct device_driver *drv)
+static int pcie_port_bus_match(struct device *dev, const struct device_driver *drv)
 {
 	struct pcie_device *pciedev;
-	struct pcie_port_service_driver *driver;
+	const struct pcie_port_service_driver *driver;
 
 	if (drv->bus != &pcie_port_bus_type || dev->bus != &pcie_port_bus_type)
 		return 0;
@@ -1726,7 +1729,7 @@ static int pcie_port_bus_match(struct device *dev, struct device_driver *drv)
 	return 1;
 }
 
-struct bus_type pcie_port_bus_type = {
+const struct bus_type pcie_port_bus_type = {
 	.name		= "pci_express",
 	.match		= pcie_port_bus_match,
 };

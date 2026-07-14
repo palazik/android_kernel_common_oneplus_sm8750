@@ -4,8 +4,6 @@
 //!
 //! This module allows Rust code to use the kernel's `struct mutex`.
 
-use crate::bindings;
-
 /// Creates a [`Mutex`] initialiser with the given name and a newly-created lock class.
 ///
 /// It uses the name if one is given, otherwise it generates one based on the file name and line
@@ -17,6 +15,7 @@ macro_rules! new_mutex {
             $inner, $crate::optional_name!($($name)?), $crate::static_lock_class!())
     };
 }
+pub use new_mutex;
 
 /// A mutual exclusion primitive.
 ///
@@ -35,7 +34,7 @@ macro_rules! new_mutex {
 /// contains an inner struct (`Inner`) that is protected by a mutex.
 ///
 /// ```
-/// use kernel::{init::InPlaceInit, init::PinInit, new_mutex, pin_init, sync::Mutex};
+/// use kernel::sync::{new_mutex, Mutex};
 ///
 /// struct Inner {
 ///     a: u32,
@@ -59,7 +58,7 @@ macro_rules! new_mutex {
 /// }
 ///
 /// // Allocate a boxed `Example`.
-/// let e = Box::pin_init(Example::new())?;
+/// let e = KBox::pin_init(Example::new(), GFP_KERNEL)?;
 /// assert_eq!(e.c, 10);
 /// assert_eq!(e.d.lock().a, 20);
 /// assert_eq!(e.d.lock().b, 30);
@@ -84,7 +83,7 @@ macro_rules! new_mutex {
 /// }
 /// ```
 ///
-/// [`struct mutex`]: ../../../../include/linux/mutex.h
+/// [`struct mutex`]: srctree/include/linux/mutex.h
 pub type Mutex<T> = super::Lock<T, MutexBackend>;
 
 /// A kernel `struct mutex` lock backend.
@@ -95,9 +94,10 @@ unsafe impl super::Backend for MutexBackend {
     type State = bindings::mutex;
     type GuardState = ();
 
+    #[inline]
     unsafe fn init(
         ptr: *mut Self::State,
-        name: *const core::ffi::c_char,
+        name: *const crate::ffi::c_char,
         key: *mut bindings::lock_class_key,
     ) {
         // SAFETY: The safety requirements ensure that `ptr` is valid for writes, and `name` and
@@ -105,15 +105,29 @@ unsafe impl super::Backend for MutexBackend {
         unsafe { bindings::__mutex_init(ptr, name, key) }
     }
 
+    #[inline]
     unsafe fn lock(ptr: *mut Self::State) -> Self::GuardState {
         // SAFETY: The safety requirements of this function ensure that `ptr` points to valid
         // memory, and that it has been initialised before.
         unsafe { bindings::mutex_lock(ptr) };
     }
 
+    #[inline]
     unsafe fn unlock(ptr: *mut Self::State, _guard_state: &Self::GuardState) {
         // SAFETY: The safety requirements of this function ensure that `ptr` is valid and that the
         // caller is the owner of the mutex.
         unsafe { bindings::mutex_unlock(ptr) };
+    }
+
+    #[inline]
+    unsafe fn try_lock(ptr: *mut Self::State) -> Option<Self::GuardState> {
+        // SAFETY: The `ptr` pointer is guaranteed to be valid and initialized before use.
+        let result = unsafe { bindings::mutex_trylock(ptr) };
+
+        if result != 0 {
+            Some(())
+        } else {
+            None
+        }
     }
 }

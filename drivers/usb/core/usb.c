@@ -46,6 +46,10 @@
 #include <linux/dma-mapping.h>
 
 #include "hub.h"
+#include "trace.h"
+
+#include <linux/android_kabi.h>
+ANDROID_KABI_DECLONLY(trace_eval_map);
 
 const char *usbcore_name = "usbcore";
 
@@ -431,7 +435,7 @@ struct usb_interface *usb_find_interface(struct usb_driver *drv, int minor)
 	struct device *dev;
 
 	argb.minor = minor;
-	argb.drv = &drv->drvwrap.driver;
+	argb.drv = &drv->driver;
 
 	dev = bus_find_device(&usb_bus_type, NULL, &argb, __find_interface);
 
@@ -497,7 +501,7 @@ static void usb_release_dev(struct device *dev)
 	kfree(udev->product);
 	kfree(udev->manufacturer);
 	kfree(udev->serial);
-	kfree(udev);
+	kfree(container_of(udev, struct usb_device_ext, udev));
 }
 
 static int usb_dev_uevent(const struct device *dev, struct kobj_uevent_env *env)
@@ -592,7 +596,7 @@ static char *usb_devnode(const struct device *dev,
 			 usb_dev->bus->busnum, usb_dev->devnum);
 }
 
-struct device_type usb_device_type = {
+const struct device_type usb_device_type = {
 	.name =		"usb_device",
 	.release =	usb_release_dev,
 	.uevent =	usb_dev_uevent,
@@ -644,22 +648,24 @@ struct usb_device *usb_alloc_dev(struct usb_device *parent,
 				 struct usb_bus *bus, unsigned port1)
 {
 	struct usb_device *dev;
+	struct usb_device_ext *ext;
 	struct usb_hcd *usb_hcd = bus_to_hcd(bus);
 	unsigned raw_port = port1;
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (!dev)
+	ext = kzalloc(sizeof(*ext), GFP_KERNEL);
+	if (!ext)
 		return NULL;
+	dev = &ext->udev;
 
 	if (!usb_get_hcd(usb_hcd)) {
-		kfree(dev);
+		kfree(ext);
 		return NULL;
 	}
 	/* Root hubs aren't true devices, so don't allocate HCD resources */
 	if (usb_hcd->driver->alloc_dev && parent &&
 		!usb_hcd->driver->alloc_dev(usb_hcd, dev)) {
 		usb_put_hcd(bus_to_hcd(bus));
-		kfree(dev);
+		kfree(ext);
 		return NULL;
 	}
 
@@ -670,6 +676,8 @@ struct usb_device *usb_alloc_dev(struct usb_device *parent,
 	set_dev_node(&dev->dev, dev_to_node(bus->sysdev));
 	dev->state = USB_STATE_ATTACHED;
 	dev->lpm_disable_count = 1;
+	spin_lock_init(usb_get_offload_lock(dev));
+	dev->offload_usage = 0;
 	atomic_set(&dev->urbnum, 0);
 
 	INIT_LIST_HEAD(&dev->ep0.urb_list);
@@ -745,6 +753,8 @@ struct usb_device *usb_alloc_dev(struct usb_device *parent,
 #endif
 
 	dev->authorized = usb_dev_authorized(dev, usb_hcd);
+	trace_usb_alloc_dev(dev_name(&dev->dev), dev->speed, dev->state, dev->bus_mA,
+			    dev->authorized);
 	return dev;
 }
 EXPORT_SYMBOL_GPL(usb_alloc_dev);
@@ -1156,4 +1166,5 @@ static void __exit usb_exit(void)
 
 subsys_initcall(usb_init);
 module_exit(usb_exit);
+MODULE_DESCRIPTION("USB core host-side support");
 MODULE_LICENSE("GPL");

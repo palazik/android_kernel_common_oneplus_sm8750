@@ -837,6 +837,7 @@ static void svc_udp_init(struct svc_sock *svsk, struct svc_serv *serv)
 	/* data might have come in before data_ready set up */
 	set_bit(XPT_DATA, &svsk->sk_xprt.xpt_flags);
 	set_bit(XPT_CHNGBUF, &svsk->sk_xprt.xpt_flags);
+	set_bit(XPT_RPCB_UNREG, &svsk->sk_xprt.xpt_flags);
 
 	/* make sure we get destination address info */
 	switch (svsk->sk_sk->sk_family) {
@@ -1076,18 +1077,14 @@ static int receive_cb_reply(struct svc_sock *svsk, struct svc_rqst *rqstp)
 	struct rpc_rqst *req = NULL;
 	struct kvec *src, *dst;
 	__be32 *p = (__be32 *)rqstp->rq_arg.head[0].iov_base;
-	__be32 xid;
-	__be32 calldir;
-
-	xid = *p++;
-	calldir = *p;
+	__be32 xid = *p;
 
 	if (!bc_xprt)
 		return -EAGAIN;
 	spin_lock(&bc_xprt->queue_lock);
 	req = xprt_lookup_rqst(bc_xprt, xid);
 	if (!req)
-		goto unlock_notfound;
+		goto unlock_eagain;
 
 	memcpy(&req->rq_private_buf, &req->rq_rcv_buf, sizeof(struct xdr_buf));
 	/*
@@ -1104,12 +1101,6 @@ static int receive_cb_reply(struct svc_sock *svsk, struct svc_rqst *rqstp)
 	rqstp->rq_arg.len = 0;
 	spin_unlock(&bc_xprt->queue_lock);
 	return 0;
-unlock_notfound:
-	printk(KERN_NOTICE
-		"%s: Got unrecognized reply: "
-		"calldir 0x%x xpt_bc_xprt %p xid %08x\n",
-		__func__, ntohl(calldir),
-		bc_xprt, ntohl(xid));
 unlock_eagain:
 	spin_unlock(&bc_xprt->queue_lock);
 	return -EAGAIN;
@@ -1367,6 +1358,7 @@ static void svc_tcp_init(struct svc_sock *svsk, struct svc_serv *serv)
 	if (sk->sk_state == TCP_LISTEN) {
 		strcpy(svsk->sk_xprt.xpt_remotebuf, "listener");
 		set_bit(XPT_LISTENER, &svsk->sk_xprt.xpt_flags);
+		set_bit(XPT_RPCB_UNREG, &svsk->sk_xprt.xpt_flags);
 		sk->sk_data_ready = svc_tcp_listen_data_ready;
 		set_bit(XPT_CONN, &svsk->sk_xprt.xpt_flags);
 	} else {
@@ -1405,7 +1397,6 @@ void svc_sock_update_bufs(struct svc_serv *serv)
 		set_bit(XPT_CHNGBUF, &svsk->sk_xprt.xpt_flags);
 	spin_unlock_bh(&serv->sv_lock);
 }
-EXPORT_SYMBOL_GPL(svc_sock_update_bufs);
 
 /*
  * Initialize socket for RPC use and create svc_sock struct

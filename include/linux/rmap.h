@@ -14,9 +14,6 @@
 #include <linux/pagemap.h>
 #include <linux/memremap.h>
 
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/mm.h>
-
 /*
  * The anon_vma heads a list of private "related" vmas, to scan if
  * an anonymous page pointing to this anon_vma needs to be unmapped:
@@ -203,6 +200,9 @@ static inline void __folio_rmap_sanity_checks(struct folio *folio,
 	/* hugetlb folios are handled separately. */
 	VM_WARN_ON_FOLIO(folio_test_hugetlb(folio), folio);
 
+	/* When (un)mapping zeropages, we should never touch ref+mapcount. */
+	VM_WARN_ON_FOLIO(is_zero_folio(folio), folio);
+
 	/*
 	 * TODO: we get driver-allocated folios that have nothing to do with
 	 * the rmap using vm_insert_page(); therefore, we cannot assume that
@@ -276,6 +276,7 @@ static inline int hugetlb_try_dup_anon_rmap(struct folio *folio,
 		ClearPageAnonExclusive(&folio->page);
 	}
 	atomic_inc(&folio->_entire_mapcount);
+	atomic_inc(&folio->_large_mapcount);
 	return 0;
 }
 
@@ -287,7 +288,7 @@ static inline int hugetlb_try_share_anon_rmap(struct folio *folio)
 	VM_WARN_ON_FOLIO(!PageAnonExclusive(&folio->page), folio);
 
 	/* Paired with the memory barrier in try_grab_folio(). */
-	if (IS_ENABLED(CONFIG_HAVE_FAST_GUP))
+	if (IS_ENABLED(CONFIG_HAVE_GUP_FAST))
 		smp_mb();
 
 	if (unlikely(folio_maybe_dma_pinned(folio)))
@@ -298,7 +299,7 @@ static inline int hugetlb_try_share_anon_rmap(struct folio *folio)
 	 * This is conceptually a smp_wmb() paired with the smp_rmb() in
 	 * gup_must_unshare().
 	 */
-	if (IS_ENABLED(CONFIG_HAVE_FAST_GUP))
+	if (IS_ENABLED(CONFIG_HAVE_GUP_FAST))
 		smp_mb__after_atomic();
 	return 0;
 }
@@ -309,6 +310,7 @@ static inline void hugetlb_add_file_rmap(struct folio *folio)
 	VM_WARN_ON_FOLIO(folio_test_anon(folio), folio);
 
 	atomic_inc(&folio->_entire_mapcount);
+	atomic_inc(&folio->_large_mapcount);
 }
 
 static inline void hugetlb_remove_rmap(struct folio *folio)
@@ -316,29 +318,31 @@ static inline void hugetlb_remove_rmap(struct folio *folio)
 	VM_WARN_ON_FOLIO(!folio_test_hugetlb(folio), folio);
 
 	atomic_dec(&folio->_entire_mapcount);
+	atomic_dec(&folio->_large_mapcount);
 }
 
 static __always_inline void __folio_dup_file_rmap(struct folio *folio,
 		struct page *page, int nr_pages, enum rmap_level level)
 {
-	bool success = false;
+	const int orig_nr_pages = nr_pages;
+
 	__folio_rmap_sanity_checks(folio, page, nr_pages, level);
 
 	switch (level) {
 	case RMAP_LEVEL_PTE:
 		if (!folio_test_large(folio)) {
-			atomic_inc(&page->_mapcount);
+			atomic_inc(&folio->_mapcount);
 			break;
 		}
 
 		do {
-			trace_android_vh_update_page_mapcount(page, true, false, NULL, &success);
-			if (!success)
-				atomic_inc(&page->_mapcount);
+			atomic_inc(&page->_mapcount);
 		} while (page++, --nr_pages > 0);
+		atomic_add(orig_nr_pages, &folio->_large_mapcount);
 		break;
 	case RMAP_LEVEL_PMD:
 		atomic_inc(&folio->_entire_mapcount);
+		atomic_inc(&folio->_large_mapcount);
 		break;
 	}
 }
@@ -358,8 +362,12 @@ static inline void folio_dup_file_rmap_ptes(struct folio *folio,
 {
 	__folio_dup_file_rmap(folio, page, nr_pages, RMAP_LEVEL_PTE);
 }
-#define folio_dup_file_rmap_pte(folio, page) \
-	folio_dup_file_rmap_ptes(folio, page, 1)
+
+static __always_inline void folio_dup_file_rmap_pte(struct folio *folio,
+		struct page *page)
+{
+	__folio_dup_file_rmap(folio, page, 1, RMAP_LEVEL_PTE);
+}
 
 /**
  * folio_dup_file_rmap_pmd - duplicate a PMD mapping of a page range of a folio
@@ -384,9 +392,9 @@ static __always_inline int __folio_try_dup_anon_rmap(struct folio *folio,
 		struct page *page, int nr_pages, struct vm_area_struct *src_vma,
 		enum rmap_level level)
 {
+	const int orig_nr_pages = nr_pages;
 	bool maybe_pinned;
 	int i;
-	bool success = false;
 
 	VM_WARN_ON_FOLIO(!folio_test_anon(folio), folio);
 	__folio_rmap_sanity_checks(folio, page, nr_pages, level);
@@ -417,17 +425,16 @@ static __always_inline int __folio_try_dup_anon_rmap(struct folio *folio,
 		if (!folio_test_large(folio)) {
 			if (PageAnonExclusive(page))
 				ClearPageAnonExclusive(page);
-			atomic_inc(&page->_mapcount);
+			atomic_inc(&folio->_mapcount);
 			break;
 		}
 
 		do {
 			if (PageAnonExclusive(page))
 				ClearPageAnonExclusive(page);
-			trace_android_vh_update_page_mapcount(page, true, false, NULL, &success);
-			if (!success)
-				atomic_inc(&page->_mapcount);
+			atomic_inc(&page->_mapcount);
 		} while (page++, --nr_pages > 0);
+		atomic_add(orig_nr_pages, &folio->_large_mapcount);
 		break;
 	case RMAP_LEVEL_PMD:
 		if (PageAnonExclusive(page)) {
@@ -436,6 +443,7 @@ static __always_inline int __folio_try_dup_anon_rmap(struct folio *folio,
 			ClearPageAnonExclusive(page);
 		}
 		atomic_inc(&folio->_entire_mapcount);
+		atomic_inc(&folio->_large_mapcount);
 		break;
 	}
 	return 0;
@@ -470,8 +478,13 @@ static inline int folio_try_dup_anon_rmap_ptes(struct folio *folio,
 	return __folio_try_dup_anon_rmap(folio, page, nr_pages, src_vma,
 					 RMAP_LEVEL_PTE);
 }
-#define folio_try_dup_anon_rmap_pte(folio, page, vma) \
-	folio_try_dup_anon_rmap_ptes(folio, page, 1, vma)
+
+static __always_inline int folio_try_dup_anon_rmap_pte(struct folio *folio,
+		struct page *page, struct vm_area_struct *src_vma)
+{
+	return __folio_try_dup_anon_rmap(folio, page, 1, src_vma,
+					 RMAP_LEVEL_PTE);
+}
 
 /**
  * folio_try_dup_anon_rmap_pmd - try duplicating a PMD mapping of a page range
@@ -563,7 +576,7 @@ static __always_inline int __folio_try_share_anon_rmap(struct folio *folio,
 	 */
 
 	/* Paired with the memory barrier in try_grab_folio(). */
-	if (IS_ENABLED(CONFIG_HAVE_FAST_GUP))
+	if (IS_ENABLED(CONFIG_HAVE_GUP_FAST))
 		smp_mb();
 
 	if (unlikely(folio_maybe_dma_pinned(folio)))
@@ -574,7 +587,7 @@ static __always_inline int __folio_try_share_anon_rmap(struct folio *folio,
 	 * This is conceptually a smp_wmb() paired with the smp_rmb() in
 	 * gup_must_unshare().
 	 */
-	if (IS_ENABLED(CONFIG_HAVE_FAST_GUP))
+	if (IS_ENABLED(CONFIG_HAVE_GUP_FAST))
 		smp_mb__after_atomic();
 	return 0;
 }
@@ -659,6 +672,11 @@ int make_device_exclusive_range(struct mm_struct *mm, unsigned long start,
 /* Look for migration entries rather than present PTEs */
 #define PVMW_MIGRATION		(1 << 1)
 
+/* Result flags */
+
+/* The page is mapped across page table boundary */
+#define PVMW_PGTABLE_CROSSED	(1 << 16)
+
 struct page_vma_mapped_walk {
 	unsigned long pfn;
 	unsigned long nr_pages;
@@ -670,16 +688,6 @@ struct page_vma_mapped_walk {
 	spinlock_t *ptl;
 	unsigned int flags;
 };
-
-#define DEFINE_PAGE_VMA_WALK(name, _page, _vma, _address, _flags)	\
-	struct page_vma_mapped_walk name = {				\
-		.pfn = page_to_pfn(_page),				\
-		.nr_pages = compound_nr(_page),				\
-		.pgoff = page_to_pgoff(_page),				\
-		.vma = _vma,						\
-		.address = _address,					\
-		.flags = _flags,					\
-	}
 
 #define DEFINE_FOLIO_VMA_WALK(name, _folio, _vma, _address, _flags)	\
 	struct page_vma_mapped_walk name = {				\
@@ -742,9 +750,12 @@ int folio_mkclean(struct folio *);
 int pfn_mkclean_range(unsigned long pfn, unsigned long nr_pages, pgoff_t pgoff,
 		      struct vm_area_struct *vma);
 
-void remove_migration_ptes(struct folio *src, struct folio *dst, bool locked);
+enum rmp_flags {
+	RMP_LOCKED		= 1 << 0,
+	RMP_USE_SHARED_ZEROPAGE	= 1 << 1,
+};
 
-int page_mapped_in_vma(struct page *page, struct vm_area_struct *vma);
+void remove_migration_ptes(struct folio *src, struct folio *dst, int flags);
 
 /*
  * rmap_walk_control: To control rmap traversing for specific needs
@@ -801,8 +812,4 @@ static inline int folio_mkclean(struct folio *folio)
 }
 #endif	/* CONFIG_MMU */
 
-static inline int page_mkclean(struct page *page)
-{
-	return folio_mkclean(page_folio(page));
-}
 #endif	/* _LINUX_RMAP_H */

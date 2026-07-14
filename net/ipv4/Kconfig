@@ -661,7 +661,8 @@ config TCP_CONG_CDG
 
 	  For further details see:
 	    D.A. Hayes and G. Armitage. "Revisiting TCP congestion control using
-	    delay gradients." In Networking 2011. Preprint: http://goo.gl/No3vdg
+	    delay gradients." In Networking 2011. Preprint:
+	    http://caia.swin.edu.au/cv/dahayes/content/networking2011-cdg-preprint.pdf
 
 config TCP_CONG_BBR
 	tristate "BBR TCP"
@@ -677,19 +678,6 @@ config TCP_CONG_BBR
 	  operate with shallow buffers, deep buffers, bufferbloat, policers, or
 	  AQM schemes that do not provide a delay signal. It requires the fq
 	  ("Fair Queue") pacing packet scheduler.
-	  
-config TCP_CONG_BRUTAL
-	tristate "Brutal TCP congestion control"
-	default n
-	help
-	
-	  TCP Brutal is Hysteria's congestion control algorithm ported to TCP, 
-	  as a Linux kernel module. Information about Brutal itself can be found 
-	  in the Hysteria documentation. As an official subproject of Hysteria, 
-	  TCP Brutal is actively maintained to be in sync with the Brutal 
-	  implementation in Hysteria.
-	  For further details see:
-	    https://github.com/apernet/tcp-brutal
 
 choice
 	prompt "Default TCP congestion control"
@@ -727,9 +715,6 @@ choice
 
 	config DEFAULT_BBR
 		bool "BBR" if TCP_CONG_BBR=y
-		
-	config DEFAULT_BRUTAL
-		bool "brutal" if TCP_CONG_BRUTAL=y
 
 	config DEFAULT_RENO
 		bool "Reno"
@@ -754,14 +739,31 @@ config DEFAULT_TCP_CONG
 	default "reno" if DEFAULT_RENO
 	default "dctcp" if DEFAULT_DCTCP
 	default "cdg" if DEFAULT_CDG
-	default "brutal" if DEFAULT_BRUTAL
 	default "bbr" if DEFAULT_BBR
 	default "cubic"
+
+config TCP_SIGPOOL
+	tristate
+
+config TCP_AO
+	bool "TCP: Authentication Option (RFC5925)"
+	select CRYPTO
+	select CRYPTO_LIB_UTILS
+	select TCP_SIGPOOL
+	depends on 64BIT && IPV6 != m # seq-number extension needs WRITE_ONCE(u64)
+	help
+	  TCP-AO specifies the use of stronger Message Authentication Codes (MACs),
+	  protects against replays for long-lived TCP connections, and
+	  provides more details on the association of security with TCP
+	  connections than TCP MD5 (See RFC5925)
+
+	  If unsure, say N.
 
 config TCP_MD5SIG
 	bool "TCP: MD5 Signature Option support (RFC2385)"
 	select CRYPTO
 	select CRYPTO_MD5
+	select TCP_SIGPOOL
 	help
 	  RFC2385 specifies a method of giving MD5 protection to TCP sessions.
 	  Its main (only?) use is to protect BGP sessions between core routers

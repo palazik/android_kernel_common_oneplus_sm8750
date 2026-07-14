@@ -4,6 +4,10 @@ config GKI_HIDDEN_DRM_CONFIGS
 	select DRM_GEM_SHMEM_HELPER if (DRM)
 	select DRM_MIPI_DSI
 	select DRM_TTM if (HAS_IOMEM && DRM)
+	select DRM_BRIDGE_CONNECTOR
+	select DRM_DISPLAY_DP_HELPER
+	select DRM_DISPLAY_HDCP_HELPER
+	select DRM_DISPLAY_HDMI_HELPER
 	select VIDEOMODE_HELPERS
 	select WANT_DEV_COREDUMP
 	select INTERVAL_TREE
@@ -41,11 +45,13 @@ config GKI_HIDDEN_CRYPTO_CONFIGS
 
 config GKI_HIDDEN_SND_CONFIGS
 	bool "Hidden SND configs needed for GKI"
+	select SND_COMPRESS_ACCEL
 	select SND_VMASTER
 	select SND_PCM_ELD
 	select SND_JACK
 	select SND_JACK_INPUT_DEV
 	select SND_INTEL_NHLT if (ACPI)
+	imply SND_HDA
 	help
 	  Dummy config option used to enable hidden SND configs.
 	  These are normally selected implicitly when a module
@@ -89,11 +95,17 @@ config GKI_HIDDEN_GPIO_CONFIGS
 	  These are normally selected implicitly when a module
 	  that relies on it is configured.
 
+# If this file is included on a 32-bit allmodconfig build, the select for
+# IOMMU_IO_PGTABLE_LPAE will trigger an "unmet direct dependency" warning
+# because this option is incompatible with GENERIC_ATOMIC64, which is
+# required by CPU_V6 and implied by ARCH_BCM2835. ARCH_BCM2835 is enabled
+# in the ARM defconfig (multi_v7_defconfig) and implied by many BCM2835
+# drivers, so it is lower impact to disable IOMMU_IO_PGTABLE_LPAE here
 config GKI_HIDDEN_QCOM_CONFIGS
 	bool "Hidden QCOM configs needed for GKI"
 	select QCOM_SMEM_STATE
 	select QCOM_GDSC if (ARCH_QCOM)
-	select IOMMU_IO_PGTABLE_LPAE if (ARCH_QCOM)
+	select IOMMU_IO_PGTABLE_LPAE if (ARCH_QCOM && 64BIT)
 	select INTERCONNECT_QCOM if (ARCH_QCOM)
 	select AUXILIARY_BUS if (ARCH_QCOM)
 
@@ -101,6 +113,17 @@ config GKI_HIDDEN_QCOM_CONFIGS
 	  Dummy config option used to enable hidden QCOM configs.
 	  These are normally selected implicitly when a module
 	  that relies on it is configured.
+
+config GKI_HIDDEN_MTK_CONFIGS
+	bool "Hidden MTK configs needed for GKI"
+	select MTK_TIMER
+	help
+	  This dummy config option is used to enable hidden MediaTek (MTK)
+	  configs required for GKI. Specifically, it selects MTK_TIMER.
+	  These configurations are normally selected implicitly when an
+	  in-tree module or driver that depends on them is enabled.
+	  However, for GKI, modules are often built out-of-tree, meaning
+	  these implicit selections do not occur, necessitating this option.
 
 config GKI_HIDDEN_MEDIA_CONFIGS
 	bool "Hidden Media configs needed for GKI"
@@ -124,6 +147,7 @@ config GKI_HIDDEN_MEDIA_CONFIGS
 config GKI_HIDDEN_VIRTUAL_CONFIGS
 	bool "Hidden Virtual configs needed for GKI"
 	select HVC_DRIVER
+	select DIMLIB
 	help
 	  Dummy config option used to enable hidden virtual device configs.
 	  These are normally selected implicitly when a module
@@ -149,7 +173,7 @@ config GKI_LEGACY_WEXT_ALLCONFIG
 	  out-of-kernel built wireless modules, say N here.
 
 config GKI_HIDDEN_USB_CONFIGS
-	bool "Hiddel USB configurations needed for GKI"
+	bool "Hidden USB configurations needed for GKI"
 	select USB_PHY
 	help
 	  Dummy config option used to enable all USB related hidden configs.
@@ -183,7 +207,6 @@ config GKI_HIDDEN_RPMSG_CONFIGS
 config GKI_HIDDEN_GPU_CONFIGS
 	bool "Hidden GPU configuration needed for GKI"
 	select TRACE_GPU_MEM
-	select TEGRA_HOST1X_CONTEXT_BUS
 	help
 	  Dummy config option used to enable the hidden GPU config.
 	  These are normally selected implicitly when a module
@@ -242,14 +265,10 @@ config GKI_HIDDEN_ETHERNET_CONFIGS
 config GKI_HIDDEN_DMA_CONFIGS
 	bool "Hidden DMA configuration needed for GKI"
 	select ASYNC_TX_ENABLE_CHANNEL_SWITCH
+	select DMA_ENGINE_RAID
 	help
 	  Dummy config option used to enable the hidden DMA configs,
 	  required by various SoC platforms.
-
-config GKI_NET_XFRM_HACKS
-	bool "XFRM changes required by Android"
-	help
-	  Android Networking tests fail without this.
 
 config GKI_DYNAMIC_TASK_STRUCT_SIZE
 	bool "Dynamic task_struct size needed for GKI"
@@ -265,6 +284,11 @@ config GKI_TASK_STRUCT_VENDOR_SIZE_MAX
 	  Allows vendor to choose the maximum size which can be added to
 	  task_struct dynamically when the GKI_DYNAMIC_TASK_STRUCT_SIZE
 	  option is enabled.
+
+config GKI_NET_XFRM_HACKS
+	bool "XFRM changes required by Android"
+	help
+	  Android Networking tests fail without this.
 
 # Atrocities needed for
 # a) building GKI modules in separate tree, or
@@ -286,6 +310,7 @@ config GKI_HACKS_TO_FIX
 	select GKI_HIDDEN_MMC_CONFIGS
 	select GKI_HIDDEN_GPIO_CONFIGS
 	select GKI_HIDDEN_QCOM_CONFIGS
+	select GKI_HIDDEN_MTK_CONFIGS if (ARM64)
 	select GKI_LEGACY_WEXT_ALLCONFIG
 	select GKI_HIDDEN_MEDIA_CONFIGS
 	select GKI_HIDDEN_VIRTUAL_CONFIGS

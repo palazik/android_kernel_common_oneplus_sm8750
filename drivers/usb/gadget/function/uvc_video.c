@@ -12,7 +12,7 @@
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
 #include <linux/usb/video.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include <media/v4l2-dev.h>
 
@@ -360,7 +360,8 @@ uvc_video_complete(struct usb_ep *ep, struct usb_request *req)
 
 	case -EXDEV:
 		uvcg_dbg(&video->uvc->func, "VS request missed xfer.\n");
-		queue->flags |= UVC_QUEUE_DROP_INCOMPLETE;
+		if (req->length != 0)
+			queue->flags |= UVC_QUEUE_DROP_INCOMPLETE;
 		break;
 
 	case -ESHUTDOWN:	/* disconnect from host. */

@@ -288,14 +288,14 @@ struct batadv_frag_table_entry {
 	/** @lock: lock to protect the list of fragments */
 	spinlock_t lock;
 
-	/** @timestamp: time (jiffie) of last received fragment */
+	/** @timestamp: time (jiffy) of last received fragment */
 	unsigned long timestamp;
 
 	/** @seqno: sequence number of the fragments in the list */
 	u16 seqno;
 
 	/** @size: accumulated size of packets in list */
-	size_t size;
+	u16 size;
 
 	/** @total_size: expected size of the assembled packet */
 	u16 total_size;
@@ -446,7 +446,7 @@ struct batadv_orig_node {
 	 * @tt_buff_len: length of the last tt changeset this node received
 	 *  from the orig node
 	 */
-	u16 tt_buff_len;
+	s16 tt_buff_len;
 
 	/** @tt_buff_lock: lock that protects tt_buff and tt_buff_len */
 	spinlock_t tt_buff_lock;
@@ -860,6 +860,70 @@ enum batadv_counters {
 	 */
 	BATADV_CNT_TT_ROAM_ADV_RX,
 
+#ifdef CONFIG_BATMAN_ADV_MCAST
+	/**
+	 * @BATADV_CNT_MCAST_TX: transmitted batman-adv multicast packets
+	 *  counter
+	 */
+	BATADV_CNT_MCAST_TX,
+
+	/**
+	 * @BATADV_CNT_MCAST_TX_BYTES: transmitted batman-adv multicast packets
+	 *  bytes counter
+	 */
+	BATADV_CNT_MCAST_TX_BYTES,
+
+	/**
+	 * @BATADV_CNT_MCAST_TX_LOCAL: counter for multicast packets which
+	 *  were locally encapsulated and transmitted as batman-adv multicast
+	 *  packets
+	 */
+	BATADV_CNT_MCAST_TX_LOCAL,
+
+	/**
+	 * @BATADV_CNT_MCAST_TX_LOCAL_BYTES: bytes counter for multicast packets
+	 *  which were locally encapsulated and transmitted as batman-adv
+	 *  multicast packets
+	 */
+	BATADV_CNT_MCAST_TX_LOCAL_BYTES,
+
+	/**
+	 * @BATADV_CNT_MCAST_RX: received batman-adv multicast packet counter
+	 */
+	BATADV_CNT_MCAST_RX,
+
+	/**
+	 * @BATADV_CNT_MCAST_RX_BYTES: received batman-adv multicast packet
+	 *  bytes counter
+	 */
+	BATADV_CNT_MCAST_RX_BYTES,
+
+	/**
+	 * @BATADV_CNT_MCAST_RX_LOCAL: counter for received batman-adv multicast
+	 *  packets which were forwarded to the local soft interface
+	 */
+	BATADV_CNT_MCAST_RX_LOCAL,
+
+	/**
+	 * @BATADV_CNT_MCAST_RX_LOCAL_BYTES: bytes counter for received
+	 *  batman-adv multicast packets which were forwarded to the local soft
+	 *  interface
+	 */
+	BATADV_CNT_MCAST_RX_LOCAL_BYTES,
+
+	/**
+	 * @BATADV_CNT_MCAST_FWD: counter for received batman-adv multicast
+	 *  packets which were forwarded to other, neighboring nodes
+	 */
+	BATADV_CNT_MCAST_FWD,
+
+	/**
+	 * @BATADV_CNT_MCAST_FWD_BYTES: bytes counter for received batman-adv
+	 *  multicast packets which were forwarded to other, neighboring nodes
+	 */
+	BATADV_CNT_MCAST_FWD_BYTES,
+#endif
+
 #ifdef CONFIG_BATMAN_ADV_DAT
 	/**
 	 * @BATADV_CNT_DAT_GET_TX: transmitted dht GET traffic packet counter
@@ -994,7 +1058,7 @@ struct batadv_priv_tt {
 	 * @last_changeset_len: length of last tt changeset this host has
 	 *  generated
 	 */
-	u16 last_changeset_len;
+	s16 last_changeset_len;
 
 	/**
 	 * @last_changeset_lock: lock protecting last_changeset &
@@ -1277,6 +1341,12 @@ struct batadv_priv_mcast {
 	atomic_t num_want_all_rtr6;
 
 	/**
+	 * @num_no_mc_ptype_capa: counter for number of nodes without the
+	 *  BATADV_MCAST_HAVE_MC_PTYPE_CAPA flag
+	 */
+	atomic_t num_no_mc_ptype_capa;
+
+	/**
 	 * @want_lists_lock: lock for protecting modifications to mcasts
 	 *  want_all_{unsnoopables,ipv4,ipv6}_list (traversals are rcu-locked)
 	 */
@@ -1388,14 +1458,11 @@ struct batadv_tp_vars {
 	/** @role: receiver/sender modi */
 	enum batadv_tp_meter_role role;
 
-	/**
-	 * @send_result: 0 when sending is ongoing and otherwise
-	 * enum batadv_tp_meter_reason
-	 */
-	atomic_t send_result;
+	/** @sending: sending binary semaphore: 1 if sending, 0 is not */
+	atomic_t sending;
 
-	/** @receiving: receiving binary semaphore: 1 if receiving, 0 is not */
-	atomic_t receiving;
+	/** @reason: reason for a stopped session */
+	enum batadv_tp_meter_reason reason;
 
 	/** @finish_work: work item for the finishing procedure */
 	struct delayed_work finish_work;

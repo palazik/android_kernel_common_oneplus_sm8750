@@ -6,19 +6,39 @@
 #include <asm/kvm_pgtable.h>
 #include <linux/android_kabi.h>
 #include <linux/export.h>
-#include <linux/android_kabi.h>
 
 typedef void (*dyn_hcall_t)(struct user_pt_regs *);
 struct kvm_hyp_iommu;
 struct iommu_iotlb_gather;
 struct kvm_hyp_iommu_domain;
-struct kvm_iommu_paddr_cache;
+struct pkvm_device;
 
-#ifdef CONFIG_MODULES
+#if defined(CONFIG_MODULES) && defined(CONFIG_KVM)
 enum pkvm_psci_notification {
 	PKVM_PSCI_CPU_SUSPEND,
 	PKVM_PSCI_SYSTEM_SUSPEND,
 	PKVM_PSCI_CPU_ENTRY,
+};
+
+struct pkvm_sglist_page {
+	u64	pfn : 40;
+	u8	order;
+} __packed;
+
+/**
+ * struct pkvm_module_trng_ops - pKVM TRNG implementation modules callbacks
+ * @trng_uuid:	  Implementation's UUID advertised on TRNG_GET_UUID call
+ * @trng_rnd64:	  TRNG implementation call for generating entropy for TRNG_RND64
+ *                call. The implementation is required to output specified
+ *                number of bits of entropy. The output array will stored in the
+ *                registers in the following order: x3, x2, x1.
+ */
+struct pkvm_module_trng_ops {
+	const uuid_t *trng_uuid;
+	int (*trng_rnd64)(u64 *entropy, int bits);
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
 };
 
 /**
@@ -36,6 +56,13 @@ enum pkvm_psci_notification {
  * @map_module_page:		Used in conjunction with @alloc_module_va. When
  *				@is_protected is not set, the page is also
  *				unmapped from the host stage-2.
+ * @map_module_pages:		Used in conjunction with @alloc_module_va. When
+ *				@is_protected is not set, the page is also
+ *				unmapped from the host stage-2.
+ * @unmap_module_pages:		Unmap pages previously allocated with
+ *				@map_module_pages. Does not restore the host
+ *				stage-2 mapping, use @hyp_donate_host for that
+ *				purpose.
  * @register_serial_driver:	Register a driver for a serial interface. The
  *				framework only needs a single callback
  *				@hyp_putc_cb which is expected to print a single
@@ -52,6 +79,14 @@ enum pkvm_psci_notification {
  *				new mapping is visible.
  * @fixmap_unmap:		Unmap a page from the hypervisor fixmap. This
  * 				call is required between each @fixmap_map().
+ * @fixblock_map:		Map a PMD-size large page into a CPU-shared
+ *				fixmap. This can be used to replace and speed-up
+ *				a set of @fixmap_map. @fixblock_unmap must be
+ *				called between each mappings to do cache
+ *				maintenance and ensure the new mapping is visible.
+ * @fixblock_unmap:		Unmap a PMD-size large page from the hypervisor
+ *				fixmap. This call is required between each
+ *				@fixblock_map.
  * @linear_map_early:		Map a large portion of memory into the
  *				hypervisor linear VA space. This is intended to
  *				be used only for module bootstrap and must be
@@ -83,24 +118,29 @@ enum pkvm_psci_notification {
  *				allows to apply this prot on a range of
  *				contiguous memory.
  * @host_stage2_enable_lazy_pte:
- * 				Unmap a range of memory from the host stage-2,
- * 				leaving the pages host ownership intact. The
- * 				pages will be remapped lazily (subject to the
- * 				usual ownership checks) in response to a
- * 				faulting access from the host.
+ *				DEPRECATED
+ *				Unmap a range of memory from the host stage-2,
+ *				leaving the pages host ownership intact. The
+ *				pages will be remapped lazily (subject to the
+ *				usual ownership checks) in response to a
+ *				faulting access from the host.
  * @host_stage2_disable_lazy_pte:
- * 				This is the opposite function of
- * 				host_stage2_enable_lazy_pte. Must be called once
- * 				the module is done with the region.
+ *				DEPRECATED
+ *				This is the opposite function of
+ *				host_stage2_enable_lazy_pte. Must be called once
+ *				the module is done with the region.
  * @host_stage2_get_leaf:	Query the host's stage2 page-table entry for
  *				the page @phys.
  * @register_host_smc_handler:	@cb is called whenever the host issues an SMC
- *				pKVM couldn't handle. If @cb returns false, the
- *				SMC will be forwarded to EL3.
- * @register_guest_smc_handler:	@cb is called whenever a guest identified by the
- *				pkvm_handle issues an SMC which pKVM doesn't
- *				handle. If @cb returns false, the control is
- *				given back to the host kernel to handle the exit.
+ *				pKVM couldn't handle.
+ *				Up-to 16 handlers can be registered. The handler
+ *				order depends on the registration order. If no
+ *				handler return True, the SMC is forwarded to
+ *				EL3.
+ * @register_guest_smc_handler: @cb is called when guest identified by the
+ *				pkvm_handle issues an SMC that pKVM couldn't
+ *				handle. If @cb returns false, then unsupported
+ *				operation error is returned back to the guest.
  * @register_default_trap_handler:
  *				@cb is called whenever EL2 traps EL1 and pKVM
  *				has not handled it. If @cb returns false, the
@@ -126,6 +166,9 @@ enum pkvm_psci_notification {
  *				full control is given to the hypervisor.
  * @host_donate_hyp_prot:	As host_donate_hyp_prot, but this variant sets
  *				the prot of the hyp.
+ * @host_donate_sglist_hyp:	Similar to host_donate_hyp but take an array of PFNs
+ *				(kvm_sglist_page) as an argument. This intends to
+ *				batch IOMMU updates.
  * @hyp_donate_host:		The page @pfn whom control has previously been
  *				given to the hypervisor (@host_donate_hyp) is
  *				given back to the host.
@@ -153,26 +196,51 @@ enum pkvm_psci_notification {
  * @hyp_free:			Free memory allocated  from hyp_alloc().
  * @iommu_donate_pages:		Allocate memory from IOMMU pool.
  * @iommu_reclaim_pages:	Reclaim memory from iommu_donate_pages()
- * @iommu_request:		Fill a request that is returned from the entry HVC (see hyp-main.c).
+ * @request_hyp_alloc:		Request an alloc request based on current IOMMU context
  * @iommu_init_device:		Initialize common IOMMU fields.
  * @udelay:			Delay in us.
  * @hyp_alloc_missing_donations:
-				Missing donations if allocator returns NULL
+ *				Missing donations if allocator returns NULL
+ * @iommu_iotlb_gather_add_page:
+ *				Add an IOVA range to an iommu_iotlb_gather.
+ * @pkvm_unuse_dma:		Decrement the refcount for pages used for DMA,
+ * 				this is typically called from the module after a
+ * 				successful unmap() operation, so the hypervisor
+ * 				can track the page state.
+ * @iommu_snapshot_host_stage2: Snapshot the host stage-2 CPU page table in to an
+ * 				IOMMU domain.
  * @__list_add_valid_or_report: Needed if the code uses linked lists.
  * @__list_del_entry_valid_or_report:
 				Needed if the code uses linked lists.
- * @iommu_iotlb_gather_add_page: Add a page to the iotlb_gather druing unmap for the IOMMU.
  * @iommu_donate_pages_atomic:	Allocate memory from IOMMU identity pool.
  * @iommu_reclaim_pages_atomic:	Reclaim memory from iommu_donate_pages_atomic()
  * @hyp_smp_processor_id:	Current CPU id
- * @guest_stage2_pa:		Look up and return the PA (@phys) mapped into
- *				the specified VM (@handle) at the specified
- *				intermediate physical address (@ipa). If there
- *				is no mapping, or if it is a block mapping,
- *				then -EINVAL will be returned. Note that no
- *				lock or pin is held on the returned PA; the
- *				only guarantee is that @handle:@ipa -> @phys
- *				at some point during the call to this function.
+ * @device_register_reset:	Register a reset callback for devices that is called
+ *				before/after devices are assigned. Only one callback
+ *				can be registered per device.
+ *				Devices are identified by the base address of the MMIO
+ *				as defined in the device tree.
+ *				Reset is expected to clear any state/secrets on the
+ *				device and put it in quiescent state, where it can't
+ *				trigger any DMA.
+ *				If reset fails at device assignment to guest, the
+ *				device won't be assigned.
+ *				Or if it fails on the guest teardown path, that would
+ *				panic to avoid leaking any information.
+ *				Direction of assignment can be deduced from pkvm_device::ctxt
+ *				where NULL means host to guest and vice versa.
+ * @device_register_power_lock: Register a power lock callback for a device. It
+ *				is expected from this callback to protect or
+ *				unprotect (according to the @lock value) the
+ *				device against power cycle.
+ *				Similar to @device_register_reset, the device is
+ *				identified by the base address of the MMIO as
+ *				defined in the device-tree. @cookie may be NULL
+ *				but it has to match the one in @device_register_reset.
+ * @register_guest_trng_ops:    Register a ARM SMCCC TRNG alternative implementation
+ *				for pVMs. The @ops.trng_uuid is used to advertise the
+ *				identity of TRNG implementation. @ops.trng_rnd64 is used
+ *				to generate entropy bits to guest.
  */
 struct pkvm_module_ops {
 	int (*create_private_mapping)(phys_addr_t phys, size_t size,
@@ -186,6 +254,8 @@ struct pkvm_module_ops {
 	void (*putx64)(u64 x);
 	void *(*fixmap_map)(phys_addr_t phys);
 	void (*fixmap_unmap)(void);
+	void *(*fixblock_map)(phys_addr_t phys);
+	void (*fixblock_unmap)(void);
 	void *(*linear_map_early)(phys_addr_t phys, size_t size, enum kvm_pgtable_prot prot);
 	void (*linear_unmap_early)(void *addr, size_t size);
 	void (*flush_dcache_to_poc)(void *addr, size_t size);
@@ -193,8 +263,13 @@ struct pkvm_module_ops {
 	void (*update_hfgwtr_el2)(unsigned long set_mask, unsigned long clear_mask);
 	int (*register_host_perm_fault_handler)(int (*cb)(struct user_pt_regs *regs, u64 esr, u64 addr));
 	int (*host_stage2_mod_prot)(u64 pfn, enum kvm_pgtable_prot prot, u64 nr_pages, bool update_iommu);
-	int (*host_stage2_get_leaf)(phys_addr_t phys, kvm_pte_t *ptep, u32 *level);
+	int (*host_stage2_get_leaf)(phys_addr_t phys, kvm_pte_t *ptep, s8 *level);
+	int (*host_stage2_enable_lazy_pte)(u64 addr, u64 nr_pages);
+	int (*host_stage2_disable_lazy_pte)(u64 addr, u64 nr_pages);
 	int (*register_host_smc_handler)(bool (*cb)(struct user_pt_regs *));
+	int (*register_guest_smc_handler)(bool (*cb)(struct arm_smccc_1_2_regs *regs,
+						     struct arm_smccc_1_2_regs *res,
+						     pkvm_handle_t handle));
 	int (*register_default_trap_handler)(bool (*cb)(struct user_pt_regs *));
 	int (*register_illegal_abt_notifier)(void (*cb)(struct user_pt_regs *));
 	int (*register_psci_notifier)(void (*cb)(enum pkvm_psci_notification, struct user_pt_regs *));
@@ -202,6 +277,7 @@ struct pkvm_module_ops {
 	int (*register_unmask_serror)(bool (*unmask)(void), void (*mask)(void));
 	int (*host_donate_hyp)(u64 pfn, u64 nr_pages, bool accept_mmio);
 	int (*host_donate_hyp_prot)(u64 pfn, u64 nr_pages, bool accept_mmio, enum kvm_pgtable_prot prot);
+	int (*host_donate_sglist_hyp)(struct pkvm_sglist_page *sglist, size_t nr_pages);
 	int (*hyp_donate_host)(u64 pfn, u64 nr_pages);
 	int (*host_share_hyp)(u64 pfn);
 	int (*host_unshare_hyp)(u64 pfn);
@@ -212,40 +288,41 @@ struct pkvm_module_ops {
 	phys_addr_t (*hyp_pa)(void *x);
 	void* (*hyp_va)(phys_addr_t phys);
 	unsigned long (*kern_hyp_va)(unsigned long x);
+	void* (*tracing_reserve_entry)(unsigned long length);
+	void (*tracing_commit_entry)(void);
+	void (*tracing_mod_hyp_printk)(u8 fmt_id, u64 a, u64 b, u64 c, u64 d);
 	void * (*hyp_alloc)(size_t size);
 	int (*hyp_alloc_errno)(void);
 	void (*hyp_free)(void *addr);
-	void * (*iommu_donate_pages)(u8 order, bool request);
+	u8 (*hyp_alloc_missing_donations)(void);
+	void * (*iommu_donate_pages)(u8 order, int flags);
 	void (*iommu_reclaim_pages)(void *p, u8 order);
-	int (*iommu_request)(struct kvm_hyp_req *req);
 	int (*iommu_init_device)(struct kvm_hyp_iommu *iommu);
 	void (*udelay)(unsigned long usecs);
-	u8 (*hyp_alloc_missing_donations)(void);
+	void (*iommu_iotlb_gather_add_page)(struct kvm_hyp_iommu_domain *domain,
+					    struct iommu_iotlb_gather *gather,
+					    unsigned long iova,
+					    size_t size);
+	int (*pkvm_unuse_dma)(phys_addr_t phys_addr, size_t size);
 #ifdef CONFIG_LIST_HARDENED
 	/* These 2 functions change calling convention based on CONFIG_DEBUG_LIST. */
 	typeof(__list_add_valid_or_report) *list_add_valid_or_report;
 	typeof(__list_del_entry_valid_or_report) *list_del_entry_valid_or_report;
 #endif
-	void (*iommu_iotlb_gather_add_page)(struct kvm_hyp_iommu_domain *domain,
-					    struct iommu_iotlb_gather *gather,
-					    unsigned long iova, size_t size);
-	int (*register_hyp_event_ids)(unsigned long start, unsigned long end);
-	void* (*tracing_reserve_entry)(unsigned long length);
-	void (*tracing_commit_entry)(void);
+	int (*iommu_snapshot_host_stage2)(struct kvm_hyp_iommu_domain *domain);
 	void * (*iommu_donate_pages_atomic)(u8 order);
 	void (*iommu_reclaim_pages_atomic)(void *p, u8 order);
-	int (*iommu_snapshot_host_stage2)(struct kvm_hyp_iommu_domain *domain);
 	int (*hyp_smp_processor_id)(void);
-	ANDROID_KABI_USE(1, void (*iommu_flush_unmap_cache)(struct kvm_iommu_paddr_cache *cache));
-	ANDROID_KABI_USE(2, int (*host_stage2_enable_lazy_pte)(u64 addr, u64 nr_pages));
-	ANDROID_KABI_USE(3, int (*host_stage2_disable_lazy_pte)(u64 addr, u64 nr_pages));
-	ANDROID_KABI_USE(4, int (*register_guest_smc_handler)(bool (*cb)(
-						     struct arm_smccc_1_2_regs *,
-						     struct arm_smccc_res *res,
-						     pkvm_handle_t handle),
-					  pkvm_handle_t handle));
-	ANDROID_KABI_USE(5, int (*guest_stage2_pa)(pkvm_handle_t handle,
-						   u64 ipa, phys_addr_t *phys));
+	int (*device_register_reset)(u64 phys, void *cookie,
+				     int (*cb)(void *cookie, bool host_to_guest));
+	ANDROID_KABI_USE(1, int (*register_guest_trng_ops)(
+				    const struct pkvm_module_trng_ops *ops));
+	ANDROID_KABI_USE(2, int (*map_module_pages)(u64 pfn, void *va, u64 nr_pages,
+				    enum kvm_pgtable_prot prot, bool is_protected));
+	ANDROID_KABI_USE(3, int (*unmap_module_pages)(u64 pfn, void *va, u64 nr_pages));
+	ANDROID_KABI_USE(4, int (*request_hyp_alloc)(void));
+	ANDROID_KABI_USE(5, int (*device_register_power_lock)(u64 phys, void *cookie,
+					     int(*cb)(void *cookie, bool lock)));
 	ANDROID_KABI_RESERVE(6);
 	ANDROID_KABI_RESERVE(7);
 	ANDROID_KABI_RESERVE(8);
@@ -280,6 +357,17 @@ int __pkvm_load_el2_module(struct module *this, unsigned long *token);
 int __pkvm_register_el2_call(unsigned long hfn_hyp_va);
 
 unsigned long pkvm_el2_mod_kern_va(unsigned long addr);
+
+static inline unsigned long __pkvm_el2_mod_va(struct pkvm_el2_module *mod, void *kern_va)
+{
+	unsigned long offset = (unsigned long)(kern_va - mod->sections.start);
+
+	WARN_ON(kern_va < mod->sections.start || kern_va >= mod->sections.end);
+
+	return (unsigned long)mod->hyp_va + offset;
+}
+
+void pkvm_el2_mod_frob_sections(Elf_Ehdr *ehdr, Elf_Shdr *sechdrs, char *secstrings);
 #else
 static inline int __pkvm_load_el2_module(struct module *this,
 					 unsigned long *token)
@@ -296,23 +384,24 @@ static inline unsigned long pkvm_el2_mod_kern_va(unsigned long addr)
 {
 	return 0;
 }
-#endif /* CONFIG_MODULES */
+
+static inline unsigned long __pkvm_el2_mod_va(void *mod, void *kern_va)
+{
+	WARN_ON(1);
+	return 0;
+}
+#endif /* CONFIG_MODULES && KVM */
 
 int pkvm_load_early_modules(void);
 
 #ifdef MODULE
+
+/* TODO: With the introduction of pkvm_el2_module::hyp_va token is redundant */
+
 /*
  * Convert an EL2 module addr from the kernel VA to the hyp VA
  */
-#define pkvm_el2_mod_va(kern_va, token)					\
-({									\
-	unsigned long hyp_mod_kern_va =				\
-		(unsigned long)THIS_MODULE->arch.hyp.sections.start;	\
-	unsigned long offset;						\
-									\
-	offset = (unsigned long)kern_va - hyp_mod_kern_va;		\
-	token + offset;							\
-})
+#define pkvm_el2_mod_va(kern_va, token) __pkvm_el2_mod_va(&THIS_MODULE->arch.hyp, kern_va)
 
 #define pkvm_load_el2_module(init_fn, token)				\
 ({									\

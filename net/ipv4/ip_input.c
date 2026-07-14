@@ -582,9 +582,13 @@ static void ip_sublist_rcv_finish(struct list_head *head)
 }
 
 static struct sk_buff *ip_extract_route_hint(const struct net *net,
-					     struct sk_buff *skb, int rt_type)
+					     struct sk_buff *skb)
 {
-	if (fib4_has_custom_rules(net) || rt_type == RTN_BROADCAST ||
+	const struct iphdr *iph = ip_hdr(skb);
+
+	if (fib4_has_custom_rules(net) ||
+	    ipv4_is_lbcast(iph->daddr) ||
+	    ipv4_is_zeronet(iph->daddr) ||
 	    IPCB(skb)->flags & IPSKB_MULTIPATH)
 		return NULL;
 
@@ -596,9 +600,8 @@ static void ip_list_rcv_finish(struct net *net, struct sock *sk,
 {
 	struct sk_buff *skb, *next, *hint = NULL;
 	struct dst_entry *curr_dst = NULL;
-	struct list_head sublist;
+	LIST_HEAD(sublist);
 
-	INIT_LIST_HEAD(&sublist);
 	list_for_each_entry_safe(skb, next, head, list) {
 		struct net_device *dev = skb->dev;
 		struct dst_entry *dst;
@@ -615,8 +618,7 @@ static void ip_list_rcv_finish(struct net *net, struct sock *sk,
 
 		dst = skb_dst(skb);
 		if (curr_dst != dst) {
-			hint = ip_extract_route_hint(net, skb,
-					       ((struct rtable *)dst)->rt_type);
+			hint = ip_extract_route_hint(net, skb);
 
 			/* dispatch old sublist */
 			if (!list_empty(&sublist))
@@ -646,9 +648,8 @@ void ip_list_rcv(struct list_head *head, struct packet_type *pt,
 	struct net_device *curr_dev = NULL;
 	struct net *curr_net = NULL;
 	struct sk_buff *skb, *next;
-	struct list_head sublist;
+	LIST_HEAD(sublist);
 
-	INIT_LIST_HEAD(&sublist);
 	list_for_each_entry_safe(skb, next, head, list) {
 		struct net_device *dev = skb->dev;
 		struct net *net = dev_net(dev);

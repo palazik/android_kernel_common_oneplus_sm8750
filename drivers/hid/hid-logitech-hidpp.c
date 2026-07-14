@@ -23,10 +23,11 @@
 #include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <linux/fixp-arith.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include "usbhid/usbhid.h"
 #include "hid-ids.h"
 
+MODULE_DESCRIPTION("Support for Logitech devices relying on the HID++ specification");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Benjamin Tissoires <benjamin.tissoires@gmail.com>");
 MODULE_AUTHOR("Nestor Lopez Casado <nlopezcasad@logitech.com>");
@@ -69,12 +70,12 @@ MODULE_PARM_DESC(disable_tap_to_click,
 #define HIDPP_QUIRK_WTP_PHYSICAL_BUTTONS	BIT(22)
 #define HIDPP_QUIRK_DELAYED_INIT		BIT(23)
 #define HIDPP_QUIRK_FORCE_OUTPUT_REPORTS	BIT(24)
-#define HIDPP_QUIRK_UNIFYING			BIT(25)
-#define HIDPP_QUIRK_HIDPP_WHEELS		BIT(26)
-#define HIDPP_QUIRK_HIDPP_EXTRA_MOUSE_BTNS	BIT(27)
-#define HIDPP_QUIRK_HIDPP_CONSUMER_VENDOR_KEYS	BIT(28)
-#define HIDPP_QUIRK_HI_RES_SCROLL_1P0		BIT(29)
-#define HIDPP_QUIRK_WIRELESS_STATUS		BIT(30)
+#define HIDPP_QUIRK_HIDPP_WHEELS		BIT(25)
+#define HIDPP_QUIRK_HIDPP_EXTRA_MOUSE_BTNS	BIT(26)
+#define HIDPP_QUIRK_HIDPP_CONSUMER_VENDOR_KEYS	BIT(27)
+#define HIDPP_QUIRK_HI_RES_SCROLL_1P0		BIT(28)
+#define HIDPP_QUIRK_WIRELESS_STATUS		BIT(29)
+#define HIDPP_QUIRK_RESET_HI_RES_SCROLL		BIT(30)
 
 /* These are just aliases for now */
 #define HIDPP_QUIRK_KBD_SCROLL_WHEEL HIDPP_QUIRK_HIDPP_WHEELS
@@ -193,8 +194,8 @@ struct hidpp_device {
 	void *private_data;
 
 	struct work_struct work;
+	struct work_struct reset_hi_res_work;
 	struct kfifo delayed_work_fifo;
-	atomic_t connected;
 	struct input_dev *delayed_input;
 
 	unsigned long quirks;
@@ -205,6 +206,8 @@ struct hidpp_device {
 	struct hidpp_scroll_counter vertical_wheel_counter;
 
 	u8 wireless_feature_index;
+
+	bool connected_once;
 };
 
 /* HID++ 1.0 error codes */
@@ -234,8 +237,6 @@ struct hidpp_device {
 #define HIDPP20_ERROR_BUSY			0x08
 #define HIDPP20_ERROR_UNSUPPORTED		0x09
 #define HIDPP20_ERROR				0xff
-
-static void hidpp_connect_event(struct hidpp_device *hidpp_dev);
 
 static int __hidpp_send_report(struct hid_device *hdev,
 				struct hidpp_report *hidpp_report)
@@ -453,13 +454,6 @@ static int hidpp_send_rap_command_sync(struct hidpp_device *hidpp_dev,
 	ret = hidpp_send_message_sync(hidpp_dev, message, response);
 	kfree(message);
 	return ret;
-}
-
-static void delayed_work_cb(struct work_struct *work)
-{
-	struct hidpp_device *hidpp = container_of(work, struct hidpp_device,
-							work);
-	hidpp_connect_event(hidpp);
 }
 
 static inline bool hidpp_match_answer(struct hidpp_report *question,
@@ -1004,8 +998,13 @@ static int hidpp_root_get_protocol_version(struct hidpp_device *hidpp)
 	hidpp->protocol_minor = response.rap.params[1];
 
 print_version:
-	hid_info(hidpp->hid_dev, "HID++ %u.%u device connected.\n",
-		 hidpp->protocol_major, hidpp->protocol_minor);
+	if (!hidpp->connected_once) {
+		hid_info(hidpp->hid_dev, "HID++ %u.%u device connected.\n",
+			 hidpp->protocol_major, hidpp->protocol_minor);
+		hidpp->connected_once = true;
+	} else
+		hid_dbg(hidpp->hid_dev, "HID++ %u.%u device connected.\n",
+			 hidpp->protocol_major, hidpp->protocol_minor);
 	return 0;
 }
 
@@ -3146,7 +3145,7 @@ static int wtp_allocate(struct hid_device *hdev, const struct hid_device_id *id)
 	return 0;
 };
 
-static int wtp_connect(struct hid_device *hdev, bool connected)
+static int wtp_connect(struct hid_device *hdev)
 {
 	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
 	struct wtp_data *wd = hidpp->private_data;
@@ -3208,7 +3207,7 @@ static const u8 m560_config_parameter[] = {0x00, 0xaf, 0x03};
 #define M560_SUB_ID			0x0a
 #define M560_BUTTON_MODE_REGISTER	0x35
 
-static int m560_send_config_command(struct hid_device *hdev, bool connected)
+static int m560_send_config_command(struct hid_device *hdev)
 {
 	struct hidpp_report response;
 	struct hidpp_device *hidpp_dev;
@@ -3304,13 +3303,13 @@ static int m560_raw_event(struct hid_device *hdev, u8 *data, int size)
 					 120);
 		}
 
-		v = hid_snto32(hid_field_extract(hdev, data+3, 0, 12), 12);
+		v = sign_extend32(hid_field_extract(hdev, data + 3, 0, 12), 11);
 		input_report_rel(hidpp->input, REL_X, v);
 
-		v = hid_snto32(hid_field_extract(hdev, data+3, 12, 12), 12);
+		v = sign_extend32(hid_field_extract(hdev, data + 3, 12, 12), 11);
 		input_report_rel(hidpp->input, REL_Y, v);
 
-		v = hid_snto32(data[6], 8);
+		v = sign_extend32(data[6], 7);
 		if (v != 0)
 			hidpp_scroll_counter_handle_scroll(hidpp->input,
 					&hidpp->vertical_wheel_counter, v);
@@ -3403,7 +3402,7 @@ static int k400_allocate(struct hid_device *hdev)
 	return 0;
 };
 
-static int k400_connect(struct hid_device *hdev, bool connected)
+static int k400_connect(struct hid_device *hdev)
 {
 	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
 
@@ -3691,8 +3690,8 @@ static int hidpp10_consumer_keys_raw_event(struct hidpp_device *hidpp,
 	consumer_report[0] = 0x03;
 	memcpy(&consumer_report[1], &data[3], 4);
 	/* We are called from atomic context */
-	hid_report_raw_event(hidpp->hid_dev, HID_INPUT_REPORT,
-			     consumer_report, 5, 1);
+	__hid_report_raw_event(hidpp->hid_dev, HID_INPUT_REPORT,
+			       consumer_report, sizeof(consumer_report), 5, 1);
 
 	return 1;
 }
@@ -3775,8 +3774,8 @@ static int hidpp_initialize_hires_scroll(struct hidpp_device *hidpp)
 /* Generic HID++ devices                                                      */
 /* -------------------------------------------------------------------------- */
 
-static u8 *hidpp_report_fixup(struct hid_device *hdev, u8 *rdesc,
-			      unsigned int *rsize)
+static const u8 *hidpp_report_fixup(struct hid_device *hdev, u8 *rdesc,
+				    unsigned int *rsize)
 {
 	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
 
@@ -3872,6 +3871,7 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 	struct hidpp_report *answer = hidpp->send_receive_buf;
 	struct hidpp_report *report = (struct hidpp_report *)data;
 	int ret;
+	int last_online;
 
 	/*
 	 * If the mutex is locked then we have a pending answer from a
@@ -3898,8 +3898,6 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 	}
 
 	if (unlikely(hidpp_report_is_connect_event(hidpp, report))) {
-		atomic_set(&hidpp->connected,
-				!(report->rap.params[0] & (1 << 6)));
 		if (schedule_work(&hidpp->work) == 0)
 			dbg_hid("%s: connect event already queued\n", __func__);
 		return 1;
@@ -3915,6 +3913,7 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 			"See: https://gitlab.freedesktop.org/jwrdegoede/logitech-27mhz-keyboard-encryption-setup/\n");
 	}
 
+	last_online = hidpp->battery.online;
 	if (hidpp->capabilities & HIDPP_CAPABILITY_HIDPP20_BATTERY) {
 		ret = hidpp20_battery_event_1000(hidpp, data, size);
 		if (ret != 0)
@@ -3937,6 +3936,11 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 		ret = hidpp10_battery_event(hidpp, data, size);
 		if (ret != 0)
 			return ret;
+	}
+
+	if (hidpp->quirks & HIDPP_QUIRK_RESET_HI_RES_SCROLL) {
+		if (last_online == 0 && hidpp->battery.online == 1)
+			schedule_work(&hidpp->reset_hi_res_work);
 	}
 
 	if (hidpp->quirks & HIDPP_QUIRK_HIDPP_WHEELS) {
@@ -4135,24 +4139,22 @@ static int hidpp_initialize_battery(struct hidpp_device *hidpp)
 	return ret;
 }
 
-static void hidpp_overwrite_name(struct hid_device *hdev)
+/* Get name + serial for USB and Bluetooth HID++ devices */
+static void hidpp_non_unifying_init(struct hidpp_device *hidpp)
 {
-	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
+	struct hid_device *hdev = hidpp->hid_dev;
 	char *name;
 
-	if (hidpp->protocol_major < 2)
-		return;
+	/* Bluetooth devices already have their serialnr set */
+	if (hid_is_usb(hdev))
+		hidpp_serial_init(hidpp);
 
 	name = hidpp_get_device_name(hidpp);
-
-	if (!name) {
-		hid_err(hdev, "unable to retrieve the name of the device");
-	} else {
+	if (name) {
 		dbg_hid("HID++: Got name: %s\n", name);
 		snprintf(hdev->name, sizeof(hdev->name), "%s", name);
+		kfree(name);
 	}
-
-	kfree(name);
 }
 
 static int hidpp_input_open(struct input_dev *dev)
@@ -4193,15 +4195,18 @@ static struct input_dev *hidpp_allocate_input(struct hid_device *hdev)
 	return input_dev;
 }
 
-static void hidpp_connect_event(struct hidpp_device *hidpp)
+static void hidpp_connect_event(struct work_struct *work)
 {
+	struct hidpp_device *hidpp = container_of(work, struct hidpp_device, work);
 	struct hid_device *hdev = hidpp->hid_dev;
-	int ret = 0;
-	bool connected = atomic_read(&hidpp->connected);
 	struct input_dev *input;
 	char *name, *devm_name;
+	int ret;
 
-	if (!connected) {
+	/* Get device version to check if it is connected */
+	ret = hidpp_root_get_protocol_version(hidpp);
+	if (ret) {
+		hid_dbg(hidpp->hid_dev, "Disconnected\n");
 		if (hidpp->battery.ps) {
 			hidpp->battery.online = false;
 			hidpp->battery.status = POWER_SUPPLY_STATUS_UNKNOWN;
@@ -4212,15 +4217,15 @@ static void hidpp_connect_event(struct hidpp_device *hidpp)
 	}
 
 	if (hidpp->quirks & HIDPP_QUIRK_CLASS_WTP) {
-		ret = wtp_connect(hdev, connected);
+		ret = wtp_connect(hdev);
 		if (ret)
 			return;
 	} else if (hidpp->quirks & HIDPP_QUIRK_CLASS_M560) {
-		ret = m560_send_config_command(hdev, connected);
+		ret = m560_send_config_command(hdev);
 		if (ret)
 			return;
 	} else if (hidpp->quirks & HIDPP_QUIRK_CLASS_K400) {
-		ret = k400_connect(hdev, connected);
+		ret = k400_connect(hdev);
 		if (ret)
 			return;
 	}
@@ -4241,16 +4246,6 @@ static void hidpp_connect_event(struct hidpp_device *hidpp)
 		ret = hidpp10_consumer_keys_connect(hidpp);
 		if (ret)
 			return;
-	}
-
-	/* the device is already connected, we can ask for its name and
-	 * protocol */
-	if (!hidpp->protocol_major) {
-		ret = hidpp_root_get_protocol_version(hidpp);
-		if (ret) {
-			hid_err(hdev, "Can not get the protocol version.\n");
-			return;
-		}
 	}
 
 	if (hidpp->protocol_major >= 2) {
@@ -4319,6 +4314,13 @@ static void hidpp_connect_event(struct hidpp_device *hidpp)
 	}
 
 	hidpp->delayed_input = input;
+}
+
+static void hidpp_reset_hi_res_handler(struct work_struct *work)
+{
+	struct hidpp_device *hidpp = container_of(work, struct hidpp_device, reset_hi_res_work);
+
+	hi_res_scroll_enable(hidpp);
 }
 
 static DEVICE_ATTR(builtin_power_supply, 0000, NULL, NULL);
@@ -4402,9 +4404,7 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	struct hidpp_device *hidpp;
 	int ret;
-	bool connected;
 	unsigned int connect_mask = HID_CONNECT_DEFAULT;
-	struct hidpp_ff_private_data data;
 
 	/* report_fixup needs drvdata to be set before we call hid_parse */
 	hidpp = devm_kzalloc(&hdev->dev, sizeof(*hidpp), GFP_KERNEL);
@@ -4433,9 +4433,6 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return hid_hw_start(hdev, HID_CONNECT_DEFAULT);
 	}
 
-	if (id->group == HID_GROUP_LOGITECH_DJ_DEVICE)
-		hidpp->quirks |= HIDPP_QUIRK_UNIFYING;
-
 	if (id->group == HID_GROUP_LOGITECH_27MHZ_DEVICE &&
 	    hidpp_application_equals(hdev, HID_GD_MOUSE))
 		hidpp->quirks |= HIDPP_QUIRK_HIDPP_WHEELS |
@@ -4455,7 +4452,8 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 			return ret;
 	}
 
-	INIT_WORK(&hidpp->work, delayed_work_cb);
+	INIT_WORK(&hidpp->work, hidpp_connect_event);
+	INIT_WORK(&hidpp->reset_hi_res_work, hidpp_reset_hi_res_handler);
 	mutex_init(&hidpp->send_mutex);
 	init_waitqueue_head(&hidpp->wait);
 
@@ -4487,48 +4485,35 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	/* Allow incoming packets */
 	hid_device_io_start(hdev);
 
-	if (hidpp->quirks & HIDPP_QUIRK_UNIFYING)
+	/* Get name + serial, store in hdev->name + hdev->uniq */
+	if (id->group == HID_GROUP_LOGITECH_DJ_DEVICE)
 		hidpp_unifying_init(hidpp);
-	else if (hid_is_usb(hidpp->hid_dev))
-		hidpp_serial_init(hidpp);
-
-	connected = hidpp_root_get_protocol_version(hidpp) == 0;
-	atomic_set(&hidpp->connected, connected);
-	if (!(hidpp->quirks & HIDPP_QUIRK_UNIFYING)) {
-		if (!connected) {
-			ret = -ENODEV;
-			hid_err(hdev, "Device not connected");
-			goto hid_hw_init_fail;
-		}
-
-		hidpp_overwrite_name(hdev);
-	}
-
-	if (connected && (hidpp->quirks & HIDPP_QUIRK_CLASS_WTP)) {
-		ret = wtp_get_config(hidpp);
-		if (ret)
-			goto hid_hw_init_fail;
-	} else if (connected && (hidpp->quirks & HIDPP_QUIRK_CLASS_G920)) {
-		ret = g920_get_config(hidpp, &data);
-		if (ret)
-			goto hid_hw_init_fail;
-	}
-
-	schedule_work(&hidpp->work);
-	flush_work(&hidpp->work);
+	else
+		hidpp_non_unifying_init(hidpp);
 
 	if (hidpp->quirks & HIDPP_QUIRK_DELAYED_INIT)
 		connect_mask &= ~HID_CONNECT_HIDINPUT;
 
 	/* Now export the actual inputs and hidraw nodes to the world */
+	hid_device_io_stop(hdev);
 	ret = hid_connect(hdev, connect_mask);
 	if (ret) {
 		hid_err(hdev, "%s:hid_connect returned error %d\n", __func__, ret);
 		goto hid_hw_init_fail;
 	}
 
+	/* Check for connected devices now that incoming packets will not be disabled again */
+	hid_device_io_start(hdev);
+	schedule_work(&hidpp->work);
+	flush_work(&hidpp->work);
+
 	if (hidpp->quirks & HIDPP_QUIRK_CLASS_G920) {
-		ret = hidpp_ff_init(hidpp, &data);
+		struct hidpp_ff_private_data data;
+
+		ret = g920_get_config(hidpp, &data);
+		if (!ret)
+			ret = hidpp_ff_init(hidpp, &data);
+
 		if (ret) {
 			hid_warn(hidpp->hid_dev,
 		     "Unable to initialize force feedback support, errno %d\n",
@@ -4566,6 +4551,7 @@ static void hidpp_remove(struct hid_device *hdev)
 
 	hid_hw_stop(hdev);
 	cancel_work_sync(&hidpp->work);
+	cancel_work_sync(&hidpp->reset_hi_res_work);
 	mutex_destroy(&hidpp->send_mutex);
 }
 
@@ -4613,6 +4599,9 @@ static const struct hid_device_id hidpp_devices[] = {
 	{ /* Keyboard MX5500 (Bluetooth-receiver in HID proxy mode) */
 	  LDJ_DEVICE(0xb30b),
 	  .driver_data = HIDPP_QUIRK_HIDPP_CONSUMER_VENDOR_KEYS },
+	{ /* Logitech G502 Lightspeed Wireless Gaming Mouse */
+	  LDJ_DEVICE(0x407f),
+	  .driver_data = HIDPP_QUIRK_RESET_HI_RES_SCROLL },
 
 	{ LDJ_DEVICE(HID_ANY_ID) },
 
@@ -4643,6 +4632,12 @@ static const struct hid_device_id hidpp_devices[] = {
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC081) },
 	{ /* Logitech G903 Gaming Mouse over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC086) },
+	{ /* Logitech G Pro Gaming Mouse over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC088) },
+	{ /* MX Vertical over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC08A) },
+	{ /* Logitech G703 Hero Gaming Mouse over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC090) },
 	{ /* Logitech G903 Hero Gaming Mouse over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC091) },
 	{ /* Logitech G915 TKL Keyboard over USB */
@@ -4653,8 +4648,6 @@ static const struct hid_device_id hidpp_devices[] = {
 	{ /* Logitech G923 Wheel (Xbox version) over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G923_XBOX_WHEEL),
 		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS },
-	{ /* Logitech G Pro Gaming Mouse over USB */
-	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC088) },
 	{ /* Logitech G Pro X Superlight Gaming Mouse over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC094) },
 	{ /* Logitech G Pro X Superlight 2 Gaming Mouse over USB */
@@ -4683,9 +4676,13 @@ static const struct hid_device_id hidpp_devices[] = {
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb012) },
 	{ /* M720 Triathlon mouse over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb015) },
+	{ /* MX Master 2S mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb019) },
 	{ /* MX Ergo trackball over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb01d) },
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb01e) },
+	{ /* MX Vertical mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb020) },
 	{ /* Signature M650 over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb02a) },
 	{ /* MX Master 3 mouse over Bluetooth */
@@ -4694,6 +4691,52 @@ static const struct hid_device_id hidpp_devices[] = {
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb025) },
 	{ /* MX Master 3S mouse over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb034) },
+	{ /* MX Anywhere 3S mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb037) },
+	{ /* MX Anywhere 3SB mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb038) },
+	{ /* Slim Solar+ K980 Keyboard over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb391) },
+	{ /* MX Master 4 mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb042) },
+	{ /* Logitech Signature K650 over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb36f) },
+	{ /* Logitech Signature K650 B2B over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb370) },
+	{ /* Logitech Pebble Keys 2 K380S over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb377) },
+	{ /* Logitech Casa Pop-Up Desk over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb371) },
+	{ /* Logitech Casa Pop-Up Desk B2B over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb374) },
+	{ /* Logitech Wave Keys over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb383) },
+	{ /* Logitech Wave Keys B2B over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb384) },
+	{ /* Logitech Signature Slim K950 over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb386) },
+	{ /* Logitech Signature Slim K950 B2B over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb388) },
+	{ /* Logitech MX Keys S over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb378) },
+	{ /* Logitech MX Keys S B2B over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb380) },
+	{ /* Logitech Keys-To-Go 2 over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb38c) },
+	{ /* Logitech Pop Icon Keys over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb38f) },
+	{ /* Logitech MX Keys Mini over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb369) },
+	{ /* Logitech MX Keys Mini B2B over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb36e) },
+	{ /* Logitech Signature Slim Solar+ K980 B2B over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb394) },
+	{ /* Logitech Bluetooth Keyboard K250/K251 over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb397) },
+	{ /* Logitech Signature Comfort K880 over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb39c) },
+	{ /* Logitech Signature Comfort K880 B2B over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb39d) },
 	{}
 };
 

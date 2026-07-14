@@ -28,12 +28,8 @@ DECLARE_HOOK(android_vh_check_bpf_syscall,
 	TP_ARGS(cmd, attr, size));
 
 DECLARE_HOOK(android_vh_check_nanosleep_syscall,
-    TP_PROTO(struct timespec64 *tu),
-    TP_ARGS(tu));
-
-DECLARE_HOOK(android_vh_destroy_inode,
-	TP_PROTO(struct inode *inode),
-	TP_ARGS(inode));
+	TP_PROTO(struct timespec64 *tu),
+	TP_ARGS(tu));
 
 #endif /* _TRACE_HOOK_SYSCALL_CHECK_H */
 /* This part must be outside protection */

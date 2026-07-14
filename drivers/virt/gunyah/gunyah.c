@@ -3,12 +3,91 @@
  * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#define pr_fmt(fmt) "gunyah: " fmt
+
 #include <linux/gunyah.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 
-static int gunyah_probe(struct platform_device *pdev)
+struct gunyah_info_desc {
+	__le16 id;
+	__le16 owner;
+	__le32 size;
+	__le32 offset;
+#define INFO_DESC_VALID		BIT(31)
+	__le32 flags;
+};
+
+static void *info_area;
+
+void *gunyah_get_info(u16 owner, u16 id, size_t *size)
+{
+	struct gunyah_info_desc *desc = info_area;
+	__le16 le_owner = cpu_to_le16(owner);
+	__le16 le_id = cpu_to_le16(id);
+
+	if (!desc)
+		return ERR_PTR(-ENOENT);
+
+	for (desc = info_area; le32_to_cpu(desc->offset); desc++) {
+		if (!(le32_to_cpu(desc->flags) & INFO_DESC_VALID))
+			continue;
+		mb();
+		if (le_owner == desc->owner && le_id == desc->id) {
+			if (size)
+				*size = le32_to_cpu(desc->size);
+			return info_area + le32_to_cpu(desc->offset);
+		}
+	}
+	return ERR_PTR(-ENOENT);
+}
+EXPORT_SYMBOL_GPL(gunyah_get_info);
+
+/**
+ * gunyah_map_addrspace_info_area - Map the addrspace info area
+ *
+ * Maps the hypervisor-provided addrspace info area into kernel space.
+ * Typically used once during the initialization and after hibernation
+ * restore (PM_POST_HIBERNATION) or in other scenarios where the info area
+ * needs to be re-initialized so as to establish the communincation with
+ * the resource manager.
+ */
+int gunyah_map_addrspace_info_area(void)
+{
+	unsigned long info_ipa, info_size;
+	enum gunyah_error gh_error;
+
+	gh_error = gunyah_hypercall_addrspace_find_info_area(&info_ipa, &info_size);
+	/* ignore errors for compatibility with gh without info_area support */
+	if (gh_error != GUNYAH_ERROR_OK)
+		return 0;
+
+	info_area = memremap(info_ipa, info_size, MEMREMAP_WB);
+	if (!info_area) {
+		pr_err("Failed to map addrspace info area\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(gunyah_map_addrspace_info_area);
+
+/**
+ * gunyah_unmap_addrspace_info_area - Unmap the addrspace info area
+ *
+ * Unmaps the previously mapped addrspace info area. Commonly used
+ * before hibernation (PM_HIBERNATION_PREPARE) or when the mapping
+ * is no longer needed.
+ */
+void gunyah_unmap_addrspace_info_area(void)
+{
+	memunmap(info_area);
+	info_area = NULL;
+}
+EXPORT_SYMBOL_GPL(gunyah_unmap_addrspace_info_area);
+
+static int __init gunyah_init(void)
 {
 	struct gunyah_hypercall_hyp_identify_resp gunyah_api;
 
@@ -28,26 +107,9 @@ static int gunyah_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	return devm_of_platform_populate(&pdev->dev);
+	return gunyah_map_addrspace_info_area();
 }
-
-static const struct of_device_id gunyah_of_match[] = {
-	{ .compatible = "gunyah-hypervisor" },
-	{ .compatible = "qcom,gunyah-hypervisor" },
-	{}
-};
-MODULE_DEVICE_TABLE(of, gunyah_of_match);
-
-/* clang-format off */
-static struct platform_driver gunyah_driver = {
-	.probe = gunyah_probe,
-	.driver = {
-		.name = "gunyah",
-		.of_match_table = gunyah_of_match,
-	}
-};
-/* clang-format on */
-module_platform_driver(gunyah_driver);
+core_initcall(gunyah_init);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Gunyah Driver");

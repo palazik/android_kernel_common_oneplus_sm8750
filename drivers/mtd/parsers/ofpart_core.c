@@ -71,7 +71,7 @@ static int parse_fixed_partitions(struct mtd_info *master,
 			dedicated = false;
 		}
 	} else { /* Partition */
-		ofpart_node = of_node_get(mtd_node);
+		ofpart_node = mtd_node;
 	}
 
 	of_id = of_match_node(parse_ofpart_match_table, ofpart_node);
@@ -164,10 +164,10 @@ static int parse_fixed_partitions(struct mtd_info *master,
 			partname = of_get_property(pp, "name", &len);
 		parts[i].name = partname;
 
-		if (of_get_property(pp, "read-only", &len))
+		if (of_property_read_bool(pp, "read-only"))
 			parts[i].mask_flags |= MTD_WRITEABLE;
 
-		if (of_get_property(pp, "lock", &len))
+		if (of_property_read_bool(pp, "lock"))
 			parts[i].mask_flags |= MTD_POWERUP_LOCK;
 
 		if (of_property_read_bool(pp, "slc-mode"))
@@ -191,11 +191,11 @@ static int parse_fixed_partitions(struct mtd_info *master,
 ofpart_fail:
 	pr_err("%s: error parsing ofpart partition %pOF (%pOF)\n",
 	       master->name, pp, mtd_node);
-	of_node_put(pp);
 	ret = -EINVAL;
 ofpart_none:
 	if (dedicated)
 		of_node_put(ofpart_node);
+	of_node_put(pp);
 	kfree(parts);
 	return ret;
 }

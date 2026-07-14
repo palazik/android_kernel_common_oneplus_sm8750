@@ -754,7 +754,7 @@ EXPORT_SYMBOL(xt_compat_init_offsets);
 
 int xt_compat_match_offset(const struct xt_match *match)
 {
-	u_int16_t csize = get_xt_match_compatsize(match) ? : match->matchsize;
+	u_int16_t csize = match->compatsize ? : match->matchsize;
 	return XT_ALIGN(match->matchsize) - COMPAT_XT_ALIGN(csize);
 }
 EXPORT_SYMBOL_GPL(xt_compat_match_offset);
@@ -763,7 +763,6 @@ void xt_compat_match_from_user(struct xt_entry_match *m, void **dstptr,
 			       unsigned int *size)
 {
 	const struct xt_match *match = m->u.kernel.match;
-	compat_from_user_fn_t compat_from_user = get_xt_match_compat_from_user(match);
 	struct compat_xt_entry_match *cm = (struct compat_xt_entry_match *)m;
 	int off = xt_compat_match_offset(match);
 	u_int16_t msize = cm->u.user.match_size;
@@ -771,8 +770,8 @@ void xt_compat_match_from_user(struct xt_entry_match *m, void **dstptr,
 
 	m = *dstptr;
 	memcpy(m, cm, sizeof(*cm));
-	if (compat_from_user)
-		compat_from_user(m->data, cm->data);
+	if (match->compat_from_user)
+		match->compat_from_user(m->data, cm->data);
 	else
 		memcpy(m->data, cm->data, msize - sizeof(*cm));
 
@@ -797,7 +796,6 @@ int xt_compat_match_to_user(const struct xt_entry_match *m,
 			    void __user **dstptr, unsigned int *size)
 {
 	const struct xt_match *match = m->u.kernel.match;
-	compat_to_user_fn_t compat_to_user = get_xt_match_compat_to_user(match);
 	struct compat_xt_entry_match __user *cm = *dstptr;
 	int off = xt_compat_match_offset(match);
 	u_int16_t msize = m->u.user.match_size - off;
@@ -805,8 +803,8 @@ int xt_compat_match_to_user(const struct xt_entry_match *m,
 	if (XT_OBJ_TO_USER(cm, m, match, msize))
 		return -EFAULT;
 
-	if (compat_to_user) {
-		if (compat_to_user((void __user *)cm->data, m->data))
+	if (match->compat_to_user) {
+		if (match->compat_to_user((void __user *)cm->data, m->data))
 			return -EFAULT;
 	} else {
 		if (COMPAT_XT_DATA_TO_USER(cm, m, match, msize - sizeof(*cm)))
@@ -1148,7 +1146,7 @@ EXPORT_SYMBOL_GPL(xt_copy_counters);
 #ifdef CONFIG_NETFILTER_XTABLES_COMPAT
 int xt_compat_target_offset(const struct xt_target *target)
 {
-	u_int16_t csize = get_xt_target_compatsize(target) ? : target->targetsize;
+	u_int16_t csize = target->compatsize ? : target->targetsize;
 	return XT_ALIGN(target->targetsize) - COMPAT_XT_ALIGN(csize);
 }
 EXPORT_SYMBOL_GPL(xt_compat_target_offset);
@@ -1157,7 +1155,6 @@ void xt_compat_target_from_user(struct xt_entry_target *t, void **dstptr,
 				unsigned int *size)
 {
 	const struct xt_target *target = t->u.kernel.target;
-	compat_from_user_fn_t compat_from_user = get_xt_target_compat_from_user(target);
 	struct compat_xt_entry_target *ct = (struct compat_xt_entry_target *)t;
 	int off = xt_compat_target_offset(target);
 	u_int16_t tsize = ct->u.user.target_size;
@@ -1165,10 +1162,11 @@ void xt_compat_target_from_user(struct xt_entry_target *t, void **dstptr,
 
 	t = *dstptr;
 	memcpy(t, ct, sizeof(*ct));
-	if (compat_from_user)
-		compat_from_user(t->data, ct->data);
+	if (target->compat_from_user)
+		target->compat_from_user(t->data, ct->data);
 	else
-		memcpy(t->data, ct->data, tsize - sizeof(*ct));
+		unsafe_memcpy(t->data, ct->data, tsize - sizeof(*ct),
+			      /* UAPI 0-sized destination */);
 
 	tsize += off;
 	t->u.user.target_size = tsize;
@@ -1185,7 +1183,6 @@ int xt_compat_target_to_user(const struct xt_entry_target *t,
 			     void __user **dstptr, unsigned int *size)
 {
 	const struct xt_target *target = t->u.kernel.target;
-	compat_to_user_fn_t compat_to_user = get_xt_target_compat_to_user(target);
 	struct compat_xt_entry_target __user *ct = *dstptr;
 	int off = xt_compat_target_offset(target);
 	u_int16_t tsize = t->u.user.target_size - off;
@@ -1193,8 +1190,8 @@ int xt_compat_target_to_user(const struct xt_entry_target *t,
 	if (XT_OBJ_TO_USER(ct, t, target, tsize))
 		return -EFAULT;
 
-	if (compat_to_user) {
-		if (compat_to_user((void __user *)ct->data, t->data))
+	if (target->compat_to_user) {
+		if (target->compat_to_user((void __user *)ct->data, t->data))
 			return -EFAULT;
 	} else {
 		if (COMPAT_XT_DATA_TO_USER(ct, t, target, tsize - sizeof(*ct)))

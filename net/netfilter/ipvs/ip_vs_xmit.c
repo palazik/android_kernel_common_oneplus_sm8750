@@ -103,18 +103,6 @@ __ip_vs_dst_check(struct ip_vs_dest *dest)
 	return dest_dst;
 }
 
-/* Based on ip_exceeds_mtu(). */
-static bool ip_vs_exceeds_mtu(const struct sk_buff *skb, unsigned int mtu)
-{
-	if (skb->len <= mtu)
-		return false;
-
-	if (skb_is_gso(skb) && skb_gso_validate_network_len(skb, mtu))
-		return false;
-
-	return true;
-}
-
 static inline bool
 __mtu_check_toobig_v6(const struct sk_buff *skb, u32 mtu)
 {
@@ -124,9 +112,10 @@ __mtu_check_toobig_v6(const struct sk_buff *skb, u32 mtu)
 		 */
 		if (IP6CB(skb)->frag_max_size > mtu)
 			return true; /* largest fragment violate MTU */
-	} else if (ip_vs_exceeds_mtu(skb, mtu))
+	}
+	else if (skb->len > mtu && !skb_is_gso(skb)) {
 		return true; /* Packet size violate MTU size */
-
+	}
 	return false;
 }
 
@@ -244,7 +233,7 @@ static inline bool ensure_mtu_is_adequate(struct netns_ipvs *ipvs, int skb_af,
 			return true;
 
 		if (unlikely(ip_hdr(skb)->frag_off & htons(IP_DF) &&
-			     ip_vs_exceeds_mtu(skb, mtu) &&
+			     skb->len > mtu && !skb_is_gso(skb) &&
 			     !ip_vs_iph_icmp(ipvsh))) {
 			icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
 				  htonl(mtu));
@@ -306,6 +295,12 @@ static inline bool decrement_ttl(struct netns_ipvs *ipvs,
 	return true;
 }
 
+/* rt has device that is down */
+static bool rt_dev_is_down(const struct net_device *dev)
+{
+	return dev && !netif_running(dev);
+}
+
 /* Get route to destination or remote server */
 static int
 __ip_vs_get_out_rt(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
@@ -321,9 +316,11 @@ __ip_vs_get_out_rt(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
 
 	if (dest) {
 		dest_dst = __ip_vs_dst_check(dest);
-		if (likely(dest_dst))
-			rt = (struct rtable *) dest_dst->dst_cache;
-		else {
+		if (likely(dest_dst)) {
+			rt = dst_rtable(dest_dst->dst_cache);
+			if (ret_saddr)
+				*ret_saddr = dest_dst->dst_saddr.ip;
+		} else {
 			dest_dst = ip_vs_dest_dst_alloc();
 			spin_lock_bh(&dest->dst_lock);
 			if (!dest_dst) {
@@ -339,14 +336,22 @@ __ip_vs_get_out_rt(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
 				ip_vs_dest_dst_free(dest_dst);
 				goto err_unreach;
 			}
-			__ip_vs_dst_set(dest, dest_dst, &rt->dst, 0);
+			/* It is forbidden to attach dest->dest_dst if
+			 * device is going down.
+			 */
+			if (!rt_dev_is_down(dst_dev_rcu(&rt->dst)))
+				__ip_vs_dst_set(dest, dest_dst, &rt->dst, 0);
+			else
+				noref = 0;
 			spin_unlock_bh(&dest->dst_lock);
 			IP_VS_DBG(10, "new dst %pI4, src %pI4, refcnt=%d\n",
 				  &dest->addr.ip, &dest_dst->dst_saddr.ip,
 				  rcuref_read(&rt->dst.__rcuref));
+			if (ret_saddr)
+				*ret_saddr = dest_dst->dst_saddr.ip;
+			if (!noref)
+				ip_vs_dest_dst_free(dest_dst);
 		}
-		if (ret_saddr)
-			*ret_saddr = dest_dst->dst_saddr.ip;
 	} else {
 		noref = 0;
 
@@ -390,10 +395,10 @@ __ip_vs_get_out_rt(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
 			    skb->ip_summed == CHECKSUM_PARTIAL)
 				mtu -= GUE_PLEN_REMCSUM + GUE_LEN_PRIV;
 		} else if (dest->tun_type == IP_VS_CONN_F_TUNNEL_TYPE_GRE) {
-			__be16 tflags = 0;
+			IP_TUNNEL_DECLARE_FLAGS(tflags) = { };
 
 			if (dest->tun_flags & IP_VS_TUNNEL_ENCAP_FLAG_CSUM)
-				tflags |= TUNNEL_CSUM;
+				__set_bit(IP_TUNNEL_CSUM_BIT, tflags);
 			mtu -= gre_calc_hlen(tflags);
 		}
 		if (mtu < 68) {
@@ -483,9 +488,11 @@ __ip_vs_get_out_rt_v6(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
 
 	if (dest) {
 		dest_dst = __ip_vs_dst_check(dest);
-		if (likely(dest_dst))
+		if (likely(dest_dst)) {
 			rt = dst_rt6_info(dest_dst->dst_cache);
-		else {
+			if (ret_saddr)
+				*ret_saddr = dest_dst->dst_saddr.in6;
+		} else {
 			u32 cookie;
 
 			dest_dst = ip_vs_dest_dst_alloc();
@@ -506,14 +513,22 @@ __ip_vs_get_out_rt_v6(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
 			}
 			rt = dst_rt6_info(dst);
 			cookie = rt6_get_cookie(rt);
-			__ip_vs_dst_set(dest, dest_dst, &rt->dst, cookie);
+			/* It is forbidden to attach dest->dest_dst if
+			 * device is going down.
+			 */
+			if (!rt_dev_is_down(dst_dev_rcu(&rt->dst)))
+				__ip_vs_dst_set(dest, dest_dst, &rt->dst, cookie);
+			else
+				noref = 0;
 			spin_unlock_bh(&dest->dst_lock);
 			IP_VS_DBG(10, "new dst %pI6, src %pI6, refcnt=%d\n",
 				  &dest->addr.in6, &dest_dst->dst_saddr.in6,
 				  rcuref_read(&rt->dst.__rcuref));
+			if (ret_saddr)
+				*ret_saddr = dest_dst->dst_saddr.in6;
+			if (!noref)
+				ip_vs_dest_dst_free(dest_dst);
 		}
-		if (ret_saddr)
-			*ret_saddr = dest_dst->dst_saddr.in6;
 	} else {
 		noref = 0;
 		dst = __ip_vs_route_output_v6(net, daddr, ret_saddr, do_xfrm,
@@ -556,10 +571,10 @@ __ip_vs_get_out_rt_v6(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
 			    skb->ip_summed == CHECKSUM_PARTIAL)
 				mtu -= GUE_PLEN_REMCSUM + GUE_LEN_PRIV;
 		} else if (dest->tun_type == IP_VS_CONN_F_TUNNEL_TYPE_GRE) {
-			__be16 tflags = 0;
+			IP_TUNNEL_DECLARE_FLAGS(tflags) = { };
 
 			if (dest->tun_flags & IP_VS_TUNNEL_ENCAP_FLAG_CSUM)
-				tflags |= TUNNEL_CSUM;
+				__set_bit(IP_TUNNEL_CSUM_BIT, tflags);
 			mtu -= gre_calc_hlen(tflags);
 		}
 		if (mtu < IPV6_MIN_MTU) {
@@ -1085,11 +1100,11 @@ ipvs_gre_encap(struct net *net, struct sk_buff *skb,
 {
 	__be16 proto = *next_protocol == IPPROTO_IPIP ?
 				htons(ETH_P_IP) : htons(ETH_P_IPV6);
-	__be16 tflags = 0;
+	IP_TUNNEL_DECLARE_FLAGS(tflags) = { };
 	size_t hdrlen;
 
 	if (cp->dest->tun_flags & IP_VS_TUNNEL_ENCAP_FLAG_CSUM)
-		tflags |= TUNNEL_CSUM;
+		__set_bit(IP_TUNNEL_CSUM_BIT, tflags);
 
 	hdrlen = gre_calc_hlen(tflags);
 	gre_build_header(skb, hdrlen, tflags, proto, 0, 0);
@@ -1168,11 +1183,11 @@ ip_vs_tunnel_xmit(struct sk_buff *skb, struct ip_vs_conn *cp,
 
 		max_headroom += sizeof(struct udphdr) + gue_hdrlen;
 	} else if (tun_type == IP_VS_CONN_F_TUNNEL_TYPE_GRE) {
+		IP_TUNNEL_DECLARE_FLAGS(tflags) = { };
 		size_t gre_hdrlen;
-		__be16 tflags = 0;
 
 		if (tun_flags & IP_VS_TUNNEL_ENCAP_FLAG_CSUM)
-			tflags |= TUNNEL_CSUM;
+			__set_bit(IP_TUNNEL_CSUM_BIT, tflags);
 		gre_hdrlen = gre_calc_hlen(tflags);
 
 		max_headroom += gre_hdrlen;
@@ -1313,11 +1328,11 @@ ip_vs_tunnel_xmit_v6(struct sk_buff *skb, struct ip_vs_conn *cp,
 
 		max_headroom += sizeof(struct udphdr) + gue_hdrlen;
 	} else if (tun_type == IP_VS_CONN_F_TUNNEL_TYPE_GRE) {
+		IP_TUNNEL_DECLARE_FLAGS(tflags) = { };
 		size_t gre_hdrlen;
-		__be16 tflags = 0;
 
 		if (tun_flags & IP_VS_TUNNEL_ENCAP_FLAG_CSUM)
-			tflags |= TUNNEL_CSUM;
+			__set_bit(IP_TUNNEL_CSUM_BIT, tflags);
 		gre_hdrlen = gre_calc_hlen(tflags);
 
 		max_headroom += gre_hdrlen;

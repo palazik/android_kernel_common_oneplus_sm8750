@@ -22,6 +22,9 @@ description: |
 
   [0] https://developer.arm.com/documentation/den0056/latest
 
+anyOf:
+  - $ref: /schemas/firmware/nxp,imx95-scmi.yaml
+
 properties:
   $nodename:
     const: scmi
@@ -38,6 +41,9 @@ properties:
                      with shmem address(4KB-page, offset) as parameters
         items:
           - const: arm,scmi-smc-param
+      - description: SCMI compliant firmware with Qualcomm SMC/HVC transport
+        items:
+          - const: qcom,scmi-smc
       - description: SCMI compliant firmware with SCMI Virtio transport.
                      The virtio transport only supports a single device.
         items:
@@ -118,7 +124,7 @@ properties:
       atomic mode of operation, even if requested.
     default: 0
 
-  max-rx-timeout-ms:
+  arm,max-rx-timeout-ms:
     description:
       An optional time value, expressed in milliseconds, representing the
       transport maximum timeout value for the receive channel. The value should
@@ -149,6 +155,14 @@ properties:
     required:
       - '#power-domain-cells'
 
+  protocol@12:
+    $ref: '#/$defs/protocol-node'
+    unevaluatedProperties: false
+
+    properties:
+      reg:
+        const: 0x12
+
   protocol@13:
     $ref: '#/$defs/protocol-node'
     unevaluatedProperties: false
@@ -160,8 +174,15 @@ properties:
       '#clock-cells':
         const: 1
 
-    required:
-      - '#clock-cells'
+      '#power-domain-cells':
+        const: 1
+
+    oneOf:
+      - required:
+          - '#clock-cells'
+
+      - required:
+          - '#power-domain-cells'
 
   protocol@14:
     $ref: '#/$defs/protocol-node'
@@ -252,7 +273,9 @@ properties:
     type: object
     allOf:
       - $ref: '#/$defs/protocol-node'
-      - $ref: /schemas/pinctrl/pinctrl.yaml
+      - anyOf:
+          - $ref: /schemas/pinctrl/pinctrl.yaml
+          - $ref: /schemas/firmware/nxp,imx95-scmi-pinctrl.yaml
 
     unevaluatedProperties: false
 
@@ -279,7 +302,7 @@ properties:
     required:
       - reg
 
-additionalProperties: false
+unevaluatedProperties: false
 
 $defs:
   protocol-node:
@@ -348,6 +371,7 @@ else:
           enum:
             - arm,scmi-smc
             - arm,scmi-smc-param
+            - qcom,scmi-smc
   then:
     required:
       - arm,smc-id
@@ -386,7 +410,7 @@ examples:
 
             scmi_dvfs: protocol@13 {
                 reg = <0x13>;
-                #clock-cells = <1>;
+                #power-domain-cells = <1>;
 
                 mboxes = <&mhuB 1 0>,
                          <&mhuB 1 1>;
@@ -518,7 +542,7 @@ examples:
                 reg = <0x13>;
                 linaro,optee-channel-id = <1>;
                 shmem = <&cpu_optee_lpri0>;
-                #clock-cells = <1>;
+                #power-domain-cells = <1>;
             };
 
             scmi_clk0: protocol@14 {

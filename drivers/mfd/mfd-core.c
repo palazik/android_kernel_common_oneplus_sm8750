@@ -30,7 +30,7 @@ struct mfd_of_node_entry {
 	struct device_node *np;
 };
 
-static struct device_type mfd_dev_type = {
+static const struct device_type mfd_dev_type = {
 	.name	= "mfd_device",
 };
 
@@ -88,7 +88,17 @@ static void mfd_acpi_add_device(const struct mfd_cell *cell,
 		}
 	}
 
-	ACPI_COMPANION_SET(&pdev->dev, adev ?: parent);
+	/*
+	 * NOTE: The fwnode design doesn't allow proper stacking/sharing. This
+	 * should eventually turn into a device fwnode API call that will allow
+	 * prepending to a list of fwnodes (with ACPI taking precedence).
+	 *
+	 * set_primary_fwnode() is used here, instead of device_set_node(), as
+	 * device_set_node() will overwrite the existing fwnode, which may be an
+	 * OF node that was populated earlier. To support a use case where ACPI
+	 * and OF is used in conjunction, we call set_primary_fwnode() instead.
+	 */
+	set_primary_fwnode(&pdev->dev, acpi_fwnode_handle(adev ?: parent));
 }
 #else
 static inline void mfd_acpi_add_device(const struct mfd_cell *cell,
@@ -135,8 +145,8 @@ allocate_of_node:
 	scoped_guard(mutex, &mfd_of_node_mutex)
 		list_add_tail(&of_entry->list, &mfd_of_node_list);
 
-	pdev->dev.of_node = np;
-	pdev->dev.fwnode = &np->fwnode;
+	of_node_get(np);
+	device_set_node(&pdev->dev, of_fwnode_handle(np));
 #endif
 	return 0;
 }
@@ -445,5 +455,6 @@ int devm_mfd_add_devices(struct device *dev, int id,
 }
 EXPORT_SYMBOL(devm_mfd_add_devices);
 
+MODULE_DESCRIPTION("Core MFD support");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Ian Molton, Dmitry Baryshkov");

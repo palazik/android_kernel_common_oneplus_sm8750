@@ -29,21 +29,9 @@ struct pagevec;
 #define SWAP_FLAG_DISCARD_ONCE	0x20000 /* discard swap area at swapon-time */
 #define SWAP_FLAG_DISCARD_PAGES 0x40000 /* discard page-clusters after use */
 
-/* set if swap cluters reserve order and percent specified */
-#define SWAP_FLAG_MTHP_RESERVE			0x80000
-/* order to reserve: Orders [1, PMD_ORDER] are valid */
-#define SWAP_FLAG_MTHP_RESERVE_ORDER_MASK	0x00F00000
-#define SWAP_FLAG_MTHP_RESERVE_ORDER_SHIFT	20
-/* percentage of swap clusters to reserve; [1, 100] are valid */
-#define SWAP_FLAG_MTHP_RESERVE_PERCENT_MASK	0x7F000000
-#define SWAP_FLAG_MTHP_RESERVE_PERCENT_SHIFT	24
-
 #define SWAP_FLAGS_VALID	(SWAP_FLAG_PRIO_MASK | SWAP_FLAG_PREFER | \
 				 SWAP_FLAG_DISCARD | SWAP_FLAG_DISCARD_ONCE | \
-				 SWAP_FLAG_DISCARD_PAGES | \
-				 SWAP_FLAG_MTHP_RESERVE | \
-				 SWAP_FLAG_MTHP_RESERVE_ORDER_MASK | \
-				 SWAP_FLAG_MTHP_RESERVE_PERCENT_MASK)
+				 SWAP_FLAG_DISCARD_PAGES)
 #define SWAP_BATCH 64
 
 static inline int current_is_kswapd(void)
@@ -266,11 +254,9 @@ struct swap_cluster_info {
 				 * other than list, and swap_info_struct->swap_map
 				 * elements corresponding to the swap cluster.
 				 */
-	unsigned int count:12;
-	unsigned int state:3;
-	unsigned int order:4;
-	unsigned int reserved:1;
-	unsigned int flags:4;
+	u16 count;
+	u8 flags;
+	u8 order;
 	struct list_head list;
 };
 #define CLUSTER_FLAG_FREE 1 /* This cluster is free */
@@ -312,10 +298,15 @@ struct swap_info_struct {
 	signed char	type;		/* strange name for an index */
 	unsigned int	max;		/* extent of the swap_map */
 	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
+	unsigned long *zeromap;		/* kvmalloc'ed bitmap to track zero pages */
 	struct swap_cluster_info *cluster_info; /* cluster info. Only for SSD */
 	struct list_head free_clusters; /* free clusters list */
+	struct list_head full_clusters; /* full clusters list */
 	struct list_head nonfull_clusters[SWAP_NR_ORDERS];
 					/* list of cluster that contains at least one free slot */
+	struct list_head frag_clusters[SWAP_NR_ORDERS];
+					/* list of cluster that are fragmented or contented */
+	unsigned int frag_cluster_nr[SWAP_NR_ORDERS];
 	unsigned int lowest_bit;	/* index of first free in swap_map */
 	unsigned int highest_bit;	/* index of last free in swap_map */
 	unsigned int pages;		/* total of usable pages of swap */
@@ -327,7 +318,6 @@ struct swap_info_struct {
 	struct rb_root swap_extent_root;/* root of the swap extent rbtree */
 	struct block_device *bdev;	/* swap device or bdev of swap file */
 	struct file *swap_file;		/* seldom referenced */
-	unsigned int old_block_size;	/* seldom referenced */
 	struct completion comp;		/* seldom referenced */
 	spinlock_t lock;		/*
 					 * protect map scan related fields like
@@ -347,6 +337,7 @@ struct swap_info_struct {
 					 * list.
 					 */
 	struct work_struct discard_work; /* discard worker */
+	struct work_struct reclaim_work; /* reclaim worker */
 	struct list_head discard_clusters; /* discard clusters list */
 	struct plist_node avail_lists[]; /*
 					   * entries in swap_avail_heads, one
@@ -376,16 +367,6 @@ void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages);
 void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg);
 void workingset_refault(struct folio *folio, void *shadow);
 void workingset_activation(struct folio *folio);
-
-/* Only track the nodes of mappings with shadow entries */
-void workingset_update_node(struct xa_node *node);
-extern struct list_lru shadow_nodes;
-#define mapping_set_update(xas, mapping) do {				\
-	if (!dax_mapping(mapping) && !shmem_mapping(mapping)) {		\
-		xas_set_update(xas, workingset_update_node);		\
-		xas_set_lru(xas, &shadow_nodes);			\
-	}								\
-} while (0)
 
 /* linux/mm/page_alloc.c */
 extern unsigned long totalreserve_pages;
@@ -443,15 +424,15 @@ extern unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 #define MEMCG_RECLAIM_PROACTIVE (1 << 2)
 #define MIN_SWAPPINESS 0
 #define MAX_SWAPPINESS 200
+
+/* Just recliam from anon folios in proactive memory reclaim */
+#define SWAPPINESS_ANON_ONLY (MAX_SWAPPINESS + 1)
+
 extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 						  unsigned long nr_pages,
 						  gfp_t gfp_mask,
-						  unsigned int reclaim_options);
-extern unsigned long try_to_free_mem_cgroup_pages_with_swappiness(struct mem_cgroup *memcg,
-								  unsigned long nr_pages,
-								  gfp_t gfp_mask,
-								  unsigned int reclaim_options,
-								  int *swappiness);
+						  unsigned int reclaim_options,
+						  int *swappiness);
 extern unsigned long mem_cgroup_shrink_node(struct mem_cgroup *mem,
 						gfp_t gfp_mask, bool noswap,
 						pg_data_t *pgdat,
@@ -460,8 +441,8 @@ extern unsigned long shrink_all_memory(unsigned long nr_pages);
 extern int vm_swappiness;
 long remove_mapping(struct address_space *mapping, struct folio *folio);
 
-extern unsigned long reclaim_pages(struct list_head *folio_list, bool ignore_references);
-extern unsigned long __reclaim_pages(struct list_head *folio_list, bool ignore_references,
+extern unsigned long reclaim_pages(struct list_head *folio_list);
+extern unsigned long __reclaim_pages(struct list_head *folio_list,
 				     void *private);
 #ifdef CONFIG_NUMA
 extern int node_reclaim_mode;
@@ -494,9 +475,10 @@ static inline unsigned long total_swapcache_pages(void)
 	return global_node_page_state(NR_SWAPCACHE);
 }
 
-extern void free_swap_cache(struct page *page);
-extern void free_page_and_swap_cache(struct page *);
-extern void free_pages_and_swap_cache(struct encoded_page **, int);
+void delete_from_swap_cache(struct folio *folio);
+void free_swap_cache(struct folio *folio);
+void free_page_and_swap_cache(struct page *);
+void free_pages_and_swap_cache(struct encoded_page **, int);
 /* linux/mm/swapfile.c */
 extern atomic_long_t nr_swap_pages;
 extern long total_swap_pages;
@@ -521,7 +503,7 @@ void put_swap_folio(struct folio *folio, swp_entry_t entry);
 extern swp_entry_t get_swap_page_of_type(int);
 extern int get_swap_pages(int n, swp_entry_t swp_entries[], int order);
 extern int add_swap_count_continuation(swp_entry_t, gfp_t);
-extern void swap_shmem_alloc(swp_entry_t);
+extern void swap_shmem_alloc(swp_entry_t, int);
 extern int swap_duplicate(swp_entry_t);
 extern int swapcache_prepare(swp_entry_t entry, int nr);
 extern void swap_free_nr(swp_entry_t entry, int nr_pages);
@@ -534,13 +516,13 @@ extern sector_t swapdev_block(int, pgoff_t);
 extern int __swap_count(swp_entry_t entry);
 extern int swap_swapcount(struct swap_info_struct *si, swp_entry_t entry);
 extern int swp_swapcount(swp_entry_t entry);
-extern struct swap_info_struct *page_swap_info(struct page *);
-extern struct swap_info_struct *swp_swap_info(swp_entry_t entry);
+struct swap_info_struct *swp_swap_info(swp_entry_t entry);
 struct backing_dev_info;
 extern int init_swap_address_space(unsigned int type, unsigned long nr_pages);
 extern void exit_swap_address_space(unsigned int type);
 extern struct swap_info_struct *get_swap_device(swp_entry_t entry);
-sector_t swap_page_sector(struct page *page);
+sector_t swap_folio_sector(struct folio *folio);
+extern sector_t alloc_swapdev_block(int swap);
 
 static inline void put_swap_device(struct swap_info_struct *si)
 {
@@ -580,7 +562,7 @@ static inline void free_swap_and_cache_nr(swp_entry_t entry, int nr)
 {
 }
 
-static inline void free_swap_cache(struct page *page)
+static inline void free_swap_cache(struct folio *folio)
 {
 }
 
@@ -589,7 +571,7 @@ static inline int add_swap_count_continuation(swp_entry_t swp, gfp_t gfp_mask)
 	return 0;
 }
 
-static inline void swap_shmem_alloc(swp_entry_t swp)
+static inline void swap_shmem_alloc(swp_entry_t swp, int nr)
 {
 }
 

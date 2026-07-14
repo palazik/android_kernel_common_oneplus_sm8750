@@ -19,6 +19,7 @@
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
+#include <linux/types.h>
 #include <linux/android_kabi.h>
 
 #include <asm/mmu.h>
@@ -47,9 +48,7 @@ struct mem_cgroup;
  * which is guaranteed to be aligned.  If you use the same storage as
  * page->mapping, you must restore it to NULL before freeing the page.
  *
- * If your page will not be mapped to userspace, you can also use the four
- * bytes in the mapcount union, but you must call page_mapcount_reset()
- * before freeing it.
+ * The mapcount field must not be used for own purposes.
  *
  * If you want to use the refcount field, it must be used in such a way
  * that other CPUs temporarily incrementing and then decrementing the
@@ -112,7 +111,7 @@ struct page {
 			/**
 			 * @private: Mapping-private opaque data.
 			 * Usually used for buffer_heads if PagePrivate.
-			 * Used for swp_entry_t if PageSwapCache.
+			 * Used for swp_entry_t if swapcache flag set.
 			 * Indicates order in the buddy system if PageBuddy.
 			 */
 			unsigned long private;
@@ -126,18 +125,7 @@ struct page {
 			struct page_pool *pp;
 			unsigned long _pp_mapping_pad;
 			unsigned long dma_addr;
-			union {
-				/**
-				 * dma_addr_upper: might require a 64-bit
-				 * value on 32-bit architectures.
-				 */
-				unsigned long dma_addr_upper;
-				/**
-				 * For frag page support, not supported in
-				 * 32-bit architectures with 64-bit DMA.
-				 */
-				atomic_long_t pp_frag_count;
-			};
+			atomic_long_t pp_ref_count;
 		};
 		struct {	/* Tail pages of compound page */
 			unsigned long compound_head;	/* Bit zero is set */
@@ -164,18 +152,31 @@ struct page {
 
 	union {		/* This union is 4 bytes in size. */
 		/*
-		 * If the page can be mapped to userspace, encodes the number
-		 * of times this page is referenced by a page table.
-		 */
-		atomic_t _mapcount;
-
-		/*
-		 * If the page is neither PageSlab nor mappable to userspace,
-		 * the value stored here may help determine what this page
-		 * is used for.  See page-flags.h for a list of page types
-		 * which are currently stored here.
+		 * For head pages of typed folios, the value stored here
+		 * allows for determining what this page is used for. The
+		 * tail pages of typed folios will not store a type
+		 * (page_type == _mapcount == -1).
+		 *
+		 * See page-flags.h for a list of page types which are currently
+		 * stored here.
+		 *
+		 * Owners of typed folios may reuse the lower 16 bit of the
+		 * head page page_type field after setting the page type,
+		 * but must reset these 16 bit to -1 before clearing the
+		 * page type.
 		 */
 		unsigned int page_type;
+
+		/*
+		 * For pages that are part of non-typed folios for which mappings
+		 * are tracked via the RMAP, encodes the number of times this page
+		 * is directly referenced by a page table.
+		 *
+		 * Note that the mapcount is always initialized to -1, so that
+		 * transitions both from it and to it can be tracked, using
+		 * atomic_inc_and_test() and atomic_add_negative(-1).
+		 */
+		atomic_t _mapcount;
 	};
 
 	/* Usage count. *DO NOT USE DIRECTLY*. See page_ref.h */
@@ -183,6 +184,8 @@ struct page {
 
 #ifdef CONFIG_MEMCG
 	unsigned long memcg_data;
+#elif defined(CONFIG_SLAB_OBJ_EXT)
+	unsigned long _unused_slab_obj_exts;
 #endif
 
 	/*
@@ -200,6 +203,10 @@ struct page {
 					   not kmapped, ie. highmem) */
 #endif /* WANT_PAGE_VIRTUAL */
 
+#ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+	int _last_cpupid;
+#endif
+
 #ifdef CONFIG_KMSAN
 	/*
 	 * KMSAN metadata for this page:
@@ -210,10 +217,6 @@ struct page {
 	 */
 	struct page *kmsan_shadow;
 	struct page *kmsan_origin;
-#endif
-
-#ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
-	int _last_cpupid;
 #endif
 } _struct_page_alignment;
 
@@ -298,8 +301,11 @@ typedef struct {
  * @_refcount: Do not access this member directly.  Use folio_ref_count()
  *    to find how many references there are to this folio.
  * @memcg_data: Memory Control Group data.
+ * @virtual: Virtual address in the kernel direct map.
+ * @_last_cpupid: IDs of last CPU and last process that accessed the folio.
  * @_entire_mapcount: Do not use directly, call folio_entire_mapcount().
- * @_nr_pages_mapped: Do not use directly, call folio_mapcount().
+ * @_large_mapcount: Do not use directly, call folio_mapcount().
+ * @_nr_pages_mapped: Do not use outside of rmap and debug code.
  * @_pincount: Do not use directly, call folio_maybe_dma_pinned().
  * @_folio_nr_pages: Do not use directly, call folio_nr_pages().
  * @_hugetlb_subpool: Do not use directly, use accessor in hugetlb.h.
@@ -307,6 +313,7 @@ typedef struct {
  * @_hugetlb_cgroup_rsvd: Do not use directly, use accessor in hugetlb_cgroup.h.
  * @_hugetlb_hwpoison: Do not use directly, call raw_hwp_list_head().
  * @_deferred_list: Folios to be split under memory pressure.
+ * @_unused_slab_obj_exts: Placeholder to match obj_exts in struct slab.
  *
  * A folio is a physically, virtually and logically contiguous set
  * of bytes.  It is a power-of-two in size, and it is aligned to that
@@ -343,6 +350,14 @@ struct folio {
 			atomic_t _refcount;
 #ifdef CONFIG_MEMCG
 			unsigned long memcg_data;
+#elif defined(CONFIG_SLAB_OBJ_EXT)
+			unsigned long _unused_slab_obj_exts;
+#endif
+#if defined(WANT_PAGE_VIRTUAL)
+			void *virtual;
+#endif
+#ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+			int _last_cpupid;
 #endif
 	/* private: the union with struct page is transitional */
 		};
@@ -353,18 +368,13 @@ struct folio {
 			unsigned long _flags_1;
 			unsigned long _head_1;
 	/* public: */
+			atomic_t _large_mapcount;
 			atomic_t _entire_mapcount;
 			atomic_t _nr_pages_mapped;
 			atomic_t _pincount;
 #ifdef CONFIG_64BIT
-			unsigned int __padding;
 			unsigned int _folio_nr_pages;
 #endif
-			union {
-				unsigned long _private_1;
-				unsigned long *_dst_ul;
-				struct page **_dst_pp;
-			};
 	/* private: the union with struct page is transitional */
 		};
 		struct page __page_1;
@@ -404,13 +414,18 @@ FOLIO_MATCH(_refcount, _refcount);
 #ifdef CONFIG_MEMCG
 FOLIO_MATCH(memcg_data, memcg_data);
 #endif
+#if defined(WANT_PAGE_VIRTUAL)
+FOLIO_MATCH(virtual, virtual);
+#endif
+#ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+FOLIO_MATCH(_last_cpupid, _last_cpupid);
+#endif
 #undef FOLIO_MATCH
 #define FOLIO_MATCH(pg, fl)						\
 	static_assert(offsetof(struct folio, fl) ==			\
 			offsetof(struct page, pg) + sizeof(struct page))
 FOLIO_MATCH(flags, _flags_1);
 FOLIO_MATCH(compound_head, _head_1);
-FOLIO_MATCH(private, _private_1);
 #undef FOLIO_MATCH
 #define FOLIO_MATCH(pg, fl)						\
 	static_assert(offsetof(struct folio, fl) ==			\
@@ -423,19 +438,22 @@ FOLIO_MATCH(compound_head, _head_2a);
 
 /**
  * struct ptdesc -    Memory descriptor for page tables.
- * @__page_flags:     Same as page flags. Unused for page tables.
+ * @__page_flags:     Same as page flags. Powerpc only.
  * @pt_rcu_head:      For freeing page table pages.
- * @pt_list:          List of used page tables. Used for s390 and x86.
+ * @pt_list:          List of used page tables. Used for s390 gmap shadow pages
+ *                    (which are not linked into the user page tables) and x86
+ *                    pgds.
  * @_pt_pad_1:        Padding that aliases with page's compound head.
  * @pmd_huge_pte:     Protected by ptdesc->ptl, used for THPs.
  * @__page_mapping:   Aliases with page->mapping. Unused for page tables.
+ * @pt_index:         Used for s390 gmap.
  * @pt_mm:            Used for x86 pgds.
  * @pt_frag_refcount: For fragmented page table tracking. Powerpc only.
  * @pt_share_count:   Used for HugeTLB PMD page table share count.
  * @_pt_pad_2:        Padding to ensure proper alignment.
  * @ptl:              Lock for the page table.
  * @__page_type:      Same as page->page_type. Unused for page tables.
- * @_refcount:        Same as page refcount.
+ * @__page_refcount:  Same as page refcount.
  * @pt_memcg_data:    Memcg data. Tracked for page tables here.
  *
  * This struct overlays struct page for now. Do not modify without a good
@@ -455,6 +473,7 @@ struct ptdesc {
 	unsigned long __page_mapping;
 
 	union {
+		pgoff_t pt_index;
 		struct mm_struct *pt_mm;
 		atomic_t pt_frag_refcount;
 #ifdef CONFIG_HUGETLB_PMD_PAGE_TABLE_SHARING
@@ -471,7 +490,7 @@ struct ptdesc {
 #endif
 	};
 	unsigned int __page_type;
-	atomic_t _refcount;
+	atomic_t __page_refcount;
 #ifdef CONFIG_MEMCG
 	unsigned long pt_memcg_data;
 #endif
@@ -483,9 +502,10 @@ TABLE_MATCH(flags, __page_flags);
 TABLE_MATCH(compound_head, pt_list);
 TABLE_MATCH(compound_head, _pt_pad_1);
 TABLE_MATCH(mapping, __page_mapping);
+TABLE_MATCH(index, pt_index);
 TABLE_MATCH(rcu_head, pt_rcu_head);
 TABLE_MATCH(page_type, __page_type);
-TABLE_MATCH(_refcount, _refcount);
+TABLE_MATCH(_refcount, __page_refcount);
 #ifdef CONFIG_MEMCG
 TABLE_MATCH(memcg_data, pt_memcg_data);
 #endif
@@ -551,7 +571,10 @@ static inline void ptdesc_pmd_pts_init(struct ptdesc *ptdesc)
  */
 #define page_private(page)		((page)->private)
 
-void set_page_private(struct page *page, unsigned long private);
+static inline void set_page_private(struct page *page, unsigned long private)
+{
+	page->private = private;
+}
 
 static inline void *folio_get_private(struct folio *folio)
 {
@@ -574,6 +597,12 @@ struct page_frag_cache {
 };
 
 typedef unsigned long vm_flags_t;
+
+/*
+ * freeptr_t represents a SLUB freelist pointer, which might be encoded
+ * and not dereferenceable if CONFIG_SLAB_FREELIST_HARDENED is enabled.
+ */
+typedef struct { unsigned long v; } freeptr_t;
 
 /*
  * A region containing a mapping of a non-memory backed file under NOMMU
@@ -610,9 +639,29 @@ struct anon_vma_name {
 	char name[];
 };
 
-struct vma_lock {
-	struct rw_semaphore lock;
-};
+#ifdef CONFIG_ANON_VMA_NAME
+/*
+ * mmap_lock should be read-locked when calling anon_vma_name(). Caller should
+ * either keep holding the lock while using the returned pointer or it should
+ * raise anon_vma_name refcount before releasing the lock.
+ */
+struct anon_vma_name *anon_vma_name(struct vm_area_struct *vma);
+struct anon_vma_name *anon_vma_name_alloc(const char *name);
+void anon_vma_name_free(struct kref *kref);
+#else /* CONFIG_ANON_VMA_NAME */
+static inline struct anon_vma_name *anon_vma_name(struct vm_area_struct *vma)
+{
+	return NULL;
+}
+
+static inline struct anon_vma_name *anon_vma_name_alloc(const char *name)
+{
+	return NULL;
+}
+#endif
+
+#define VMA_LOCK_OFFSET	0x40000000
+#define VMA_REF_LIMIT	(VMA_LOCK_OFFSET - 1)
 
 struct vma_numab_state {
 	/*
@@ -655,6 +704,12 @@ struct vma_numab_state {
  * per VM-area/task. A VM area is any part of the process virtual memory
  * space that has a special rule for the page-fault handlers (ie a shared
  * library, the executable area etc).
+ *
+ * Only explicitly marked struct members may be accessed by RCU readers before
+ * getting a stable reference.
+ *
+ * WARNING: when adding new members, please update vm_area_init_from() to copy
+ * them during vm_area_struct content duplication.
  */
 struct vm_area_struct {
 	/* The first cache line has the info for VMA tree walking. */
@@ -665,12 +720,14 @@ struct vm_area_struct {
 			unsigned long vm_start;
 			unsigned long vm_end;
 		};
-#ifdef CONFIG_PER_VMA_LOCK
-		struct rcu_head vm_rcu;	/* Used for deferred freeing. */
-#endif
+		freeptr_t vm_freeptr; /* Pointer used by SLAB_TYPESAFE_BY_RCU */
 	};
 
-	struct mm_struct *vm_mm;	/* The address space we belong to. */
+	/*
+	 * The address space we belong to.
+	 * Unstable RCU readers are allowed to read this.
+	 */
+	struct mm_struct *vm_mm;
 	pgprot_t vm_page_prot;          /* Access permissions of this VMA. */
 
 	/*
@@ -683,16 +740,13 @@ struct vm_area_struct {
 	};
 
 #ifdef CONFIG_PER_VMA_LOCK
-	/* Flag to indicate areas detached from the mm->mm_mt tree */
-	bool detached;
-
 	/*
 	 * Can only be written (using WRITE_ONCE()) while holding both:
 	 *  - mmap_lock (in write mode)
-	 *  - vm_lock->lock (in write mode)
+	 *  - vm_refcnt bit at VMA_LOCK_OFFSET is set
 	 * Can be read reliably while holding one of:
 	 *  - mmap_lock (in read or write mode)
-	 *  - vm_lock->lock (in read or write mode)
+	 *  - vm_refcnt bit at VMA_LOCK_OFFSET is set or vm_refcnt > 1
 	 * Can be read unreliably (using READ_ONCE()) for pessimistic bailout
 	 * while holding nothing (except RCU to keep the VMA struct allocated).
 	 *
@@ -700,20 +754,8 @@ struct vm_area_struct {
 	 * counter reuse can only lead to occasional unnecessary use of the
 	 * slowpath.
 	 */
-	int vm_lock_seq;
-	struct vma_lock *vm_lock;
+	unsigned int vm_lock_seq;
 #endif
-
-	/*
-	 * For areas with an address space and backing store,
-	 * linkage into the address_space->i_mmap interval tree.
-	 *
-	 */
-	struct {
-		struct rb_node rb;
-		unsigned long rb_subtree_last;
-	} shared;
-
 	/*
 	 * A file's MAP_PRIVATE vma can be in both i_mmap tree and anon_vma
 	 * list, after a COW of one of the file pages.	A MAP_SHARED vma
@@ -733,14 +775,6 @@ struct vm_area_struct {
 	struct file * vm_file;		/* File we map to (can be NULL). */
 	void * vm_private_data;		/* was vm_pte (shared mem) */
 
-#ifdef CONFIG_ANON_VMA_NAME
-	/*
-	 * For private and shared anonymous mappings, a pointer to a null
-	 * terminated string containing the name given to the vma, or NULL if
-	 * unnamed. Serialized by mmap_lock. Use anon_vma_name to access.
-	 */
-	struct anon_vma_name *anon_name;
-#endif
 #ifdef CONFIG_SWAP
 	atomic_long_t swap_readahead_info;
 #endif
@@ -753,6 +787,30 @@ struct vm_area_struct {
 #ifdef CONFIG_NUMA_BALANCING
 	struct vma_numab_state *numab_state;	/* NUMA Balancing state */
 #endif
+#ifdef CONFIG_PER_VMA_LOCK
+	/* Unstable RCU readers are allowed to read this. */
+	refcount_t vm_refcnt ____cacheline_aligned_in_smp;
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	struct lockdep_map vmlock_dep_map;
+#endif
+#endif
+	/*
+	 * For areas with an address space and backing store,
+	 * linkage into the address_space->i_mmap interval tree.
+	 *
+	 */
+	struct {
+		struct rb_node rb;
+		unsigned long rb_subtree_last;
+	} shared;
+#ifdef CONFIG_ANON_VMA_NAME
+	/*
+	 * For private and shared anonymous mappings, a pointer to a null
+	 * terminated string containing the name given to the vma, or NULL if
+	 * unnamed. Serialized by mmap_lock. Use anon_vma_name to access.
+	 */
+	struct anon_vma_name *anon_name;
+#endif
 	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
 
 	ANDROID_KABI_RESERVE(1);
@@ -760,6 +818,12 @@ struct vm_area_struct {
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
 } __randomize_layout;
+
+#ifdef CONFIG_NUMA
+#define vma_policy(vma) ((vma)->vm_policy)
+#else
+#define vma_policy(vma) NULL
+#endif
 
 #ifdef CONFIG_SCHED_MM_CID
 struct mm_cid {
@@ -769,6 +833,7 @@ struct mm_cid {
 #endif
 
 struct kioctx_table;
+struct iommu_mm_data;
 struct mm_struct {
 	struct {
 		/*
@@ -787,11 +852,7 @@ struct mm_struct {
 		} ____cacheline_aligned_in_smp;
 
 		struct maple_tree mm_mt;
-#ifdef CONFIG_MMU
-		unsigned long (*get_unmapped_area) (struct file *filp,
-				unsigned long addr, unsigned long len,
-				unsigned long pgoff, unsigned long flags);
-#endif
+
 		unsigned long mmap_base;	/* base of mmap area */
 		unsigned long mmap_legacy_base;	/* base of mmap area in bottom-up allocations */
 #ifdef CONFIG_HAVE_ARCH_COMPAT_MMAP_BASES
@@ -867,12 +928,16 @@ struct mm_struct {
 					  * by mmlist_lock
 					  */
 #ifdef CONFIG_PER_VMA_LOCK
+		struct rcuwait vma_writer_wait;
 		/*
 		 * This field has lock-like semantics, meaning it is sometimes
 		 * accessed with ACQUIRE/RELEASE semantics.
 		 * Roughly speaking, incrementing the sequence number is
 		 * equivalent to releasing locks on VMAs; reading the sequence
 		 * number can be part of taking a read lock on a VMA.
+		 * Incremented every time mmap_lock is write-locked/unlocked.
+		 * Initialized to 0, therefore odd values indicate mmap_lock
+		 * is write-locked and even values that it's released.
 		 *
 		 * Can be modified under write mmap_lock using RELEASE
 		 * semantics.
@@ -881,7 +946,7 @@ struct mm_struct {
 		 * Can be read with ACQUIRE semantics if not holding write
 		 * mmap_lock.
 		 */
-		int mm_lock_seq;
+		seqcount_t mm_lock_seq;
 #endif
 
 
@@ -944,7 +1009,7 @@ struct mm_struct {
 #ifdef CONFIG_MMU_NOTIFIER
 		struct mmu_notifier_subscriptions *notifier_subscriptions;
 #endif
-#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !defined(CONFIG_SPLIT_PMD_PTLOCKS)
 		pgtable_t pmd_huge_pte; /* protected by page_table_lock */
 #endif
 #ifdef CONFIG_NUMA_BALANCING
@@ -980,8 +1045,8 @@ struct mm_struct {
 #endif
 		struct work_struct async_put_work;
 
-#ifdef CONFIG_IOMMU_SVA
-		u32 pasid;
+#ifdef CONFIG_IOMMU_MM_DATA
+		struct iommu_mm_data *iommu_mm;
 #endif
 #ifdef CONFIG_KSM
 		/*
@@ -1000,7 +1065,7 @@ struct mm_struct {
 		 */
 		atomic_long_t ksm_zero_pages;
 #endif /* CONFIG_KSM */
-#ifdef CONFIG_LRU_GEN
+#ifdef CONFIG_LRU_GEN_WALKS_MMU
 		struct {
 			/* this mm_struct is on lru_gen_mm_list */
 			struct list_head list;
@@ -1015,10 +1080,9 @@ struct mm_struct {
 			struct mem_cgroup *memcg;
 #endif
 		} lru_gen;
-#endif /* CONFIG_LRU_GEN */
+#endif /* CONFIG_LRU_GEN_WALKS_MMU */
 
-		ANDROID_KABI_RESERVE(1);
-		ANDROID_BACKPORT_USE(1, struct task_dma_buf_info *dmabuf_info);
+		ANDROID_KABI_USE(1, struct task_dma_buf_info *dmabuf_info);
 	} __randomize_layout;
 
 	/*
@@ -1056,11 +1120,13 @@ struct lru_gen_mm_list {
 	spinlock_t lock;
 };
 
+#endif /* CONFIG_LRU_GEN */
+
+#ifdef CONFIG_LRU_GEN_WALKS_MMU
+
 void lru_gen_add_mm(struct mm_struct *mm);
 void lru_gen_del_mm(struct mm_struct *mm);
-#ifdef CONFIG_MEMCG
 void lru_gen_migrate_mm(struct mm_struct *mm);
-#endif
 
 static inline void lru_gen_init_mm(struct mm_struct *mm)
 {
@@ -1081,7 +1147,7 @@ static inline void lru_gen_use_mm(struct mm_struct *mm)
 	WRITE_ONCE(mm->lru_gen.bitmap, -1);
 }
 
-#else /* !CONFIG_LRU_GEN */
+#else /* !CONFIG_LRU_GEN_WALKS_MMU */
 
 static inline void lru_gen_add_mm(struct mm_struct *mm)
 {
@@ -1091,11 +1157,9 @@ static inline void lru_gen_del_mm(struct mm_struct *mm)
 {
 }
 
-#ifdef CONFIG_MEMCG
 static inline void lru_gen_migrate_mm(struct mm_struct *mm)
 {
 }
-#endif
 
 static inline void lru_gen_init_mm(struct mm_struct *mm)
 {
@@ -1105,7 +1169,7 @@ static inline void lru_gen_use_mm(struct mm_struct *mm)
 {
 }
 
-#endif /* CONFIG_LRU_GEN */
+#endif /* CONFIG_LRU_GEN_WALKS_MMU */
 
 struct vma_iterator {
 	struct ma_state mas;
@@ -1116,7 +1180,8 @@ struct vma_iterator {
 		.mas = {						\
 			.tree = &(__mm)->mm_mt,				\
 			.index = __addr,				\
-			.node = MAS_START,				\
+			.node = NULL,					\
+			.status = ma_start,				\
 		},							\
 	}
 
@@ -1182,14 +1247,15 @@ static inline void mm_init_cid(struct mm_struct *mm)
 	cpumask_clear(mm_cidmask(mm));
 }
 
-static inline int mm_alloc_cid(struct mm_struct *mm)
+static inline int mm_alloc_cid_noprof(struct mm_struct *mm)
 {
-	mm->pcpu_cid = alloc_percpu(struct mm_cid);
+	mm->pcpu_cid = alloc_percpu_noprof(struct mm_cid);
 	if (!mm->pcpu_cid)
 		return -ENOMEM;
 	mm_init_cid(mm);
 	return 0;
 }
+#define mm_alloc_cid(...)	alloc_hooks(mm_alloc_cid_noprof(__VA_ARGS__))
 
 static inline void mm_destroy_cid(struct mm_struct *mm)
 {
@@ -1312,6 +1378,9 @@ struct vm_special_mapping {
 
 	int (*mremap)(const struct vm_special_mapping *sm,
 		     struct vm_area_struct *new_vma);
+
+	void (*close)(const struct vm_special_mapping *sm,
+		      struct vm_area_struct *vma);
 };
 
 enum tlb_flush_reason {

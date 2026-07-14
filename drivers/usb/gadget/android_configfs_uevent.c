@@ -8,7 +8,6 @@
 #include <linux/err.h>
 #include <linux/kdev_t.h>
 #include <linux/spinlock.h>
-#include <trace/hooks/usb.h>
 
 static struct android_uevent_opts *android_opts;
 
@@ -118,9 +117,6 @@ static void android_work(struct work_struct *data)
 		 */
 		dev_dbg(dev, "did not send uevent\n");
 	}
-
-	trace_android_vh_configfs_uevent_work(connected,
-		disconnected, configured, uevent_sent);
 }
 
 static ssize_t state_show(struct device *pdev,
@@ -275,50 +271,3 @@ void android_set_unconfigured(struct android_uevent_opts *opts)
 {
 	__android_set_configured(opts, false);
 }
-
-struct device *android_create_function_device(char *name, void *drvdata,
-	       const struct attribute_group **groups)
-{
-	struct android_uevent_opts *opts;
-	struct device *dev;
-	unsigned long flags;
-	int id;
-
-	spin_lock_irqsave(&opts_lock, flags);
-	opts = android_opts;
-	if (IS_ERR_OR_NULL(opts) || IS_ERR_OR_NULL(opts->dev)) {
-		spin_unlock_irqrestore(&opts_lock, flags);
-		return ERR_PTR(-ENODEV);
-	}
-
-	id = ida_alloc(&opts->function_ida, GFP_ATOMIC);
-	if (id < 0) {
-		spin_unlock_irqrestore(&opts_lock, flags);
-		return ERR_PTR(id);
-	}
-	// device_create_with_groups can sleep, so we must unlock first
-	spin_unlock_irqrestore(&opts_lock, flags);
-	dev = device_create_with_groups(&android_usb_class, opts->dev,
-	       MKDEV(0, id), drvdata, groups, name);
-	return dev;
-}
-EXPORT_SYMBOL_GPL(android_create_function_device);
-
-void android_remove_function_device(struct device *dev)
-{
-	struct android_uevent_opts *opts;
-	unsigned long flags;
-
-	device_destroy(&android_usb_class, dev->devt);
-
-	spin_lock_irqsave(&opts_lock, flags);
-	opts = android_opts;
-	if (IS_ERR_OR_NULL(opts)) {
-		spin_unlock_irqrestore(&opts_lock, flags);
-		return;
-	}
-
-	ida_free(&opts->function_ida, MINOR(dev->devt));
-	spin_unlock_irqrestore(&opts_lock, flags);
-}
-EXPORT_SYMBOL_GPL(android_remove_function_device);

@@ -148,6 +148,7 @@ config CRYPTO_SKCIPHER
 	tristate
 	select CRYPTO_SKCIPHER2
 	select CRYPTO_ALGAPI
+	select CRYPTO_ECB
 
 config CRYPTO_SKCIPHER2
 	tristate
@@ -374,28 +375,11 @@ config CRYPTO_ECRDSA
 	  One of the Russian cryptographic standard algorithms (called GOST
 	  algorithms). Only signature verification is implemented.
 
-config CRYPTO_SM2
-	tristate "SM2 (ShangMi 2)"
-	select CRYPTO_SM3
-	select CRYPTO_AKCIPHER
-	select CRYPTO_MANAGER
-	select MPILIB
-	select ASN1
-	help
-	  SM2 (ShangMi 2) public key algorithm
-
-	  Published by State Encryption Management Bureau, China,
-	  as specified by OSCCA GM/T 0003.1-2012 -- 0003.5-2012.
-
-	  References:
-	  https://datatracker.ietf.org/doc/draft-shen-sm2-ecdsa/
-	  http://www.oscca.gov.cn/sca/xxgk/2010-12/17/content_1002386.shtml
-	  http://www.gmbz.org.cn/main/bzlb.html
-
 config CRYPTO_CURVE25519
 	tristate "Curve25519"
 	select CRYPTO_KPP
 	select CRYPTO_LIB_CURVE25519_GENERIC
+	select CRYPTO_LIB_CURVE25519_INTERNAL
 	help
 	  Curve25519 elliptic curve (RFC7748)
 
@@ -694,6 +678,7 @@ config CRYPTO_ARC4
 config CRYPTO_CHACHA20
 	tristate "ChaCha"
 	select CRYPTO_LIB_CHACHA_GENERIC
+	select CRYPTO_LIB_CHACHA_INTERNAL
 	select CRYPTO_SKCIPHER
 	help
 	  The ChaCha20, XChaCha20, and XChaCha12 stream cipher algorithms
@@ -722,15 +707,6 @@ config CRYPTO_CBC
 
 	  This block cipher mode is required for IPSec ESP (XFRM_ESP).
 
-config CRYPTO_CFB
-	tristate "CFB (Cipher Feedback)"
-	select CRYPTO_SKCIPHER
-	select CRYPTO_MANAGER
-	help
-	  CFB (Cipher Feedback) mode (NIST SP800-38A)
-
-	  This block cipher mode is required for TPM2 Cryptography.
-
 config CRYPTO_CTR
 	tristate "CTR (Counter)"
 	select CRYPTO_SKCIPHER
@@ -751,7 +727,7 @@ config CRYPTO_CTS
 
 config CRYPTO_ECB
 	tristate "ECB (Electronic Codebook)"
-	select CRYPTO_SKCIPHER
+	select CRYPTO_SKCIPHER2
 	select CRYPTO_MANAGER
 	help
 	  ECB (Electronic Codebook) mode (NIST SP800-38A)
@@ -795,20 +771,6 @@ config CRYPTO_LRW
 	  rest is used to tie each cipher block to its logical position.
 
 	  See https://people.csail.mit.edu/rivest/pubs/LRW02.pdf
-
-config CRYPTO_OFB
-	tristate "OFB (Output Feedback)"
-	select CRYPTO_SKCIPHER
-	select CRYPTO_MANAGER
-	help
-	  OFB (Output Feedback) mode (NIST SP800-38A)
-
-	  This mode makes a block cipher into a synchronous
-	  stream cipher. It generates keystream blocks, which are then XORed
-	  with the plaintext blocks to get the ciphertext. Flipping a bit in the
-	  ciphertext produces a flipped bit in the plaintext at the same
-	  location. This property allows many error correcting codes to function
-	  normally even when applied before encryption.
 
 config CRYPTO_PCBC
 	tristate "PCBC (Propagating Cipher Block Chaining)"
@@ -1046,6 +1008,7 @@ config CRYPTO_POLY1305
 	tristate "Poly1305"
 	select CRYPTO_HASH
 	select CRYPTO_LIB_POLY1305_GENERIC
+	select CRYPTO_LIB_POLY1305_INTERNAL
 	help
 	  Poly1305 authenticator algorithm (RFC7539)
 
@@ -1538,26 +1501,6 @@ config CRYPTO_USER_API_ENABLE_OBSOLETE
 	  Allow obsolete cryptographic algorithms to be selected that have
 	  already been phased out from internal use by the kernel, and are
 	  only useful for userspace clients that still rely on them.
-
-config CRYPTO_STATS
-	bool "Crypto usage statistics"
-	depends on CRYPTO_USER
-	help
-	  Enable the gathering of crypto stats.
-
-	  Enabling this option reduces the performance of the crypto API.  It
-	  should only be enabled when there is actually a use case for it.
-
-	  This collects data sizes, numbers of requests, and numbers
-	  of errors processed by:
-	  - AEAD ciphers (encrypt, decrypt)
-	  - asymmetric key ciphers (encrypt, decrypt, verify, sign)
-	  - symmetric key ciphers (encrypt, decrypt)
-	  - compression algorithms (compress, decompress)
-	  - hash algorithms (hash)
-	  - key-agreement protocol primitives (setsecret, generate
-	    public key, compute shared secret)
-	  - RNG (generate, seed)
 
 endmenu
 

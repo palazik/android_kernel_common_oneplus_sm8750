@@ -2,11 +2,10 @@
 #ifndef __DRM_OF_H__
 #define __DRM_OF_H__
 
+#include <linux/err.h>
 #include <linux/of_graph.h>
 #if IS_ENABLED(CONFIG_OF) && IS_ENABLED(CONFIG_DRM_PANEL_BRIDGE)
-#ifndef __GENKSYMS__
 #include <linux/of.h>
-#endif
 #include <drm/drm_bridge.h>
 #endif
 

@@ -245,11 +245,11 @@ static inline bool linker_ctx(void)
 		/*
 		 * We cannot use vma_start_read() as it may fail due to
 		 * false locked (see comment in vma_start_read()). We
-		 * can avoid that by directly locking vm_lock under
+		 * can avoid that by using vma_start_read_locked under
 		 * mmap_lock, which guarantees that nobody can lock the
 		 * vma for write (vma_start_write()) under us.
 		 */
-		down_read(&vma->vm_lock->lock);
+		BUG_ON(!vma_start_read_locked(vma));
 
 		mmap_read_unlock(mm);
 	}
@@ -349,6 +349,10 @@ void madvise_vma_pad_pages(struct vm_area_struct *vma,
 
 	/* Only bionic's dynamic linker needs to hint padding pages. */
 	if (!linker_ctx())
+		return;
+
+	/* Keep this as the last check to avoid IO if possible. */
+	if (!is_elf_file(vma->vm_file))
 		return;
 
 	vma_set_pad_pages(vma, nr_pad_pages);

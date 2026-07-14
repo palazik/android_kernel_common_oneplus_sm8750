@@ -79,6 +79,7 @@
 #define UVC_QUIRK_DISABLE_AUTOSUSPEND	0x00008000
 #define UVC_QUIRK_INVALID_DEVICE_SOF	0x00010000
 #define UVC_QUIRK_MJPEG_NO_EOF		0x00020000
+#define UVC_QUIRK_MSXU_META		0x00040000
 
 /* Format flags */
 #define UVC_FMT_FLAG_COMPRESSED		0x00000001
@@ -90,7 +91,9 @@
 
 struct gpio_desc;
 struct sg_table;
+struct uvc_control;
 struct uvc_device;
+struct uvc_video_chain;
 
 /*
  * TODO: Put the most frequently accessed fields at the beginning of
@@ -116,7 +119,12 @@ struct uvc_control_mapping {
 	u8 entity[16];
 	u8 selector;
 
+	/*
+	 * Size of the control data in the payload of the UVC control GET and
+	 * SET requests, expressed in bits.
+	 */
 	u8 size;
+
 	u8 offset;
 	enum v4l2_ctrl_type v4l2_type;
 	u32 data_type;
@@ -129,10 +137,13 @@ struct uvc_control_mapping {
 	s32 master_manual;
 	u32 slave_ids[2];
 
-	s32 (*get)(struct uvc_control_mapping *mapping, u8 query,
-		   const u8 *data);
-	void (*set)(struct uvc_control_mapping *mapping, s32 value,
-		    u8 *data);
+	const struct uvc_control_mapping *(*filter_mapping)
+				(struct uvc_video_chain *chain,
+				struct uvc_control *ctrl);
+	int (*get)(struct uvc_control_mapping *mapping, u8 query,
+		   const void *uvc_in, size_t v4l2_size, void *v4l2_out);
+	int (*set)(struct uvc_control_mapping *mapping, size_t v4l2_size,
+		   const void *v4l2_in, void *uvc_out);
 };
 
 struct uvc_control {
@@ -392,7 +403,7 @@ struct uvc_stats_stream {
 	unsigned int max_sof;		/* Maximum STC.SOF value */
 };
 
-#define UVC_METADATA_BUF_SIZE 10240
+#define UVC_METADATA_BUF_MIN_SIZE 10240
 
 /**
  * struct uvc_copy_op: Context structure to schedule asynchronous memcpy
@@ -473,6 +484,7 @@ struct uvc_streaming {
 		struct video_device vdev;
 		struct uvc_video_queue queue;
 		u32 format;
+		u32 buffersize;
 	} meta;
 
 	/* Context data used by the bulk completion handler. */
@@ -509,6 +521,7 @@ struct uvc_streaming {
 		unsigned int head;
 		unsigned int count;
 		unsigned int size;
+		unsigned int last_sof_overflow;
 
 		u16 last_sof;
 		u16 sof_offset;
@@ -533,8 +546,14 @@ struct uvc_device_info {
 	u32	quirks;
 	u32	meta_format;
 	u16	uvc_version;
-	const struct uvc_control_mapping **mappings;
 };
+
+struct uvc_rect {
+	u16 top;
+	u16 left;
+	u16 bottom;
+	u16 right;
+} __packed;
 
 struct uvc_status_streaming {
 	u8	button;
@@ -556,6 +575,8 @@ struct uvc_status {
 	};
 } __packed;
 
+#define UVC_MAX_META_DATA_FORMATS 3
+
 struct uvc_device {
 	struct usb_device *udev;
 	struct usb_interface *intf;
@@ -568,6 +589,10 @@ struct uvc_device {
 
 	struct mutex lock;		/* Protects users */
 	unsigned int users;
+
+	u32 meta_formats[UVC_MAX_META_DATA_FORMATS];
+	unsigned int nmeta_formats;
+
 	atomic_t nmappings;
 
 	/* Video control interface */
@@ -716,8 +741,10 @@ static inline int uvc_queue_streaming(struct uvc_video_queue *queue)
 }
 
 static inline struct uvc_streaming *
-uvc_queue_to_stream(struct uvc_video_queue *queue)
+uvc_queue_to_stream(struct uvc_video_queue *queue, unsigned int type)
 {
+	if (type == V4L2_BUF_TYPE_META_CAPTURE)
+		return container_of(queue, struct uvc_streaming, meta.queue);
 	return container_of(queue, struct uvc_streaming, queue);
 }
 
@@ -742,6 +769,7 @@ int uvc_query_ctrl(struct uvc_device *dev, u8 query, u8 unit,
 void uvc_video_clock_update(struct uvc_streaming *stream,
 			    struct vb2_v4l2_buffer *vbuf,
 			    struct uvc_buffer *buf);
+int uvc_meta_init(struct uvc_device *dev);
 int uvc_meta_register(struct uvc_streaming *stream);
 
 int uvc_register_video_device(struct uvc_device *dev,
@@ -760,12 +788,10 @@ int uvc_status_start(struct uvc_device *dev, gfp_t flags);
 void uvc_status_stop(struct uvc_device *dev);
 
 /* Controls */
-extern const struct uvc_control_mapping uvc_ctrl_power_line_mapping_limited;
-extern const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc11;
 extern const struct v4l2_subscribed_event_ops uvc_ctrl_sub_ev_ops;
 
 int uvc_query_v4l2_ctrl(struct uvc_video_chain *chain,
-			struct v4l2_queryctrl *v4l2_ctrl);
+			struct v4l2_query_ext_ctrl *v4l2_ctrl);
 int uvc_query_v4l2_menu(struct uvc_video_chain *chain,
 			struct v4l2_querymenu *query_menu);
 
@@ -792,10 +818,11 @@ static inline int uvc_ctrl_rollback(struct uvc_fh *handle)
 	return __uvc_ctrl_commit(handle, 1, NULL);
 }
 
-int uvc_ctrl_get(struct uvc_video_chain *chain, struct v4l2_ext_control *xctrl);
+int uvc_ctrl_get(struct uvc_video_chain *chain, u32 which,
+		 struct v4l2_ext_control *xctrl);
 int uvc_ctrl_set(struct uvc_fh *handle, struct v4l2_ext_control *xctrl);
 int uvc_ctrl_is_accessible(struct uvc_video_chain *chain, u32 v4l2_id,
-			   const struct v4l2_ext_controls *ctrls,
+			   const struct v4l2_ext_controls *ctrls, u32 which,
 			   unsigned long ioctl);
 
 int uvc_xu_ctrl_query(struct uvc_video_chain *chain,

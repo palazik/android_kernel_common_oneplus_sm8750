@@ -30,14 +30,6 @@
 #define pgcompat_err(fmt, ...) \
 	pr_err("pgcompat [%i (%s)]: " fmt, task_pid_nr(current), current->comm, ## __VA_ARGS__)
 
-#ifdef CONFIG_SHMEM
-extern vm_fault_t shmem_fault(struct vm_fault *vmf);
-#endif	/* CONFIG_SHMEM */
-
-#ifdef CONFIG_F2FS_FS
-extern vm_fault_t f2fs_filemap_fault(struct vm_fault *vmf);
-#endif	/* CONFIG_F2FS_FS */
-
 #define __offset_in_page_log(addr)							\
 ({											\
 	if (static_branch_unlikely(&page_shift_compat_enabled) &&			\
@@ -143,6 +135,20 @@ static inline bool __is_emulated_pagemap_file(struct file *file)
 	return false;
 }
 #endif
+
+static __always_inline void __adjust_cachestat_counters(struct cachestat *cs)
+{
+	unsigned int nr_sub_pages = __PAGE_SIZE / PAGE_SIZE;
+
+	if (nr_sub_pages <= 1)
+		return;
+
+	cs->nr_cache /= nr_sub_pages;
+	cs->nr_dirty /= nr_sub_pages;
+	cs->nr_writeback /= nr_sub_pages;
+	cs->nr_evicted /= nr_sub_pages;
+	cs->nr_recently_evicted /= nr_sub_pages;
+}
 
 #endif /* !__ASSEMBLY__ */
 

@@ -5,6 +5,7 @@
  */
 
 #include <linux/kvm_host.h>
+#include <linux/arm-smccc.h>
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_hyp.h>
 #include <asm/kvm_hypevents.h>
@@ -21,11 +22,8 @@
 #include <nvhe/mem_protect.h>
 #include <nvhe/mm.h>
 #include <nvhe/modules.h>
-#include <nvhe/pkvm.h>
 
-#define KVM_HOST_S2_FLAGS (KVM_PGTABLE_S2_NOFWB | \
-			   KVM_PGTABLE_S2_IDMAP | \
-			   KVM_PGTABLE_S2_PREFAULT_BLOCK)
+#define KVM_HOST_S2_FLAGS (KVM_PGTABLE_S2_NOFWB | KVM_PGTABLE_S2_IDMAP)
 
 struct host_mmu host_mmu;
 
@@ -48,6 +46,15 @@ static struct kvm_pgtable_pte_ops guest_s2_pte_ops = {
 	.force_pte_cb = guest_stage2_force_pte_cb,
 	.pte_is_counted_cb = guest_stage2_pte_is_counted
 };
+
+static void pkvm_sme_dvmsync_fw_call(void)
+{
+	if (alternative_has_cap_unlikely(ARM64_WORKAROUND_4193714)) {
+		struct arm_smccc_res res;
+
+		arm_smccc_1_1_smc(ARM_SMCCC_CPU_WORKAROUND_4193714, &res);
+	}
+}
 
 static void guest_lock_component(struct pkvm_hyp_vm *vm)
 {
@@ -112,7 +119,7 @@ static void host_s2_put_page(void *addr)
 	hyp_put_page(&host_s2_pool, addr);
 }
 
-static void host_s2_free_unlinked_table(void *addr, u32 level)
+static void host_s2_free_unlinked_table(void *addr, s8 level)
 {
 	kvm_pgtable_stage2_free_unlinked(&host_mmu.mm_ops, host_mmu.pgt.pte_ops,
 					 addr, level);
@@ -151,8 +158,8 @@ static void prepare_host_vtcr(void)
 	parange = kvm_get_parange(id_aa64mmfr0_el1_sys_val);
 	phys_shift = id_aa64mmfr0_parange_to_phys_shift(parange);
 
-	host_mmu.arch.vtcr = kvm_get_vtcr(id_aa64mmfr0_el1_sys_val,
-					  id_aa64mmfr1_el1_sys_val, phys_shift);
+	host_mmu.arch.mmu.vtcr = kvm_get_vtcr(id_aa64mmfr0_el1_sys_val,
+					      id_aa64mmfr1_el1_sys_val, phys_shift);
 }
 
 static int prepopulate_host_stage2(void)
@@ -267,7 +274,7 @@ static void guest_s2_put_page(void *addr)
 	hyp_put_page(&current_vm->pool, addr);
 }
 
-static void guest_s2_free_unlinked_table(void *addr, u32 level)
+static void guest_s2_free_unlinked_table(void *addr, s8 level)
 {
 	/* We are trying to collapse a table into a block mapping. This is forbidden. */
 	WARN_ON(1);
@@ -338,13 +345,37 @@ static void invalidate_icache_guest_page(void *va, size_t size)
 	}
 }
 
-int kvm_guest_prepare_stage2(struct pkvm_hyp_vm *vm, void *pgd)
+static void hyp_flush_page(phys_addr_t phys, size_t size)
+{
+	WARN_ON(!PAGE_ALIGNED(size));
+
+	while (size) {
+		size_t __size = size == PMD_SIZE ? size : PAGE_SIZE;
+		void *addr = __fixmap_guest_page(__hyp_va(phys), &__size);
+
+		/*
+		 * Prefer kvm_flush_dcache_to_poc() over __clean_dcache_guest_page()
+		 * here as the latter may elide the CMO under the assumption that FWB
+		 * will be enabled on CPUs that support it. This is incorrect for the
+		 * host stage-2 and would otherwise lead to a malicious host potentially
+		 * being able to read the contents of newly reclaimed guest pages.
+		 */
+		kvm_flush_dcache_to_poc(addr, __size);
+		__fixunmap_guest_page(__size);
+
+		size -= __size;
+		phys += __size;
+	}
+}
+
+int kvm_guest_prepare_stage2(struct pkvm_hyp_vm *vm, void *pgd,
+			     enum kvm_pgtable_stage2_flags flags)
 {
 	struct kvm_s2_mmu *mmu = &vm->kvm.arch.mmu;
 	unsigned long nr_pages;
 	int ret;
 
-	nr_pages = kvm_pgtable_stage2_pgd_size(vm->kvm.arch.vtcr) >> PAGE_SHIFT;
+	nr_pages = kvm_pgtable_stage2_pgd_size(mmu->vtcr) >> PAGE_SHIFT;
 	ret = hyp_pool_init(&vm->pool, hyp_virt_to_pfn(pgd), nr_pages, 0);
 	if (ret)
 		return ret;
@@ -365,8 +396,7 @@ int kvm_guest_prepare_stage2(struct pkvm_hyp_vm *vm, void *pgd)
 	};
 
 	guest_lock_component(vm);
-	ret = __kvm_pgtable_stage2_init(mmu->pgt, mmu, &vm->mm_ops,
-					KVM_PGTABLE_S2_PREFAULT_BLOCK,
+	ret = __kvm_pgtable_stage2_init(mmu->pgt, mmu, &vm->mm_ops, flags,
 					&guest_s2_pte_ops);
 	guest_unlock_component(vm);
 	if (ret)
@@ -377,50 +407,39 @@ int kvm_guest_prepare_stage2(struct pkvm_hyp_vm *vm, void *pgd)
 	return 0;
 }
 
-struct relinquish_data {
-	enum pkvm_page_state expected_state;
-	u64 pa;
-};
-
-static int relinquish_walker(const struct kvm_pgtable_visit_ctx *ctx,
-			     enum kvm_pgtable_walk_flags visit)
+static enum pkvm_page_state guest_get_page_state(kvm_pte_t pte, u64 addr)
 {
-	u64 addr = ALIGN_DOWN(ctx->addr, kvm_granule_size(ctx->level));
-	kvm_pte_t pte = *ctx->ptep;
-	struct relinquish_data *data = ctx->arg;
-	enum pkvm_page_state state;
-	phys_addr_t phys;
+	enum pkvm_page_state state = 0;
+	enum kvm_pgtable_prot prot;
 
-	if (!kvm_pte_valid(pte))
-		return 0;
+	if (!kvm_pte_valid(pte)) {
+		state = PKVM_NOPAGE;
 
-	/* We don't support splitting non-leaf mappings */
-	if (ctx->level != (KVM_PGTABLE_MAX_LEVELS - 1))
-		return -E2BIG;
+		if (pte == KVM_INVALID_PTE_MMIO_NOTE)
+			state |= PKVM_MMIO;
 
-	state = pkvm_getstate(kvm_pgtable_stage2_pte_prot(pte));
-	if (state != data->expected_state)
-		return -EPERM;
+		return state;
+	}
 
-	phys = kvm_pte_to_phys(pte);
-	phys += ctx->addr - addr;
+	prot = kvm_pgtable_stage2_pte_prot(pte);
+	if (kvm_pte_valid(pte) && ((prot & KVM_PGTABLE_PROT_RWX) != KVM_PGTABLE_PROT_RWX))
+		state = PKVM_PAGE_RESTRICTED_PROT;
 
-	data->pa = phys;
-
-	return 0;
+	return state | pkvm_getstate(prot);
 }
 
 int __pkvm_guest_relinquish_to_host(struct pkvm_hyp_vcpu *vcpu,
-				    u64 ipa, u64 *ppa)
+				    u64 ipa, u64 flags, u64 *ppa)
 {
-	struct relinquish_data data;
-	struct kvm_pgtable_walker walker = {
-		.cb     = relinquish_walker,
-		.flags  = KVM_PGTABLE_WALK_LEAF,
-		.arg    = &data,
-	};
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
+	enum pkvm_page_state state;
+	u64 phys = 0, addr;
+	kvm_pte_t pte;
+	s8 level;
 	int ret;
+
+	if (!pkvm_hyp_vcpu_is_protected(vcpu))
+		return 0;
 
 	if (ipa & ~PAGE_MASK)
 		return -EINVAL;
@@ -428,30 +447,43 @@ int __pkvm_guest_relinquish_to_host(struct pkvm_hyp_vcpu *vcpu,
 	host_lock_component();
 	guest_lock_component(vm);
 
-	/* Expected page state depends on VM type. */
-	data.expected_state = pkvm_hyp_vcpu_is_protected(vcpu) ?
-		PKVM_PAGE_OWNED :
-		PKVM_PAGE_SHARED_BORROWED;
-
-	/* Set default pa value to "not found". */
-	data.pa = 0;
-
-	/* If ipa is mapped: poisons the page, and gets the pa. */
-	ret = kvm_pgtable_walk(&vm->pgt, ipa, PAGE_SIZE, &walker);
-	if (ret || !data.pa)
+	ret = kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, &level);
+	if (ret || !kvm_pte_valid(pte))
 		goto end;
+
+	/* We don't support splitting non-leaf mappings */
+	if (level != KVM_PGTABLE_LAST_LEVEL) {
+		ret = -E2BIG;
+		goto end;
+	}
+
+	state = guest_get_page_state(pte, ipa);
+	if (state != PKVM_PAGE_OWNED) {
+		ret = -EPERM;
+		goto end;
+	}
+
+	addr = ALIGN_DOWN(ipa, kvm_granule_size(level));
+	phys = kvm_pte_to_phys(pte);
+	phys += ipa - addr;
+	/* page might be used for DMA! */
+	if (hyp_page_count(hyp_phys_to_virt(phys))) {
+		ret = -EBUSY;
+		goto end;
+	}
 
 	/* Zap the guest stage2 pte and return ownership to the host */
 	ret = kvm_pgtable_stage2_unmap(&vm->pgt, ipa, PAGE_SIZE);
 	if (ret)
 		goto end;
 
-	if (pkvm_hyp_vcpu_is_protected(vcpu)) {
-		hyp_poison_page(data.pa, PAGE_SIZE);
-		psci_mem_protect_dec(1);
-	}
+	if (!(flags & KVM_FUNC_MEM_RELINQUISH_NO_POISON))
+		hyp_poison_page(phys, PAGE_SIZE);
+	else
+		hyp_flush_page(phys, PAGE_SIZE);
+	psci_mem_protect_dec(1);
 
-	WARN_ON(host_stage2_set_owner_locked(data.pa, PAGE_SIZE, PKVM_ID_HOST));
+	WARN_ON(host_stage2_set_owner_locked(phys, PAGE_SIZE, PKVM_ID_HOST));
 
 	if (pkvm_ipa_range_has_pvmfw(vm, ipa, ipa + PAGE_SIZE))
 		vm->kvm.arch.pkvm.pvmfw_load_addr = PVMFW_INVALID_LOAD_ADDR;
@@ -460,7 +492,8 @@ end:
 	guest_unlock_component(vm);
 	host_unlock_component();
 
-	*ppa = data.pa;
+	*ppa = phys;
+
 	return ret;
 }
 
@@ -473,7 +506,7 @@ int __pkvm_prot_finalize(void)
 		return -EPERM;
 
 	params->vttbr = kvm_get_vttbr(mmu);
-	params->vtcr = host_mmu.arch.vtcr;
+	params->vtcr = mmu->vtcr;
 	params->hcr_el2 |= HCR_VM;
 
 	/*
@@ -575,6 +608,18 @@ static enum kvm_pgtable_prot default_hyp_prot(phys_addr_t phys)
 	return addr_is_memory(phys) ? PAGE_HYP : PAGE_HYP_DEVICE;
 }
 
+/*
+ * Use NORMAL_NC for guest MMIO, when a guest has:
+ * No FWB: It will combined with stage-1 attrs where device has precedence over normal.
+ * FWB: With MT_S2_FWB_NORMAL_NC encoding, results in device if stage-1 used device attr.
+ *      otherwise NC.
+ */
+static enum kvm_pgtable_prot default_guest_prot(bool is_memory)
+{
+	return is_memory ? KVM_PGTABLE_PROT_RWX :
+		KVM_PGTABLE_PROT_RW | KVM_PGTABLE_PROT_NORMAL_NC;
+}
+
 bool addr_is_memory(phys_addr_t phys)
 {
 	struct kvm_mem_range range;
@@ -582,33 +627,28 @@ bool addr_is_memory(phys_addr_t phys)
 	return !!find_mem_range(phys, &range);
 }
 
-static bool is_range_refcounted(phys_addr_t addr, u64 nr_pages)
+static bool is_in_mem_range(u64 addr, struct kvm_mem_range *range)
 {
-	struct hyp_page *p;
-	int i;
-
-	for (i = 0 ; i < nr_pages ; ++i) {
-		p = hyp_phys_to_page(addr + i * PAGE_SIZE);
-		if (hyp_refcount_get(p->refcount))
-			return true;
-	}
-
-	return false;
+	return range->start <= addr && addr < range->end;
 }
 
-static bool addr_is_allowed_memory(phys_addr_t phys)
+static int check_range_allowed_memory(u64 start, u64 end)
 {
 	struct memblock_region *reg;
 	struct kvm_mem_range range;
 
-	reg = find_mem_range(phys, &range);
+	/*
+	 * Callers can't check the state of a range that overlaps memory and
+	 * MMIO regions, so ensure [start, end[ is in the same kvm_mem_range.
+	 */
+	reg = find_mem_range(start, &range);
+	if (!is_in_mem_range(end - 1, &range))
+		return -EINVAL;
 
-	return reg && !(reg->flags & MEMBLOCK_NOMAP);
-}
+	if (!reg || reg->flags & MEMBLOCK_NOMAP)
+		return -EPERM;
 
-static bool is_in_mem_range(u64 addr, struct kvm_mem_range *range)
-{
-	return range->start <= addr && addr < range->end;
+	return 0;
 }
 
 static bool range_is_memory(u64 start, u64 end)
@@ -621,20 +661,16 @@ static bool range_is_memory(u64 start, u64 end)
 	return is_in_mem_range(end - 1, &r);
 }
 
-static inline int __host_stage2_idmap(u64 start, u64 end,
-				      enum kvm_pgtable_prot prot,
-				      bool update_iommu)
+static void __host_stage2_idmap_complete(enum kvm_pgtable_prot prot)
 {
-	int ret;
+	if ((prot & KVM_PGTABLE_PROT_RW) != KVM_PGTABLE_PROT_RW)
+		pkvm_sme_dvmsync_fw_call();
+}
 
-	ret = kvm_pgtable_stage2_map(&host_mmu.pgt, start, end - start, start,
-				     prot, &host_s2_pool, 0);
-	if (ret)
-		return ret;
-
-	if (update_iommu)
-		kvm_iommu_host_stage2_idmap(start, end, prot);
-	return 0;
+static inline int __host_stage2_idmap(u64 start, u64 end, enum kvm_pgtable_prot prot)
+{
+	return kvm_pgtable_stage2_map(&host_mmu.pgt, start, end - start, start,
+				      prot, &host_s2_pool, 0);
 }
 
 /*
@@ -666,7 +702,7 @@ static int host_stage2_adjust_range(u64 addr, struct kvm_mem_range *range)
 {
 	struct kvm_mem_range cur;
 	kvm_pte_t pte;
-	u32 level;
+	s8 level;
 	int ret;
 
 	hyp_assert_lock_held(&host_mmu.lock);
@@ -688,7 +724,7 @@ static int host_stage2_adjust_range(u64 addr, struct kvm_mem_range *range)
 		cur.start = ALIGN_DOWN(addr, granule);
 		cur.end = cur.start + granule;
 		level++;
-	} while ((level < KVM_PGTABLE_MAX_LEVELS) &&
+	} while ((level <= KVM_PGTABLE_LAST_LEVEL) &&
 			!(kvm_level_supports_block_mapping(level) &&
 			  range_included(&cur, range)));
 
@@ -701,7 +737,19 @@ int host_stage2_idmap_locked(phys_addr_t addr, u64 size,
 			     enum kvm_pgtable_prot prot,
 			     bool update_iommu)
 {
-	return host_stage2_try(__host_stage2_idmap, addr, addr + size, prot, update_iommu);
+	int ret = host_stage2_try(__host_stage2_idmap, addr, addr + size, prot);
+
+	if (ret)
+		return ret;
+
+	__host_stage2_idmap_complete(prot);
+
+	if (update_iommu) {
+		kvm_iommu_host_stage2_idmap(addr, addr + size, prot);
+		kvm_iommu_host_stage2_idmap_complete(!!prot);
+	}
+
+	return 0;
 }
 
 #define KVM_MAX_OWNER_ID               FIELD_MAX(KVM_INVALID_PTE_OWNER_MASK)
@@ -719,8 +767,30 @@ static void __host_update_page_state(phys_addr_t addr, u64 size, enum pkvm_page_
 		hyp_phys_to_page(addr)->host_state = state;
 }
 
-static int __host_stage2_set_owner_locked(phys_addr_t addr, u64 size, u8 owner_id, bool is_memory,
-					  enum pkvm_page_state nopage_state, bool update_iommu)
+enum host_set_page_state_flags {
+	HOST_SET_IS_MMIO		= BIT(0),
+	HOST_SET_NO_IOMMU_UPDATE	= BIT(1),
+	HOST_SET_NO_COMPLETE		= BIT(2), /* Skip __host_stage2_set_owner_complete() */
+};
+
+static void __host_stage2_set_owner_complete(u8 owner_id, enum host_set_page_state_flags flags)
+{
+	bool is_memory = !(flags & HOST_SET_IS_MMIO);
+	bool map = owner_id == PKVM_ID_HOST;
+
+	hyp_assert_lock_held(&host_mmu.lock);
+
+	__host_stage2_idmap_complete(map ? default_host_prot(is_memory) : 0);
+
+	if (flags & HOST_SET_NO_IOMMU_UPDATE)
+		return;
+
+	kvm_iommu_host_stage2_idmap_complete(map);
+}
+
+static int __host_stage2_set_owner_locked(phys_addr_t addr, u64 size, u8 owner_id,
+					  enum pkvm_page_state nopage_state,
+					  enum host_set_page_state_flags flags)
 {
 	kvm_pte_t annotation;
 	enum kvm_pgtable_prot prot;
@@ -730,7 +800,7 @@ static int __host_stage2_set_owner_locked(phys_addr_t addr, u64 size, u8 owner_i
 		return -EINVAL;
 
 	if (owner_id == PKVM_ID_HOST) {
-		prot = default_host_prot(addr_is_memory(addr));
+		prot = default_host_prot(!(flags & HOST_SET_IS_MMIO));
 		ret = host_stage2_idmap_locked(addr, size, prot, false);
 	} else {
 		annotation = kvm_init_invalid_leaf_owner(owner_id);
@@ -741,12 +811,20 @@ static int __host_stage2_set_owner_locked(phys_addr_t addr, u64 size, u8 owner_i
 	if (ret)
 		return ret;
 
-	if (update_iommu) {
-		prot = owner_id == PKVM_ID_HOST ? PKVM_HOST_MEM_PROT : 0;
-		kvm_iommu_host_stage2_idmap(addr, addr + size, prot);
-	}
+	if (flags & HOST_SET_NO_IOMMU_UPDATE)
+		goto complete;
 
-	if (!is_memory)
+	prot = owner_id == PKVM_ID_HOST ? PKVM_HOST_MEM_PROT : 0;
+	kvm_iommu_host_stage2_idmap(addr, addr + size, prot);
+
+complete:
+	if (flags & HOST_SET_NO_COMPLETE)
+		goto update_vmemmap;
+
+	__host_stage2_set_owner_complete(owner_id, flags);
+
+update_vmemmap:
+	if (flags & HOST_SET_IS_MMIO)
 		return 0;
 
 	/* Don't forget to update the vmemmap tracking for the host */
@@ -760,7 +838,8 @@ static int __host_stage2_set_owner_locked(phys_addr_t addr, u64 size, u8 owner_i
 
 int host_stage2_set_owner_locked(phys_addr_t addr, u64 size, u8 owner_id)
 {
-	return __host_stage2_set_owner_locked(addr, size, owner_id, addr_is_memory(addr), 0, true);
+	return __host_stage2_set_owner_locked(addr, size, owner_id, 0,
+					      addr_is_memory(addr) ? 0 : HOST_SET_IS_MMIO);
 }
 
 static bool host_stage2_force_pte(u64 addr, u64 end, enum kvm_pgtable_prot prot)
@@ -874,53 +953,6 @@ static void host_inject_abort(struct kvm_cpu_context *host_ctxt)
 	write_sysreg_el2(spsr, SYS_SPSR);
 }
 
-#define MAX_HOST_FAULT_HANDLERS 16
-
-static int
-(*perm_fault_handlers[MAX_HOST_FAULT_HANDLERS])(struct user_pt_regs *regs, u64 esr, u64 addr);
-
-int hyp_register_host_perm_fault_handler(int (*cb)(struct user_pt_regs *regs, u64 esr, u64 addr))
-{
-	static DEFINE_HYP_SPINLOCK(handlers_lock);
-	int i;
-
-	hyp_spin_lock(&handlers_lock);
-
-	for (i = 0; i < MAX_HOST_FAULT_HANDLERS; i++) {
-		if (!perm_fault_handlers[i]) {
-			WRITE_ONCE(perm_fault_handlers[i], cb);
-			break;
-		}
-	}
-
-	hyp_spin_unlock(&handlers_lock);
-
-	return i >= MAX_HOST_FAULT_HANDLERS ? -EBUSY : 0;
-}
-
-static int handle_host_perm_fault(struct kvm_cpu_context *host_ctxt, u64 esr, u64 addr)
-{
-	int (*cb)(struct user_pt_regs *regs, u64 esr, u64 addr);
-	bool handled = false;
-	int i;
-
-	for (i = 0; i < MAX_HOST_FAULT_HANDLERS; i++) {
-		int err;
-
-		cb = READ_ONCE(perm_fault_handlers[i]);
-		if (!cb)
-			break;
-
-		handled = true;
-
-		err = cb(&host_ctxt->regs, esr, addr);
-		if (err)
-			return err;
-	}
-
-	return handled ? 0 : -EPERM;
-}
-
 static bool is_dabt(u64 esr)
 {
 	return ESR_ELx_EC(esr) == ESR_ELx_EC_DABT_LOW;
@@ -930,16 +962,17 @@ void handle_host_mem_abort(struct kvm_cpu_context *host_ctxt)
 {
 	struct kvm_vcpu_fault_info fault;
 	u64 esr, addr;
-	int ret = -EPERM;
+	int ret;
 
 	esr = read_sysreg_el2(SYS_ESR);
 	if (!__get_fault_info(esr, &fault)) {
+		/* Setting the address to an invalid value for use in tracing. */
 		addr = (u64)-1;
 		/*
 		 * We've presumably raced with a page-table change which caused
 		 * AT to fail, try again.
 		 */
-		goto return_to_host;
+		return;
 	}
 
 	addr = (fault.hpfar_el2 & HPFAR_MASK) << 8;
@@ -949,12 +982,18 @@ void handle_host_mem_abort(struct kvm_cpu_context *host_ctxt)
 	    kvm_iommu_host_dabt_handler(host_ctxt, esr, addr))
 		goto return_to_host;
 
-	/* If not handled, attempt to map the page. */
-	if (ret == -EPERM)
+	switch (esr & ESR_ELx_FSC_TYPE) {
+	case ESR_ELx_FSC_FAULT:
 		ret = host_stage2_idmap(addr);
-
-	if ((esr & ESR_ELx_FSC_TYPE) == ESR_ELx_FSC_PERM)
-		ret = handle_host_perm_fault(host_ctxt, esr, addr);
+		break;
+	case ESR_ELx_FSC_PERM:
+		ret = module_handle_host_perm_fault(&host_ctxt->regs, esr, addr);
+		ret = ret ? 0 /* handled */ : -EPERM;
+		break;
+	default:
+		ret = -EPERM;
+		break;
+	}
 
 	if (ret == -EPERM)
 		host_inject_abort(host_ctxt);
@@ -964,52 +1003,6 @@ void handle_host_mem_abort(struct kvm_cpu_context *host_ctxt)
 return_to_host:
 	trace_host_mem_abort(esr, addr);
 }
-
-struct pkvm_mem_transition {
-	u64				nr_pages;
-
-	struct {
-		enum pkvm_component_id	id;
-		/* Address in the initiator's address space */
-		u64			addr;
-
-		union {
-			struct {
-				/* Address in the completer's address space */
-				u64	completer_addr;
-			} host;
-			struct {
-				u64	completer_addr;
-			} hyp;
-			struct {
-				struct pkvm_hyp_vm *hyp_vm;
-				struct kvm_hyp_memcache *mc;
-			} guest;
-		};
-	} initiator;
-
-	struct {
-		enum pkvm_component_id	id;
-
-		union {
-			struct {
-				struct pkvm_hyp_vm *hyp_vm;
-				struct kvm_hyp_memcache *mc;
-				phys_addr_t phys;
-			} guest;
-		};
-
-		const enum kvm_pgtable_prot		prot;
-	} completer;
-};
-
-struct pkvm_checked_mem_transition {
-	const struct pkvm_mem_transition	*tx;
-	u64					completer_addr;
-
-	/* Number of physically contiguous pages */
-	u64					nr_pages;
-};
 
 struct check_walk_data {
 	enum pkvm_page_state	desired;
@@ -1055,17 +1048,34 @@ static enum pkvm_page_state host_get_mmio_page_state(kvm_pte_t pte, u64 addr)
 	return state | pkvm_getstate(prot);
 }
 
+enum host_check_page_state_flags {
+	HOST_CHECK_NULL_REFCNT		= BIT(0),
+	HOST_CHECK_IS_MEMORY		= BIT(1),
+	HOST_CHECK_ALLOW_NO_MAP		= BIT(2),
+};
+
 static int ___host_check_page_state_range(u64 addr, u64 size,
 					  enum pkvm_page_state state,
-					  struct memblock_region *reg)
+					  enum host_check_page_state_flags flags)
 {
 	struct check_walk_data d = {
 		.desired	= state,
 		.get_page_state	= host_get_mmio_page_state,
 	};
+	struct hyp_page *p;
+	struct memblock_region *reg;
+	struct kvm_mem_range range;
 	u64 end;
 
 	if (check_add_overflow(addr, size, &end))
+		return -EINVAL;
+
+	/* Can't check the state of both MMIO and memory regions at once */
+	reg = find_mem_range(addr, &range);
+	if (!reg && (flags & HOST_CHECK_IS_MEMORY))
+		return -EINVAL;
+
+	if (!is_in_mem_range(end - 1, &range))
 		return -EINVAL;
 
 	hyp_assert_lock_held(&host_mmu.lock);
@@ -1074,12 +1084,15 @@ static int ___host_check_page_state_range(u64 addr, u64 size,
 	if (!reg)
 		return check_page_state_range(&host_mmu.pgt, addr, size, &d);
 
-	if (reg->flags & MEMBLOCK_NOMAP)
+	if (reg->flags & MEMBLOCK_NOMAP && !(flags & HOST_CHECK_ALLOW_NO_MAP))
 		return -EPERM;
 
 	for (; addr < end; addr += PAGE_SIZE) {
-		if (hyp_phys_to_page(addr)->host_state != state)
+		p = hyp_phys_to_page(addr);
+		if (p->host_state != state)
 			return -EPERM;
+		if ((flags & HOST_CHECK_NULL_REFCNT) && hyp_refcount_get(p->refcount))
+			return -EINVAL;
 	}
 
 	/*
@@ -1094,32 +1107,18 @@ static int ___host_check_page_state_range(u64 addr, u64 size,
 static int __host_check_page_state_range(u64 addr, u64 size,
 					 enum pkvm_page_state state)
 {
-	struct memblock_region *reg;
-	struct kvm_mem_range range;
-	u64 end;
+	enum host_check_page_state_flags flags = HOST_CHECK_IS_MEMORY;
 
-	if (check_add_overflow(addr, size, &end))
-		return -EINVAL;
+	if (state == PKVM_PAGE_OWNED)
+		flags |= HOST_CHECK_NULL_REFCNT;
 
-	/* Can't check the state of both MMIO and memory regions at once */
-	reg = find_mem_range(addr, &range);
-	if (!is_in_mem_range(end - 1, &range))
-		return -EINVAL;
-
-	return ___host_check_page_state_range(addr, size, state, reg);
+	/* Check the refcount of PAGE_OWNED pages as those may be used for DMA. */
+	return ___host_check_page_state_range(addr, size, state, flags);
 }
 
 static int __host_set_page_state_range(u64 addr, u64 size,
 				       enum pkvm_page_state state)
 {
-	u64 end;
-
-	if (check_add_overflow(addr, size, &end))
-		return -EINVAL;
-
-	if (!range_is_memory(addr, end))
-		return -EPERM;
-
 	if (hyp_phys_to_page(addr)->host_state & PKVM_NOPAGE) {
 		int ret = host_stage2_idmap_locked(addr, size, PKVM_HOST_MEM_PROT, true);
 
@@ -1130,142 +1129,6 @@ static int __host_set_page_state_range(u64 addr, u64 size,
 	__host_update_page_state(addr, size, state);
 
 	return 0;
-}
-
-static int host_request_owned_transition(u64 *completer_addr,
-					 const struct pkvm_mem_transition *tx)
-{
-	u64 size = tx->nr_pages * PAGE_SIZE;
-	u64 addr = tx->initiator.addr;
-
-	if (range_is_memory(addr, addr + size) && is_range_refcounted(addr, tx->nr_pages))
-		return -EINVAL;
-
-	*completer_addr = tx->initiator.host.completer_addr;
-	return __host_check_page_state_range(addr, size, PKVM_PAGE_OWNED);
-}
-
-static int host_request_unshare(struct pkvm_checked_mem_transition *checked_tx)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	u64 size = tx->nr_pages * PAGE_SIZE;
-	u64 addr = tx->initiator.addr;
-
-
-	if (is_range_refcounted(addr, tx->nr_pages))
-		return -EINVAL;
-
-	checked_tx->completer_addr = tx->initiator.host.completer_addr;
-	checked_tx->nr_pages = tx->nr_pages;
-
-	return __host_check_page_state_range(addr, size, PKVM_PAGE_SHARED_OWNED);
-}
-
-static int host_initiate_share(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-	u64 addr = tx->initiator.addr;
-
-	return __host_set_page_state_range(addr, size, PKVM_PAGE_SHARED_OWNED);
-}
-
-static int host_initiate_unshare(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-	u64 addr = tx->initiator.addr;
-
-	return __host_set_page_state_range(addr, size, PKVM_PAGE_OWNED);
-}
-
-static int host_initiate_donation(u64 *completer_addr,
-				  const struct pkvm_mem_transition *tx)
-{
-	u8 owner_id = tx->completer.id;
-	u64 size = tx->nr_pages * PAGE_SIZE;
-
-	*completer_addr = tx->initiator.host.completer_addr;
-	return host_stage2_set_owner_locked(tx->initiator.addr, size, owner_id);
-}
-
-static bool __host_ack_skip_pgtable_check(const struct pkvm_mem_transition *tx)
-{
-	return !(IS_ENABLED(CONFIG_NVHE_EL2_DEBUG) ||
-		 tx->initiator.id != PKVM_ID_HYP);
-}
-
-static int __host_ack_transition(u64 addr, u64 size,
-				 const struct pkvm_mem_transition *tx,
-				 enum pkvm_page_state state)
-{
-	if (__host_ack_skip_pgtable_check(tx))
-		return 0;
-
-	return __host_check_page_state_range(addr, size, state);
-}
-
-static int host_ack_share(const struct pkvm_checked_mem_transition *checked_tx,
-			  enum kvm_pgtable_prot perms)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-
-	if (perms != PKVM_HOST_MEM_PROT)
-		return -EPERM;
-
-	return __host_ack_transition(checked_tx->completer_addr, size,
-				     tx, PKVM_NOPAGE);
-}
-
-static int host_ack_donation(u64 addr,
-			     const struct pkvm_mem_transition *tx)
-{
-	return __host_ack_transition(addr, tx->nr_pages * PAGE_SIZE, tx, PKVM_NOPAGE);
-}
-
-static int host_ack_unshare(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	return __host_check_page_state_range(checked_tx->completer_addr,
-					     checked_tx->nr_pages * PAGE_SIZE,
-					     PKVM_PAGE_SHARED_BORROWED);
-}
-
-static int host_complete_share(const struct pkvm_checked_mem_transition *checked_tx,
-			       enum kvm_pgtable_prot perms)
-{
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-	int err;
-
-	err = __host_set_page_state_range(checked_tx->completer_addr, size,
-					  PKVM_PAGE_SHARED_BORROWED);
-	if (err)
-		return err;
-
-	if (checked_tx->tx->initiator.id == PKVM_ID_GUEST)
-		psci_mem_protect_dec(checked_tx->nr_pages);
-
-	return 0;
-}
-
-static int host_complete_unshare(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-	u8 owner_id = checked_tx->tx->initiator.id;
-
-	if (checked_tx->tx->initiator.id == PKVM_ID_GUEST)
-		psci_mem_protect_inc(checked_tx->nr_pages);
-
-	return host_stage2_set_owner_locked(checked_tx->completer_addr, size,
-					    owner_id);
-}
-
-static int host_complete_donation(u64 addr, const struct pkvm_mem_transition *tx)
-{
-	u64 size = tx->nr_pages * PAGE_SIZE;
-	u8 host_id = tx->completer.id;
-
-	return host_stage2_set_owner_locked(addr, size, host_id);
 }
 
 static enum pkvm_page_state hyp_get_page_state(kvm_pte_t pte, u64 addr)
@@ -1295,125 +1158,22 @@ static int __hyp_check_page_state_range(u64 addr, u64 size,
 	return check_page_state_range(&pkvm_pgtable, addr, size, &d);
 }
 
-static int hyp_request_donation(u64 *completer_addr,
-				const struct pkvm_mem_transition *tx)
+int hyp_check_range_owned(u64 phys_addr, u64 size)
 {
-	u64 size = tx->nr_pages * PAGE_SIZE;
-	u64 addr = tx->initiator.addr;
-
-	*completer_addr = tx->initiator.hyp.completer_addr;
-	return __hyp_check_page_state_range(addr, size, PKVM_PAGE_OWNED);
-}
-
-static int hyp_initiate_donation(u64 *completer_addr,
-				 const struct pkvm_mem_transition *tx)
-{
-	u64 size = tx->nr_pages * PAGE_SIZE;
 	int ret;
 
-	*completer_addr = tx->initiator.hyp.completer_addr;
-	ret = kvm_pgtable_hyp_unmap(&pkvm_pgtable, tx->initiator.addr, size);
-	return (ret != size) ? -EFAULT : 0;
+	hyp_lock_component();
+	ret = __hyp_check_page_state_range((u64)hyp_phys_to_virt(phys_addr),
+					   size, PKVM_PAGE_OWNED);
+	hyp_unlock_component();
+
+	return ret;
 }
 
-static bool __hyp_ack_skip_pgtable_check(const struct pkvm_mem_transition *tx)
-{
-	return !(IS_ENABLED(CONFIG_NVHE_EL2_DEBUG) ||
-		 tx->initiator.id != PKVM_ID_HOST);
-}
-
-static int hyp_ack_share(const struct pkvm_checked_mem_transition *checked_tx,
-			 enum kvm_pgtable_prot perms)
-{
-	phys_addr_t phys = hyp_virt_to_phys((void *)checked_tx->completer_addr);
-	enum kvm_pgtable_prot prot = default_hyp_prot(phys);
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-
-	if (!addr_is_memory(phys) || perms != prot)
-		return -EPERM;
-
-	if (__hyp_ack_skip_pgtable_check(tx))
-		return 0;
-
-	return __hyp_check_page_state_range(checked_tx->completer_addr,
-					    size, PKVM_NOPAGE);
-}
-
-static int hyp_ack_unshare(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-	u64 addr = checked_tx->completer_addr;
-
-	return __hyp_check_page_state_range(addr, size,
-					    PKVM_PAGE_SHARED_BORROWED);
-}
-
-static int hyp_ack_donation(u64 addr, const struct pkvm_mem_transition *tx)
-{
-	u64 size = tx->nr_pages * PAGE_SIZE;
-
-	if (__hyp_ack_skip_pgtable_check(tx))
-		return 0;
-
-	return __hyp_check_page_state_range(addr, size, PKVM_NOPAGE);
-}
-
-static int hyp_complete_share(const struct pkvm_checked_mem_transition *checked_tx,
-			      enum kvm_pgtable_prot perms)
-{
-	void *start = (void *)checked_tx->completer_addr;
-	void *end = start + (checked_tx->nr_pages * PAGE_SIZE);
-	enum kvm_pgtable_prot prot;
-
-	prot = pkvm_mkstate(perms, PKVM_PAGE_SHARED_BORROWED);
-	return pkvm_create_mappings_locked(start, end, prot);
-}
-
-static int hyp_complete_unshare(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	u64 unmapped, size = checked_tx->nr_pages * PAGE_SIZE;
-
-	unmapped = kvm_pgtable_hyp_unmap(&pkvm_pgtable, checked_tx->completer_addr,
-					 size);
-
-	return (unmapped != size) ? -EFAULT : 0;
-}
-
-static int hyp_complete_donation(u64 addr,
-				 const struct pkvm_mem_transition *tx)
-{
-	void *start = (void *)addr, *end = start + (tx->nr_pages * PAGE_SIZE);
-	enum kvm_pgtable_prot prot = tx->completer.prot;
-
-	prot = pkvm_mkstate(prot, PKVM_PAGE_OWNED);
-	return pkvm_create_mappings_locked(start, end, prot);
-}
-
-static enum pkvm_page_state guest_get_page_state(kvm_pte_t pte, u64 addr)
-{
-	enum pkvm_page_state state = 0;
-	enum kvm_pgtable_prot prot;
-
-	if (!kvm_pte_valid(pte)) {
-		state = PKVM_NOPAGE;
-
-		if (pte == KVM_INVALID_PTE_MMIO_NOTE)
-			state |= PKVM_MMIO;
-
-		return state;
-	}
-
-	prot = kvm_pgtable_stage2_pte_prot(pte);
-	if (kvm_pte_valid(pte) && ((prot & KVM_PGTABLE_PROT_RWX) != KVM_PGTABLE_PROT_RWX))
-		state = PKVM_PAGE_RESTRICTED_PROT;
-
-	return state | pkvm_getstate(prot);
-}
-
-static int __guest_check_page_state_range(struct pkvm_hyp_vm *vm, u64 addr,
+static int __guest_check_page_state_range(struct pkvm_hyp_vcpu *vcpu, u64 addr,
 					  u64 size, enum pkvm_page_state state)
 {
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
 	struct check_walk_data d = {
 		.desired	= state,
 		.get_page_state	= guest_get_page_state,
@@ -1427,116 +1187,13 @@ static int __guest_check_page_state_range(struct pkvm_hyp_vm *vm, u64 addr,
 	return check_page_state_range(&vm->pgt, addr, size, &d);
 }
 
-static int guest_ack_share(const struct pkvm_checked_mem_transition *checked_tx,
-			   enum kvm_pgtable_prot perms)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-
-	if (!addr_is_memory(tx->completer.guest.phys) || (perms & ~KVM_PGTABLE_PROT_RWX))
-		return -EPERM;
-
-	return __guest_check_page_state_range(tx->completer.guest.hyp_vm,
-					      checked_tx->completer_addr, size,
-					      PKVM_NOPAGE);
-}
-
-static int guest_ack_unshare(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	enum pkvm_page_state state = PKVM_PAGE_SHARED_BORROWED;
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-	u64 addr = checked_tx->completer_addr;
-	int ret;
-
-	ret = __guest_check_page_state_range(tx->completer.guest.hyp_vm, addr, size, state);
-	if (ret == -EPERM && !pkvm_hyp_vm_is_protected(tx->completer.guest.hyp_vm)) {
-		/* NP guest pages have their permission relaxed lazily */
-		state |= PKVM_PAGE_RESTRICTED_PROT;
-		ret = __guest_check_page_state_range(tx->completer.guest.hyp_vm, addr, size, state);
-	}
-
-	return ret;
-}
-
-static int guest_ack_donation(u64 addr, const struct pkvm_mem_transition *tx)
-{
-	u64 size = tx->nr_pages * PAGE_SIZE;
-
-	if (!addr_is_memory(tx->completer.guest.phys))
-		return -EPERM;
-
-	return __guest_check_page_state_range(tx->completer.guest.hyp_vm,
-					      addr, size, PKVM_NOPAGE);
-}
-
-static int guest_complete_share(const struct pkvm_checked_mem_transition *checked_tx,
-				enum kvm_pgtable_prot perms)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	struct pkvm_hyp_vm *vm = tx->completer.guest.hyp_vm;
-	struct kvm_hyp_memcache *mc = tx->completer.guest.mc;
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-	u64 addr = checked_tx->completer_addr;
-	enum kvm_pgtable_prot prot;
-
-	prot = pkvm_mkstate(perms, PKVM_PAGE_SHARED_BORROWED);
-	return kvm_pgtable_stage2_map(&vm->pgt, addr, size, tx->completer.guest.phys,
-				      prot, mc, 0);
-}
-
-static int guest_complete_unshare(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	struct pkvm_hyp_vm *vm = tx->completer.guest.hyp_vm;
-	u64 size = checked_tx->nr_pages * PAGE_SIZE;
-	u64 addr = checked_tx->completer_addr;
-
-	return kvm_pgtable_stage2_unmap(&vm->pgt, addr, size);
-}
-
-static int guest_complete_donation(u64 addr, const struct pkvm_mem_transition *tx)
-{
-	enum kvm_pgtable_prot prot = pkvm_mkstate(KVM_PGTABLE_PROT_RWX, PKVM_PAGE_OWNED);
-	struct pkvm_hyp_vm *vm = tx->completer.guest.hyp_vm;
-	struct kvm_hyp_memcache *mc = tx->completer.guest.mc;
-	phys_addr_t phys = tx->completer.guest.phys;
-	u64 size = tx->nr_pages * PAGE_SIZE;
-	int err;
-
-	if (tx->initiator.id == PKVM_ID_HOST)
-		psci_mem_protect_inc(tx->nr_pages);
-
-	if (pkvm_ipa_range_has_pvmfw(vm, addr, addr + size)) {
-		if (WARN_ON(!pkvm_hyp_vm_is_protected(vm))) {
-			err = -EPERM;
-			goto err_undo_psci;
-		}
-
-		WARN_ON(tx->initiator.id != PKVM_ID_HOST);
-		err = pkvm_load_pvmfw_pages(vm, addr, phys, size);
-		if (err)
-			goto err_undo_psci;
-	}
-
-	/*
-	 * If this fails, we effectively leak the pages since they're now
-	 * owned by the guest but not mapped into its stage-2 page-table.
-	 */
-	return kvm_pgtable_stage2_map(&vm->pgt, addr, size, phys, prot, mc, 0);
-
-err_undo_psci:
-	if (tx->initiator.id == PKVM_ID_HOST)
-		psci_mem_protect_dec(tx->nr_pages);
-	return err;
-}
-
 struct guest_request_walker_data {
-	unsigned long		ipa_start;
-	phys_addr_t		phys_start;
+	union {
+		kvm_pte_t		pte_start; /* guest_request_walker() */
+		unsigned long		ipa_start; /* guest_request_ioguard_walker() */
+	};
 	u64			size;
 	enum pkvm_page_state	desired_state;
-	enum pkvm_page_state	desired_mask;
 	int			max_ptes;
 };
 
@@ -1544,7 +1201,6 @@ struct guest_request_walker_data {
 {											\
 	.size		= 0,								\
 	.desired_state	= __state,							\
-	.desired_mask	= ~0,								\
 	/*										\
 	 * In the very unlucky case where we have:					\
 	 *   1. A block-aligned start address						\
@@ -1568,514 +1224,175 @@ static int guest_request_walker(const struct kvm_pgtable_visit_ctx *ctx,
 	struct guest_request_walker_data *data = (struct guest_request_walker_data *)ctx->arg;
 	enum pkvm_page_state state;
 	kvm_pte_t pte = *ctx->ptep;
-	u32 level = ctx->level;
 	phys_addr_t phys;
+	u64 granule_size;
 
 	state = guest_get_page_state(pte, 0);
-	if (data->desired_state != (state & data->desired_mask))
-		return (state & PKVM_NOPAGE) ? -EFAULT : -EINVAL;
+	if (data->desired_state != state)
+		return (state == PKVM_NOPAGE) ? -EFAULT : -EPERM;
 
-	if (state & PKVM_NOPAGE) {
-		phys = PHYS_ADDR_MAX;
-	} else {
-		phys = kvm_pte_to_phys(pte);
-		if (!addr_is_allowed_memory(phys))
-			return -EINVAL;
-	}
+	/* state != PKVM_NOPAGE but invalid PTE? */
+	if (WARN_ON(!kvm_pte_valid(pte)))
+		return -EINVAL;
 
-	data->max_ptes--;
+	granule_size = kvm_granule_size(ctx->level);
+	phys = kvm_pte_to_phys(pte);
 
+	/* First PTE */
 	if (!data->size) {
-		data->phys_start = phys;
-		data->size = kvm_granule_size(level);
-		data->ipa_start = ctx->addr & ~(kvm_granule_size(level) - 1);
+		/* Request starts in the middle of a huge-mapping */
+		if (!IS_ALIGNED(ctx->start, granule_size))
+			return -E2BIG;
+
+		data->pte_start = pte;
+		data->size = granule_size;
+
 		goto end;
 	}
 
+	if (kvm_pgtable_stage2_pte_prot(pte) !=
+	    kvm_pgtable_stage2_pte_prot(data->pte_start))
+		return -EINVAL;
+
 	/* Can only describe physically contiguous mappings */
-	if ((data->phys_start != PHYS_ADDR_MAX) &&
-	    (phys != data->phys_start + data->size))
+	if ((phys != kvm_pte_to_phys(data->pte_start) + data->size))
+		return -ERANGE;
+
+	data->size += granule_size;
+
+end:
+	/* Request ends in the middle of a huge-mapping */
+	if (ctx->start + data->size > ctx->end)
 		return -E2BIG;
 
-	data->size += kvm_granule_size(level);
-end:
-	return data->max_ptes > 0 ? 0 : -E2BIG;
+	return --data->max_ptes > 0 ? 0 : -ERANGE;
 }
 
-static int __guest_request_page_transition(struct pkvm_checked_mem_transition *checked_tx,
+static int __guest_request_page_transition(u64 ipa, kvm_pte_t *__pte, u64 *__nr_pages,
+					   struct pkvm_hyp_vm *vm,
 					   enum pkvm_page_state desired)
 {
 	struct guest_request_walker_data data = GUEST_WALKER_DATA_INIT(desired);
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	struct pkvm_hyp_vm *vm = tx->initiator.guest.hyp_vm;
 	struct kvm_pgtable_walker walker = {
 		.cb     = guest_request_walker,
 		.flags  = KVM_PGTABLE_WALK_LEAF,
 		.arg    = (void *)&data,
 	};
-	u64 phys_offset;
+	phys_addr_t phys;
+	size_t size;
 	int ret;
 
-	ret = kvm_pgtable_walk(&vm->pgt, tx->initiator.addr,
-			       tx->nr_pages * PAGE_SIZE, &walker);
-	/* Walker reached data.max_ptes or a non physically contiguous block */
-	if (ret == -E2BIG)
+	if (check_mul_overflow(*__nr_pages, PAGE_SIZE, &size) ||
+	    ipa >= ipa + size)
+		return -EINVAL;
+
+	ret = kvm_pgtable_walk(&vm->pgt, ipa, size, &walker);
+	/*
+	 * Walker reached data.max_ptes or a non-physically-contiguous mapping.
+	 * Proceed with the current valid region. The guest will have to issue a new call for the
+	 * leftover.
+	 */
+	if (ret == -ERANGE)
 		ret = 0;
 	else if (ret)
 		return ret;
 
-	if (data.ipa_start > tx->initiator.addr)
+	if (WARN_ON(!kvm_pte_valid(data.pte_start)))
 		return -EINVAL;
 
-	/*
-	 * transition not aligned with block memory mapping. They'll be broken
-	 * down and memory donation will be needed.
-	 */
-	phys_offset = tx->initiator.addr - data.ipa_start;
-	if (phys_offset || (tx->nr_pages * PAGE_SIZE < data.size)) {
-		struct pkvm_hyp_vcpu *hyp_vcpu = pkvm_get_loaded_hyp_vcpu();
-		int min_pages;
-
-		if (WARN_ON(!hyp_vcpu))
-			return -EINVAL;
-
-		min_pages = kvm_mmu_cache_min_pages(hyp_vcpu->vcpu.kvm);
-		if (hyp_vcpu->vcpu.arch.stage2_mc.nr_pages < min_pages)
-			return -ENOMEM;
-	}
-
-	checked_tx->completer_addr = data.phys_start + phys_offset;
-
-
-	checked_tx->nr_pages = min_t(u64, (data.size - phys_offset) >> PAGE_SHIFT,
-				     tx->nr_pages);
-
-	return 0;
-}
-
-static int guest_request_share(struct pkvm_checked_mem_transition *checked_tx)
-{
-	return __guest_request_page_transition(checked_tx, PKVM_PAGE_OWNED);
-}
-
-static int guest_request_unshare(struct pkvm_checked_mem_transition *checked_tx)
-{
-	int ret;
-
-	ret = __guest_request_page_transition(checked_tx,
-					      PKVM_PAGE_SHARED_OWNED);
+	phys = kvm_pte_to_phys(data.pte_start);
+	ret = check_range_allowed_memory(phys, phys + data.size);
 	if (ret)
 		return ret;
 
-	if (is_range_refcounted(checked_tx->completer_addr, checked_tx->nr_pages))
-		return -EINVAL;
+	*__pte = data.pte_start;
+	*__nr_pages = data.size >> PAGE_SHIFT;
 
 	return 0;
 }
 
-static int __guest_initiate_page_transition(const struct pkvm_checked_mem_transition *checked_tx,
+static int __guest_initiate_page_transition(u64 ipa, kvm_pte_t pte, u64 nr_pages,
+					    struct pkvm_hyp_vcpu *vcpu,
 					    enum pkvm_page_state state)
 {
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	struct kvm_hyp_memcache *mc = tx->initiator.guest.mc;
-	struct pkvm_hyp_vm *vm = tx->initiator.guest.hyp_vm;
-	u64 offset, size = checked_tx->nr_pages * PAGE_SIZE;
-	u64 addr = tx->initiator.addr;
+	struct kvm_hyp_memcache *mc = &vcpu->vcpu.arch.stage2_mc;
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
+	u64 size = nr_pages * PAGE_SIZE;
 	enum kvm_pgtable_prot prot;
-	phys_addr_t phys;
-	kvm_pte_t pte;
-	u32 level;
+	u64 phys;
 	int ret;
 
-	ret = kvm_pgtable_get_leaf(&vm->pgt, addr, &pte, &level);
-	if (ret)
-		return ret;
-
-	offset = addr - ALIGN_DOWN(addr, kvm_granule_size(level));
-
-	phys = kvm_pte_to_phys(pte) + offset;
+	phys = kvm_pte_to_phys(pte);
 	prot = pkvm_mkstate(kvm_pgtable_stage2_pte_prot(pte), state);
-	return kvm_pgtable_stage2_map(&vm->pgt, addr, size, phys, prot, mc, 0);
-}
-
-static int guest_initiate_share(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	return __guest_initiate_page_transition(checked_tx, PKVM_PAGE_SHARED_OWNED);
-}
-
-static int guest_initiate_unshare(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	return __guest_initiate_page_transition(checked_tx, PKVM_PAGE_OWNED);
-}
-
-static int check_share(struct pkvm_checked_mem_transition *checked_tx)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	int ret;
-
-	if (!tx->nr_pages)
-		return -EINVAL;
-
-	switch (tx->initiator.id) {
-	case PKVM_ID_HOST:
-		ret = host_request_owned_transition(&checked_tx->completer_addr, tx);
-		checked_tx->nr_pages = tx->nr_pages;
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_request_share(checked_tx);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
+	ret = kvm_pgtable_stage2_map(&vm->pgt, ipa, size, phys, prot, mc, 0);
 	if (ret)
 		return ret;
-
-	switch (tx->completer.id) {
-	case PKVM_ID_HOST:
-		ret = host_ack_share(checked_tx, tx->completer.prot);
-		break;
-	case PKVM_ID_HYP:
-		ret = hyp_ack_share(checked_tx, tx->completer.prot);
-		break;
-	case PKVM_ID_FFA:
-		/*
-		 * We only check the host; the secure side will check the other
-		 * end when we forward the FFA call.
-		 */
-		ret = 0;
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_ack_share(checked_tx, tx->completer.prot);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	return ret;
-}
-
-static int __do_share(struct pkvm_mem_transition *tx,
-		      const struct pkvm_checked_mem_transition *checked_tx)
-{
-	int ret;
-
-	switch (tx->initiator.id) {
-	case PKVM_ID_HOST:
-		ret = host_initiate_share(checked_tx);
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_initiate_share(checked_tx);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	if (ret)
-		return ret;
-
-	switch (tx->completer.id) {
-	case PKVM_ID_HOST:
-		ret = host_complete_share(checked_tx, tx->completer.prot);
-		break;
-	case PKVM_ID_HYP:
-		ret = hyp_complete_share(checked_tx, tx->completer.prot);
-		if (ret == -ENOMEM) {
-			WARN_ON(tx->initiator.id != PKVM_ID_HOST);
-			WARN_ON(host_initiate_unshare(checked_tx));
-			return ret;
-		}
-		break;
-	case PKVM_ID_FFA:
-		/*
-		 * We're not responsible for any secure page-tables, so there's
-		 * nothing to do here.
-		 */
-		ret = 0;
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_complete_share(checked_tx, tx->completer.prot);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	return WARN_ON(ret);
-}
-
-/*
- * do_share():
- *
- * The page owner grants access to another component with a given set
- * of permissions.
- *
- * Initiator: OWNED	=> SHARED_OWNED
- * Completer: NOPAGE	=> SHARED_BORROWED
- */
-static int do_share(struct pkvm_mem_transition *share,
-		    u64 *nr_shared)
-{
-	struct pkvm_checked_mem_transition checked_tx = {
-		.tx		= share,
-		.nr_pages	= 0,
-	};
-	int ret;
-
-	ret = check_share(&checked_tx);
-	if (ret)
-		return ret;
-
-	ret = __do_share(share, &checked_tx);
-	if (ret)
-		return ret;
-
-	*nr_shared = checked_tx.nr_pages;
-
-	return ret;
-}
-
-static int check_unshare(struct pkvm_checked_mem_transition *checked_tx)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	int ret;
-
-	if (!tx->nr_pages)
-		return -EINVAL;
-
-	switch (tx->initiator.id) {
-	case PKVM_ID_HOST:
-		ret = host_request_unshare(checked_tx);
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_request_unshare(checked_tx);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	if (ret)
-		return ret;
-
-	switch (tx->completer.id) {
-	case PKVM_ID_HOST:
-		ret = host_ack_unshare(checked_tx);
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_ack_unshare(checked_tx);
-		break;
-	case PKVM_ID_HYP:
-		ret = hyp_ack_unshare(checked_tx);
-		break;
-	case PKVM_ID_FFA:
-		/* See check_share() */
-		ret = 0;
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	return ret;
-}
-
-static int __do_unshare(const struct pkvm_checked_mem_transition *checked_tx)
-{
-	const struct pkvm_mem_transition *tx = checked_tx->tx;
-	int ret;
-
-	switch (tx->initiator.id) {
-	case PKVM_ID_HOST:
-		ret = host_initiate_unshare(checked_tx);
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_initiate_unshare(checked_tx);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	if (ret)
-		return ret;
-
-	switch (tx->completer.id) {
-	case PKVM_ID_HOST:
-		ret = host_complete_unshare(checked_tx);
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_complete_unshare(checked_tx);
-		break;
-	case PKVM_ID_HYP:
-		ret = hyp_complete_unshare(checked_tx);
-		break;
-	case PKVM_ID_FFA:
-		/* See __do_share() */
-		ret = 0;
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	return ret;
-}
-
-/*
- * do_unshare():
- *
- * The page owner revokes access from another component for a range of
- * pages which were previously shared using do_share().
- *
- * Initiator: SHARED_OWNED	=> OWNED
- * Completer: SHARED_BORROWED	=> NOPAGE
- */
-static int do_unshare(struct pkvm_mem_transition *share,
-		      u64 *nr_unshared)
-{
-	struct pkvm_checked_mem_transition checked_tx = {
-		.tx		= share,
-		.nr_pages	= 0,
-	};
-	int ret;
-
-	ret = check_unshare(&checked_tx);
-	if (ret)
-		return ret;
-
-	ret = __do_unshare(&checked_tx);
-	if (WARN_ON(ret))
-		return ret;
-
-	*nr_unshared = checked_tx.nr_pages;
 
 	return 0;
-}
-
-static int check_donation(struct pkvm_mem_transition *tx)
-{
-	u64 completer_addr;
-	int ret;
-
-	switch (tx->initiator.id) {
-	case PKVM_ID_HOST:
-		ret = host_request_owned_transition(&completer_addr, tx);
-		break;
-	case PKVM_ID_HYP:
-		ret = hyp_request_donation(&completer_addr, tx);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	if (ret)
-		return ret;
-
-	switch (tx->completer.id) {
-	case PKVM_ID_HOST:
-		ret = host_ack_donation(completer_addr, tx);
-		break;
-	case PKVM_ID_HYP:
-		ret = hyp_ack_donation(completer_addr, tx);
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_ack_donation(completer_addr, tx);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	return ret;
-}
-
-static int __do_donate(struct pkvm_mem_transition *tx)
-{
-	u64 completer_addr;
-	int ret;
-
-	switch (tx->initiator.id) {
-	case PKVM_ID_HOST:
-		ret = host_initiate_donation(&completer_addr, tx);
-		break;
-	case PKVM_ID_HYP:
-		ret = hyp_initiate_donation(&completer_addr, tx);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	if (ret)
-		return ret;
-
-	switch (tx->completer.id) {
-	case PKVM_ID_HOST:
-		ret = host_complete_donation(completer_addr, tx);
-		break;
-	case PKVM_ID_HYP:
-		ret = hyp_complete_donation(completer_addr, tx);
-		if (ret == -ENOMEM) {
-			struct pkvm_mem_transition abort = {
-				.nr_pages = tx->nr_pages,
-				.completer.id = PKVM_ID_HOST,
-			};
-
-			WARN_ON(tx->initiator.id != PKVM_ID_HOST);
-			WARN_ON(host_complete_donation(completer_addr, &abort));
-			return -ENOMEM;
-		}
-		break;
-	case PKVM_ID_GUEST:
-		ret = guest_complete_donation(completer_addr, tx);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-
-	return WARN_ON(ret);
-}
-
-/*
- * do_donate():
- *
- * The page owner transfers ownership to another component, losing access
- * as a consequence.
- *
- * Initiator: OWNED	=> NOPAGE
- * Completer: NOPAGE	=> OWNED
- */
-static int do_donate(struct pkvm_mem_transition *donation)
-{
-	int ret;
-
-	ret = check_donation(donation);
-	if (ret)
-		return ret;
-
-	return __do_donate(donation);
 }
 
 int __pkvm_host_share_hyp(u64 pfn)
 {
+	u64 phys = hyp_pfn_to_phys(pfn);
+	void *virt = __hyp_va(phys);
+	enum kvm_pgtable_prot prot;
+	u64 size = PAGE_SIZE;
 	int ret;
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	u64 hyp_addr = (u64)__hyp_va(host_addr);
-	struct pkvm_mem_transition share = {
-		.nr_pages	= 1,
-		.initiator	= {
-			.id	= PKVM_ID_HOST,
-			.addr	= host_addr,
-			.host	= {
-				.completer_addr = hyp_addr,
-			},
-		},
-		.completer	= {
-			.id	= PKVM_ID_HYP,
-			.prot = default_hyp_prot(host_addr),
-		},
-	};
-	u64 nr_shared;
 
 	host_lock_component();
 	hyp_lock_component();
 
-	ret = do_share(&share, &nr_shared);
+	ret = __host_check_page_state_range(phys, size, PKVM_PAGE_OWNED);
+	if (ret)
+		goto unlock;
+	if (IS_ENABLED(CONFIG_PKVM_STRICT_CHECKS)) {
+		ret = __hyp_check_page_state_range((u64)virt, size, PKVM_NOPAGE);
+		if (ret)
+			goto unlock;
+	}
 
+	prot = pkvm_mkstate(PAGE_HYP, PKVM_PAGE_SHARED_BORROWED);
+	ret = pkvm_create_mappings_locked(virt, virt + size, prot);
+	if (ret) {
+		WARN_ON(ret != -ENOMEM);
+		/* We might have failed halfway through, so remove anything we've installed */
+		pkvm_remove_mappings_locked(virt, virt + size);
+		goto unlock;
+	}
+
+	WARN_ON(__host_set_page_state_range(phys, size, PKVM_PAGE_SHARED_OWNED));
+
+unlock:
+	hyp_unlock_component();
+	host_unlock_component();
+	return ret;
+}
+
+int __pkvm_host_unshare_hyp(u64 pfn)
+{
+	u64 phys = hyp_pfn_to_phys(pfn);
+	u64 virt = (u64)__hyp_va(phys);
+	u64 size = PAGE_SIZE;
+	int ret;
+
+	host_lock_component();
+	hyp_lock_component();
+
+	ret = __host_check_page_state_range(phys, size, PKVM_PAGE_SHARED_OWNED);
+	if (ret)
+		goto unlock;
+	ret = __hyp_check_page_state_range(virt, size, PKVM_PAGE_SHARED_BORROWED);
+	if (ret)
+		goto unlock;
+	if (hyp_page_count((void *)virt)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	WARN_ON(kvm_pgtable_hyp_unmap(&pkvm_pgtable, virt, size) != size);
+	WARN_ON(__host_set_page_state_range(phys, size, PKVM_PAGE_OWNED));
+
+unlock:
 	hyp_unlock_component();
 	host_unlock_component();
 
@@ -2085,31 +1402,123 @@ int __pkvm_host_share_hyp(u64 pfn)
 int __pkvm_guest_share_host(struct pkvm_hyp_vcpu *vcpu, u64 ipa, u64 nr_pages,
 			    u64 *nr_shared)
 {
-	int ret;
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
-	struct pkvm_mem_transition share = {
-		.nr_pages	= nr_pages,
-		.initiator	= {
-			.id	= PKVM_ID_GUEST,
-			.addr	= ipa,
-			.guest	= {
-				.hyp_vm = vm,
-				.mc = &vcpu->vcpu.arch.stage2_mc,
-			},
-		},
-		.completer	= {
-			.id	= PKVM_ID_HOST,
-			.prot = PKVM_HOST_MEM_PROT,
-		},
-	};
+	kvm_pte_t pte;
+	size_t size;
+	u64 phys;
+	int ret;
 
 	host_lock_component();
 	guest_lock_component(vm);
 
-	ret = do_share(&share, nr_shared);
+	ret = __guest_request_page_transition(ipa, &pte, &nr_pages, vm, PKVM_PAGE_OWNED);
+	if (ret)
+		goto unlock;
 
+	phys = kvm_pte_to_phys(pte);
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	ret = __host_check_page_state_range(phys, size, PKVM_NOPAGE);
+	if (ret)
+		goto unlock;
+
+	WARN_ON(__guest_initiate_page_transition(ipa, pte, nr_pages, vcpu, PKVM_PAGE_SHARED_OWNED));
+	WARN_ON(__host_set_page_state_range(phys, size, PKVM_PAGE_SHARED_BORROWED));
+	psci_mem_protect_dec(nr_pages);
+	*nr_shared = nr_pages;
+
+unlock:
 	guest_unlock_component(vm);
 	host_unlock_component();
+
+	return ret;
+}
+
+int __pkvm_guest_share_hyp_page(struct pkvm_hyp_vcpu *vcpu, u64 ipa, u64 *hyp_va)
+{
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
+	int ret;
+	kvm_pte_t pte;
+	u64 phys;
+	enum kvm_pgtable_prot prot;
+	void *virt;
+	u64 nr_pages = 1;
+
+	hyp_lock_component();
+	guest_lock_component(vm);
+
+	ret = __guest_request_page_transition(ipa, &pte, &nr_pages, vm, PKVM_PAGE_OWNED);
+	if (ret)
+		goto unlock;
+
+	phys = kvm_pte_to_phys(pte);
+
+	virt = __hyp_va(phys);
+	if (IS_ENABLED(CONFIG_NVHE_EL2_DEBUG)) {
+		ret = __hyp_check_page_state_range((u64)virt, PAGE_SIZE, PKVM_NOPAGE);
+		if (ret)
+			goto unlock;
+	}
+
+	prot = pkvm_mkstate(PAGE_HYP, PKVM_PAGE_SHARED_BORROWED);
+	ret = pkvm_create_mappings_locked(virt, virt + PAGE_SIZE, prot);
+	if (ret) {
+		/*
+		 * Repaint the return code as we need to distinguish between the
+		 * no memory from the guest which is recoverable and no memory
+		 * from the hypervisor.
+		 */
+		if (ret == -ENOMEM)
+			ret = -EBUSY;
+		goto unlock;
+	}
+
+	WARN_ON(__guest_initiate_page_transition(ipa, pte, nr_pages, vcpu, PKVM_PAGE_SHARED_OWNED));
+	*hyp_va = (u64)virt;
+unlock:
+	guest_unlock_component(vm);
+	hyp_unlock_component();
+
+	return ret;
+}
+
+int __pkvm_guest_unshare_hyp_page(struct pkvm_hyp_vm *vm, u64 ipa)
+{
+	int ret;
+	kvm_pte_t pte;
+	u64 phys, virt, nr_pages = 1;
+
+	hyp_lock_component();
+	guest_lock_component(vm);
+
+	ret = __guest_request_page_transition(ipa, &pte, &nr_pages, vm, PKVM_PAGE_SHARED_OWNED);
+	if (ret)
+		goto unlock;
+
+	phys = kvm_pte_to_phys(pte);
+
+	virt = (u64)__hyp_va(phys);
+	ret = __hyp_check_page_state_range(virt, PAGE_SIZE, PKVM_PAGE_SHARED_BORROWED);
+	if (ret)
+		goto unlock;
+
+	WARN_ON(kvm_pgtable_hyp_unmap(&pkvm_pgtable, virt, PAGE_SIZE) != PAGE_SIZE);
+	/*
+	 * NULL memcache: this is the reverse of a prior PAGE_SIZE share, so the
+	 * walker rejected any coarser leaf with -E2BIG. The map below only
+	 * flips software state bits via the try_leaf fast path and never
+	 * allocates. The teardown path runs without a loaded vCPU, so there is
+	 * no correct memcache to pass.
+	 */
+	ret = kvm_pgtable_stage2_map(&vm->pgt, ipa, PAGE_SIZE, phys,
+				     pkvm_mkstate(KVM_PGTABLE_PROT_RWX, PKVM_PAGE_OWNED),
+				     NULL, 0);
+unlock:
+	guest_unlock_component(vm);
+	hyp_unlock_component();
 
 	return ret;
 }
@@ -2117,63 +1526,83 @@ int __pkvm_guest_share_host(struct pkvm_hyp_vcpu *vcpu, u64 ipa, u64 nr_pages,
 int __pkvm_guest_unshare_host(struct pkvm_hyp_vcpu *vcpu, u64 ipa, u64 nr_pages,
 			      u64 *nr_unshared)
 {
-	int ret;
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
-	struct pkvm_mem_transition share = {
-		.nr_pages	= nr_pages,
-		.initiator	= {
-			.id	= PKVM_ID_GUEST,
-			.addr	= ipa,
-			.guest	= {
-				.hyp_vm = vm,
-				.mc = &vcpu->vcpu.arch.stage2_mc,
-			},
-		},
-		.completer	= {
-			.id	= PKVM_ID_HOST,
-			.prot = PKVM_HOST_MEM_PROT,
-		},
-	};
+	kvm_pte_t pte;
+	size_t size;
+	u64 phys;
+	int ret;
 
 	host_lock_component();
 	guest_lock_component(vm);
 
-	ret = do_unshare(&share, nr_unshared);
+	ret = __guest_request_page_transition(ipa, &pte, &nr_pages, vm, PKVM_PAGE_SHARED_OWNED);
+	if (ret)
+		goto unlock;
 
+	phys = kvm_pte_to_phys(pte);
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	ret = __host_check_page_state_range(phys, size, PKVM_PAGE_SHARED_BORROWED);
+	if (ret)
+		goto unlock;
+
+	WARN_ON(__guest_initiate_page_transition(ipa, pte, nr_pages, vcpu, PKVM_PAGE_OWNED));
+	psci_mem_protect_inc(nr_pages);
+	WARN_ON(host_stage2_set_owner_locked(phys, size, PKVM_ID_GUEST));
+	*nr_unshared = nr_pages;
+
+unlock:
 	guest_unlock_component(vm);
 	host_unlock_component();
 
 	return ret;
 }
 
-int __pkvm_host_unshare_hyp(u64 pfn)
+int __pkvm_guest_share_ffa_page(struct pkvm_hyp_vcpu *vcpu, u64 ipa, phys_addr_t *phys)
+{
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
+	int ret;
+	kvm_pte_t pte;
+	u64 nr_pages = 1;
+
+	guest_lock_component(vm);
+	ret = __guest_request_page_transition(ipa, &pte, &nr_pages, vm, PKVM_PAGE_OWNED);
+	if (ret)
+		goto unlock;
+
+	ret = __guest_initiate_page_transition(ipa, pte, nr_pages, vcpu, PKVM_PAGE_SHARED_OWNED);
+	if (!ret)
+		*phys = kvm_pte_to_phys(pte);
+unlock:
+	guest_unlock_component(vm);
+
+	return ret;
+}
+
+/*
+ * The caller is responsible for tracking the FFA state and this function
+ * should only be called for IPAs that have previously been shared with FFA.
+ */
+int __pkvm_guest_unshare_ffa_page(struct pkvm_hyp_vm *vm, u64 ipa)
 {
 	int ret;
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	u64 hyp_addr = (u64)__hyp_va(host_addr);
-	struct pkvm_mem_transition share = {
-		.nr_pages	= 1,
-		.initiator	= {
-			.id	= PKVM_ID_HOST,
-			.addr	= host_addr,
-			.host	= {
-				.completer_addr = hyp_addr,
-			},
-		},
-		.completer	= {
-			.id	= PKVM_ID_HYP,
-			.prot = default_hyp_prot(host_addr),
-		},
-	};
-	u64 nr_unshared;
+	kvm_pte_t pte;
+	u64 nr_pages = 1;
 
-	host_lock_component();
-	hyp_lock_component();
+	guest_lock_component(vm);
+	ret = __guest_request_page_transition(ipa, &pte, &nr_pages, vm, PKVM_PAGE_SHARED_OWNED);
+	if (ret)
+		goto unlock;
 
-	ret = do_unshare(&share, &nr_unshared);
-
-	hyp_unlock_component();
-	host_unlock_component();
+	/* See __pkvm_guest_unshare_hyp_page() for why mc is NULL. */
+	ret = kvm_pgtable_stage2_map(&vm->pgt, ipa, PAGE_SIZE, kvm_pte_to_phys(pte),
+				     pkvm_mkstate(KVM_PGTABLE_PROT_RWX, PKVM_PAGE_OWNED),
+				     NULL, 0);
+unlock:
+	guest_unlock_component(vm);
 
 	return ret;
 }
@@ -2207,31 +1636,63 @@ int ___pkvm_host_donate_hyp(u64 pfn, u64 nr_pages, bool accept_mmio)
 					    default_hyp_prot(hyp_pfn_to_phys(pfn)));
 }
 
+static int pkvm_hyp_donate_guest(struct pkvm_hyp_vcpu *vcpu, u64 pfn, u64 gfn)
+{
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
+	u64 phys = hyp_pfn_to_phys(pfn);
+	u64 ipa = hyp_pfn_to_phys(gfn);
+	u64 hyp_addr = (u64)__hyp_va(phys);
+	size_t size = PAGE_SIZE;
+	enum kvm_pgtable_prot prot;
+	int ret;
+
+	hyp_assert_lock_held(&pkvm_pgd_lock);
+	hyp_assert_lock_held(&vm->pgtable_lock);
+
+	ret = __hyp_check_page_state_range(hyp_addr, size, PKVM_PAGE_OWNED);
+	if (ret)
+		return ret;;
+	ret = __guest_check_page_state_range(vcpu, ipa, size, PKVM_NOPAGE);
+	if (ret)
+		return ret;
+
+	WARN_ON(kvm_pgtable_hyp_unmap(&pkvm_pgtable, hyp_addr, size) != size);
+	prot = pkvm_mkstate(default_guest_prot(addr_is_memory(phys)), PKVM_PAGE_OWNED);
+	return WARN_ON(kvm_pgtable_stage2_map(&vm->pgt, ipa, size, phys, prot,
+					      &vcpu->vcpu.arch.stage2_mc, 0));
+}
+
 int __pkvm_host_donate_hyp_locked(u64 pfn, u64 nr_pages, enum kvm_pgtable_prot prot)
 {
+	u64 size, phys = hyp_pfn_to_phys(pfn);
+	void *virt = __hyp_va(phys);
 	int ret;
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	u64 hyp_addr = (u64)__hyp_va(host_addr);
-	struct pkvm_mem_transition donation = {
-		.nr_pages	= nr_pages,
-		.initiator	= {
-			.id	= PKVM_ID_HOST,
-			.addr	= host_addr,
-			.host	= {
-				.completer_addr = hyp_addr,
-			},
-		},
-		.completer	= {
-			.id	= PKVM_ID_HYP,
-			.prot = prot,
-		},
-	};
 
-	hyp_assert_lock_held(&host_mmu.lock);
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size))
+		return -EINVAL;
+
 	hyp_lock_component();
 
-	ret = do_donate(&donation);
+	ret = ___host_check_page_state_range(phys, size, PKVM_PAGE_OWNED, HOST_CHECK_NULL_REFCNT);
+	if (ret)
+		goto unlock;
+	if (IS_ENABLED(CONFIG_PKVM_STRICT_CHECKS)) {
+		ret = __hyp_check_page_state_range((u64)virt, size, PKVM_NOPAGE);
+		if (ret)
+			goto unlock;
+	}
 
+	prot = pkvm_mkstate(prot, PKVM_PAGE_OWNED);
+	ret = pkvm_create_mappings_locked(virt, virt + size, prot);
+	if (ret) {
+		WARN_ON(ret != -ENOMEM);
+		/* We might have failed halfway through, so remove anything we've installed */
+		pkvm_remove_mappings_locked(virt, virt + size);
+		goto unlock;
+	}
+	WARN_ON(host_stage2_set_owner_locked(phys, size, PKVM_ID_HYP));
+
+unlock:
 	hyp_unlock_component();
 
 	return ret;
@@ -2239,51 +1700,112 @@ int __pkvm_host_donate_hyp_locked(u64 pfn, u64 nr_pages, enum kvm_pgtable_prot p
 
 int __pkvm_hyp_donate_host(u64 pfn, u64 nr_pages)
 {
+	u64 size, phys = hyp_pfn_to_phys(pfn);
+	u64 virt = (u64)__hyp_va(phys);
 	int ret;
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	u64 hyp_addr = (u64)__hyp_va(host_addr);
-	struct pkvm_mem_transition donation = {
-		.nr_pages	= nr_pages,
-		.initiator	= {
-			.id	= PKVM_ID_HYP,
-			.addr	= hyp_addr,
-			.hyp	= {
-				.completer_addr = host_addr,
-			},
-		},
-		.completer	= {
-			.id	= PKVM_ID_HOST,
-		},
-	};
+
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size))
+		return -EINVAL;
 
 	host_lock_component();
 	hyp_lock_component();
 
-	ret = do_donate(&donation);
+	ret = __hyp_check_page_state_range(virt, size, PKVM_PAGE_OWNED);
+	if (ret)
+		goto unlock;
+	if (IS_ENABLED(CONFIG_PKVM_STRICT_CHECKS)) {
+		ret = ___host_check_page_state_range(phys, size, PKVM_NOPAGE, 0);
+		if (ret)
+			goto unlock;
+	}
 
+	WARN_ON(kvm_pgtable_hyp_unmap(&pkvm_pgtable, virt, size) != size);
+	WARN_ON(host_stage2_set_owner_locked(phys, size, PKVM_ID_HOST));
+
+unlock:
 	hyp_unlock_component();
 	host_unlock_component();
-
 	return ret;
 }
 
-#define MODULE_PROT_ALLOWLIST (KVM_PGTABLE_PROT_RWX |	\
-			       KVM_PGTABLE_PROT_DEVICE |\
-			       KVM_PGTABLE_PROT_NC |	\
-			       KVM_PGTABLE_PROT_PXN |	\
+/*
+ * Rejects MMIO regions and is unsafe. Use with care!
+ */
+int __pkvm_host_donate_ffa(u64 pfn, u64 nr_pages)
+{
+	u64 size, phys = hyp_pfn_to_phys(pfn), end;
+	int ret;
+
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size) ||
+	    check_add_overflow(phys, size, &end))
+		return -EINVAL;
+
+	host_lock_component();
+
+	ret = ___host_check_page_state_range(phys, size, PKVM_PAGE_OWNED,
+					     HOST_CHECK_IS_MEMORY |
+						     HOST_CHECK_NULL_REFCNT |
+						     HOST_CHECK_ALLOW_NO_MAP);
+	if (ret)
+		goto unlock;
+
+	/* HOST_SET_NO_COMPLETE to skip pkvm_sme_dvmsync_fw_call() */
+	WARN_ON(__host_stage2_set_owner_locked(phys, size, PKVM_ID_FFA, 0,
+					       HOST_SET_NO_IOMMU_UPDATE | HOST_SET_NO_COMPLETE));
+
+unlock:
+	host_unlock_component();
+	return ret;
+}
+
+/*
+ * Just like __pkvm_donate_ffa, rejects MMIO regions and does not update the IOMMU.
+ */
+int __pkvm_host_reclaim_ffa(u64 pfn, u64 nr_pages)
+{
+	u64 size, phys = hyp_pfn_to_phys(pfn), end;
+	int ret;
+
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size) ||
+	    check_add_overflow(phys, size, &end))
+		return -EINVAL;
+
+	host_lock_component();
+
+	ret = ___host_check_page_state_range(phys, size, PKVM_NOPAGE,
+					     HOST_CHECK_IS_MEMORY |
+						     HOST_CHECK_ALLOW_NO_MAP);
+	if (ret)
+		goto unlock;
+
+	WARN_ON(__host_stage2_set_owner_locked(phys, size, PKVM_ID_HOST, 0,
+					       HOST_SET_NO_IOMMU_UPDATE));
+
+unlock:
+	host_unlock_component();
+	return ret;
+}
+
+#define MODULE_PROT_ALLOWLIST (KVM_PGTABLE_PROT_RWX |		\
+			       KVM_PGTABLE_PROT_DEVICE |	\
+			       KVM_PGTABLE_PROT_NORMAL_NC |	\
+			       KVM_PGTABLE_PROT_PXN |		\
 			       KVM_PGTABLE_PROT_UXN)
 
 int module_change_host_page_prot(u64 pfn, enum kvm_pgtable_prot prot, u64 nr_pages,
 				 bool update_iommu)
 {
-	u64 i, addr = hyp_pfn_to_phys(pfn);
-	u64 end = addr + nr_pages * PAGE_SIZE;
+	u64 i, end, addr = hyp_pfn_to_phys(pfn);
 	struct hyp_page *page = NULL;
 	struct kvm_mem_range range;
 	struct memblock_region *reg;
 	int ret;
 
 	if ((prot & MODULE_PROT_ALLOWLIST) != prot)
+		return -EINVAL;
+
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &end) ||
+	    check_add_overflow(addr, end, &end))
 		return -EINVAL;
 
 	reg = find_mem_range(addr, &range);
@@ -2318,20 +1840,31 @@ int module_change_host_page_prot(u64 pfn, enum kvm_pgtable_prot prot, u64 nr_pag
 		}
 	} else {
 		/* The entire range must be pristine. */
-		ret = ___host_check_page_state_range(
-				addr, nr_pages << PAGE_SHIFT, PKVM_PAGE_OWNED, reg);
+		ret = ___host_check_page_state_range(addr, nr_pages << PAGE_SHIFT,
+						     PKVM_PAGE_OWNED, HOST_CHECK_NULL_REFCNT);
 		if (ret)
 			goto unlock;
 	}
 
 update:
 	if (!prot) {
+		enum host_set_page_state_flags flags = 0;
+
+		if (!reg)
+			flags |= HOST_SET_IS_MMIO;
+		if (!update_iommu)
+			flags |= HOST_SET_NO_IOMMU_UPDATE;
+
 		ret = __host_stage2_set_owner_locked(addr, nr_pages << PAGE_SHIFT,
-						     PKVM_ID_PROTECTED, !!reg,
-						     PKVM_MODULE_OWNED_PAGE, update_iommu);
+						     PKVM_ID_PROTECTED,
+						     PKVM_MODULE_OWNED_PAGE, flags);
 	} else {
-		ret = host_stage2_idmap_locked(
-			addr, nr_pages << PAGE_SHIFT, prot, update_iommu);
+		/* !update_iommu is fast but not safe. For that reason it also skips dvmsync */
+		if (!update_iommu)
+			ret = host_stage2_try(__host_stage2_idmap, addr,
+					      addr + (nr_pages << PAGE_SHIFT), prot);
+		else
+			ret = host_stage2_idmap_locked(addr, nr_pages << PAGE_SHIFT, prot, true);
 	}
 
 	if (WARN_ON(ret) || !page || !prot)
@@ -2344,42 +1877,6 @@ update:
 			page[i].host_state = PKVM_PAGE_OWNED;
 		}
 	}
-
-unlock:
-	host_unlock_component();
-
-	return ret;
-}
-
-int __pkvm_host_lazy_pte(u64 pfn, u64 nr_pages, bool enable)
-{
-	u64 size = nr_pages << PAGE_SHIFT;
-	u64 addr = hyp_pfn_to_phys(pfn);
-	u64 end = addr + size;
-	struct memblock_region *reg;
-	struct kvm_mem_range range;
-	int ret;
-
-	/* Reject MMIO regions */
-	reg = find_mem_range(addr, &range);
-	if (!reg)
-		return -EPERM;
-
-	if (!is_in_mem_range(end - 1, &range) ||
-	    is_range_refcounted(addr, nr_pages))
-		return -EPERM;
-
-	host_lock_component();
-
-	ret = ___host_check_page_state_range(addr, size, PKVM_PAGE_OWNED, reg);
-	if (ret)
-		goto unlock;
-
-	if (enable)
-		ret = kvm_pgtable_stage2_get_pages(&host_mmu.pgt, addr, size,
-						   &host_s2_pool);
-	else
-		ret = kvm_pgtable_stage2_put_pages(&host_mmu.pgt, addr, size);
 
 unlock:
 	host_unlock_component();
@@ -2434,21 +1931,22 @@ void hyp_unpin_shared_mem(void *from, void *to)
 
 int __pkvm_host_share_ffa(u64 pfn, u64 nr_pages)
 {
+
+	u64 size, phys = hyp_pfn_to_phys(pfn);
 	int ret;
-	struct pkvm_mem_transition share = {
-		.nr_pages	= nr_pages,
-		.initiator	= {
-			.id	= PKVM_ID_HOST,
-			.addr	= hyp_pfn_to_phys(pfn),
-		},
-		.completer	= {
-			.id	= PKVM_ID_FFA,
-		},
-	};
-	u64 nr_shared;
+
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size))
+		return -EINVAL;
 
 	host_lock_component();
-	ret = do_share(&share, &nr_shared);
+
+	ret = ___host_check_page_state_range(phys, size, PKVM_PAGE_OWNED,
+					     HOST_CHECK_IS_MEMORY |
+						     HOST_CHECK_NULL_REFCNT |
+						     HOST_CHECK_ALLOW_NO_MAP);
+	if (!ret)
+		ret = __host_set_page_state_range(phys, size, PKVM_PAGE_SHARED_OWNED);
+
 	host_unlock_component();
 
 	return ret;
@@ -2456,205 +1954,297 @@ int __pkvm_host_share_ffa(u64 pfn, u64 nr_pages)
 
 int __pkvm_host_unshare_ffa(u64 pfn, u64 nr_pages)
 {
+	u64 size, phys = hyp_pfn_to_phys(pfn);
 	int ret;
-	struct pkvm_mem_transition share = {
-		.nr_pages	= nr_pages,
-		.initiator	= {
-			.id	= PKVM_ID_HOST,
-			.addr	= hyp_pfn_to_phys(pfn),
-		},
-		.completer	= {
-			.id	= PKVM_ID_FFA,
-		},
-	};
-	u64 nr_unshared;
+
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size))
+		return -EINVAL;
 
 	host_lock_component();
-	ret = do_unshare(&share, &nr_unshared);
+
+	ret = ___host_check_page_state_range(phys, size, PKVM_PAGE_SHARED_OWNED,
+					     HOST_CHECK_IS_MEMORY |
+						     HOST_CHECK_ALLOW_NO_MAP);
+	if (!ret)
+		ret = __host_set_page_state_range(phys, size, PKVM_PAGE_OWNED);
+
 	host_unlock_component();
 
 	return ret;
 }
 
-static int __pkvm_host_use_dma_page(phys_addr_t phys_addr)
+static void __pkvm_use_dma_page(phys_addr_t phys_addr)
 {
-	int ret;
 	struct hyp_page *p = hyp_phys_to_page(phys_addr);
-	enum pkvm_page_state state;
-	kvm_pte_t pte;
-	enum kvm_pgtable_prot prot;
 
-	hyp_assert_lock_held(&host_mmu.lock);
+	hyp_page_ref_inc(p);
+}
+
+static void __pkvm_unuse_dma_page(phys_addr_t phys_addr)
+{
+	struct hyp_page *p = hyp_phys_to_page(phys_addr);
+
+	hyp_page_ref_dec(p);
+}
+
+static int __pkvm_use_dma_locked(phys_addr_t phys_addr, size_t size,
+				 struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	int i;
+	int ret = 0;
+	struct kvm_mem_range r;
+	size_t nr_pages = size >> PAGE_SHIFT;
+	struct memblock_region *reg = find_mem_range(phys_addr, &r);
+
+	if (WARN_ON(!PAGE_ALIGNED(phys_addr | size)) || !is_in_mem_range(phys_addr + size - 1, &r))
+		return -EINVAL;
 
 	/*
 	 * Some differences between handling of RAM and device memory:
 	 * - The hyp vmemmap area for device memory is not backed by physical
 	 *   pages in the hyp page tables.
 	 * - However, in some cases modules can donate MMIO, as they can't be
-	 *   refcounted, taint them by marking them as dma(new state), and that
-	 *   will prevent any future transition, this is too restrictive at the,
-	 *   moment which can be improved with more infrastructure to track MMIO
-	 *   pages that ideally comes with device assignment support.
+	 *   refcounted, taint them by marking them as shared PKVM_PAGE_TAINTED, and that
+	 *   will prevent any future transition.
 	 */
-	if (!addr_is_memory(phys_addr)) {
-		ret = kvm_pgtable_get_leaf(&host_mmu.pgt, phys_addr, &pte, NULL);
-		if (ret)
-			return ret;
-		state = host_get_mmio_page_state(pte, phys_addr);
-		if (state == PKVM_PAGE_MMIO_DMA)
-			return 0;
-		if (state != PKVM_PAGE_OWNED)
-			return -EPERM;
-		prot = pkvm_mkstate(PKVM_HOST_MMIO_PROT, PKVM_PAGE_MMIO_DMA);
-		return host_stage2_idmap_locked(phys_addr, PAGE_SIZE, prot, false);
+	if (!reg) {
+		enum kvm_pgtable_prot prot;
+
+		if (hyp_vcpu)
+			return -EINVAL;
+
+		for (i = 0; i < nr_pages; i++) {
+			u64 addr = phys_addr + i * PAGE_SIZE;
+
+			ret = ___host_check_page_state_range(addr, PAGE_SIZE,
+							     PKVM_PAGE_TAINTED,
+							     0);
+			/* Page already tainted */
+			if (!ret)
+				continue;
+			ret = ___host_check_page_state_range(addr, PAGE_SIZE,
+							     PKVM_PAGE_OWNED,
+							     0);
+			if (ret)
+				return ret;
+		}
+		prot = pkvm_mkstate(PKVM_HOST_MMIO_PROT, PKVM_PAGE_TAINTED);
+		WARN_ON(host_stage2_idmap_locked(phys_addr, size, prot, false));
+	} else {
+		/* For VMs, we know if we reach this point the VM has access to the page. */
+		if (!hyp_vcpu) {
+			for (i = 0; i < nr_pages; i++) {
+				enum pkvm_page_state state;
+				phys_addr_t this_addr = phys_addr + i * PAGE_SIZE;
+
+				state = hyp_phys_to_page(this_addr)->host_state;
+				if (state != PKVM_PAGE_OWNED) {
+					ret = -EPERM;
+					break;
+				}
+			}
+			if (ret)
+				return ret;
+		}
+
+		for (i = 0; i < nr_pages; i++)
+			__pkvm_use_dma_page(phys_addr + i * PAGE_SIZE);
 	}
-
-	state = hyp_phys_to_page(phys_addr)->host_state;
-
-	if (state & (PKVM_NOPAGE | PKVM_MODULE_OWNED_PAGE))
-		return -EPERM;
-
-	/*
-	 * Technically, this page is accessible by the host, however it seems strange,
-	 * so we don't allow DMA to be mapped to pages accessible from hyp even if the
-	 * host shared the page.
-	 */
-	if (state & PKVM_PAGE_SHARED_BORROWED || state & PKVM_PAGE_SHARED_OWNED) {
-		ret = __hyp_check_page_state_range((u64)hyp_phys_to_virt(phys_addr),
-						   PAGE_SIZE, PKVM_NOPAGE);
-		if (ret)
-			return ret;
-	}
-
-	hyp_page_ref_inc(p);
-
-	return 0;
-}
-
-static int __pkvm_host_unuse_dma_page(phys_addr_t phys_addr)
-{
-	struct hyp_page *p = hyp_phys_to_page(phys_addr);
-
-	if (!addr_is_memory(phys_addr))
-		return 0;
-
-	hyp_page_ref_dec(p);
-
-	return 0;
-}
-
-/*
- * __pkvm_host_use_dma - Mark host memory as used for DMA
- * @phys_addr:	physical address of the DMA region
- * @size:	size of the DMA region
- *
- * We must not allow the host to donate pages that are mapped in the IOMMU for
- * DMA. So we refcount it, since a page may be mapped in multiple device address spaces.
- * At some point we may end up needing more than the current 16 bits for
- * refcounting, for example if all devices and sub-devices map the same MSI
- * doorbell page. It will do for now.
- */
-int __pkvm_host_use_dma(phys_addr_t phys_addr, size_t size)
-{
-	int i;
-	int ret = 0;
-	size_t nr_pages = size >> PAGE_SHIFT;
-
-	if (WARN_ON(!PAGE_ALIGNED(phys_addr | size)))
-		return -EINVAL;
-
-	host_lock_component();
-	hyp_lock_component();
-
-	for (i = 0; i < nr_pages; i++) {
-		ret = __pkvm_host_use_dma_page(phys_addr + i * PAGE_SIZE);
-		if (ret)
-			break;
-	}
-
-	if (ret) {
-		for (--i; i >= 0; --i)
-			__pkvm_host_unuse_dma_page(phys_addr + i * PAGE_SIZE);
-	}
-
-	hyp_unlock_component();
-	host_unlock_component();
 
 	return ret;
 }
 
-int __pkvm_host_unuse_dma(phys_addr_t phys_addr, size_t size)
+/*
+ * __pkvm_use_dma - Mark memory as used for DMA
+ * @phys_addr:	physical address of the DMA region
+ * @size:	size of the DMA region
+ * When a page is mapped in an IOMMU page table for DMA, it must
+ * not be donated to a guest or the hypervisor we ensure this with:
+ * - Host can only map pages that are OWNED
+ * - Any page that is mapped is refcounted
+ * - Donation/Sharing is prevented from refcount check in
+ *   ___host_check_page_state_range()
+ * - No MMIO transtion is allowed beyond IOMMU MMIO which
+ *   happens during de-privilege.
+ * In case in the future shared pages are allowed to be mapped,
+ * similar checks are needed in host_request_unshare() and
+ * host_ack_unshare()
+ */
+int __pkvm_use_dma(phys_addr_t phys_addr, size_t size, struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	int ret;
+
+	host_lock_component();
+	ret = __pkvm_use_dma_locked(phys_addr, size, hyp_vcpu);
+	host_unlock_component();
+	return ret;
+}
+
+int __pkvm_unuse_dma(phys_addr_t phys_addr, size_t size, struct pkvm_hyp_vcpu *hyp_vcpu)
 {
 	int i;
-	int ret = 0;
 	size_t nr_pages = size >> PAGE_SHIFT;
 
+	if (WARN_ON(!PAGE_ALIGNED(phys_addr | size)))
+		return -EINVAL;
+	if (!range_is_memory(phys_addr, phys_addr + size)) {
+		WARN_ON(hyp_vcpu);
+		return 0;
+	}
+
+	host_lock_component();
 	/*
 	 * We end up here after the caller successfully unmapped the page from
 	 * the IOMMU table. Which means that a ref is held, the page is shared
 	 * in the host s2, there can be no failure.
 	 */
-	for (i = 0; i < nr_pages; i++) {
-		ret = __pkvm_host_unuse_dma_page(phys_addr + i * PAGE_SIZE);
-		if (ret)
-			break;
-	}
+	for (i = 0; i < nr_pages; i++)
+		__pkvm_unuse_dma_page(phys_addr + i * PAGE_SIZE);
 
-	return ret;
+	host_unlock_component();
+	return 0;
 }
 
-int __pkvm_host_share_guest(struct pkvm_hyp_vcpu *vcpu, u64 pfn, u64 gfn,
-			    u64 nr_pages, enum kvm_pgtable_prot prot)
+int __pkvm_host_share_guest(u64 pfn, u64 gfn, struct pkvm_hyp_vcpu *vcpu,
+			    enum kvm_pgtable_prot prot, u64 nr_pages)
 {
-	int ret;
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	u64 guest_addr = hyp_pfn_to_phys(gfn);
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
-	struct pkvm_mem_transition share = {
-		.nr_pages	= nr_pages,
-		.initiator	= {
-			.id	= PKVM_ID_HOST,
-			.addr	= host_addr,
-			.host	= {
-				.completer_addr = guest_addr,
-			},
-		},
-		.completer	= {
-			.id	= PKVM_ID_GUEST,
-			.prot = prot,
-			.guest	= {
-				.hyp_vm = vm,
-				.mc = &vcpu->vcpu.arch.stage2_mc,
-				.phys = host_addr,
-			},
-		},
-	};
-	u64 nr_shared;
+	u64 phys = hyp_pfn_to_phys(pfn);
+	u64 ipa = hyp_pfn_to_phys(gfn);
+	struct hyp_page *page;
+	size_t size;
+	u64 end;
+	int ret;
 
+	if (prot & ~KVM_PGTABLE_PROT_RWX)
+		return -EINVAL;
+
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size) ||
+	    check_add_overflow(phys, size, &end))
+		return -EINVAL;
+
+	ret = check_range_allowed_memory(phys, end);
+	if (ret)
+		return ret;
 
 	host_lock_component();
 	guest_lock_component(vm);
 
-	ret = do_share(&share, &nr_shared);
+	ret = __guest_check_page_state_range(vcpu, ipa, size, PKVM_NOPAGE);
+	if (ret)
+		goto unlock;
 
+	for (; phys < end; phys += PAGE_SIZE) {
+		page = hyp_phys_to_page(phys);
+		if (page->host_state == PKVM_PAGE_OWNED && !hyp_refcount_get(page->refcount))
+			continue;
+		else if (page->host_state == PKVM_PAGE_SHARED_OWNED && page->host_share_guest_count)
+			continue;
+		ret = -EPERM;
+		goto unlock;
+	}
+
+	phys = hyp_pfn_to_phys(pfn) ;
+	WARN_ON(kvm_pgtable_stage2_map(&vm->pgt, ipa, size, phys,
+				       pkvm_mkstate(prot, PKVM_PAGE_SHARED_BORROWED),
+				       &vcpu->vcpu.arch.stage2_mc, 0));
+	for (; phys < end; phys += PAGE_SIZE) {
+		page = hyp_phys_to_page(phys);
+		page->host_state = PKVM_PAGE_SHARED_OWNED;
+		page->host_share_guest_count++;
+	}
+
+unlock:
 	guest_unlock_component(vm);
 	host_unlock_component();
 
 	return ret;
 }
 
-static int guest_get_valid_pte(struct pkvm_hyp_vm *vm, u64 pfn, u64 ipa,
-			       u8 order, kvm_pte_t *pte)
+static int __check_host_shared_guest(struct pkvm_hyp_vm *vm, u64 *__phys, u64 ipa, size_t size)
 {
-	size_t size = PAGE_SIZE << order;
-	u64 phys = hyp_pfn_to_phys(pfn);
-	u32 level;
-	u64 end;
+	enum pkvm_page_state state;
+	struct hyp_page *page;
+	kvm_pte_t pte;
+	u64 phys, end;
+	s8 level;
+	int ret;
 
-	if (order && size != PMD_SIZE)
+	if (size != PAGE_SIZE && size != PMD_SIZE)
+		return -EINVAL;
+	ret = kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, &level);
+	if (ret)
+		return ret;
+	if (!kvm_pte_valid(pte))
+		return -ENOENT;
+	if (kvm_granule_size(level) != size)
+		return -E2BIG;
+
+	state = guest_get_page_state(pte, ipa) & ~PKVM_PAGE_RESTRICTED_PROT;
+	if (state != PKVM_PAGE_SHARED_BORROWED)
+		return -EPERM;
+
+	phys = kvm_pte_to_phys(pte);
+	if (check_add_overflow(phys, size, &end))
 		return -EINVAL;
 
-	if (check_add_overflow(phys, size, &end))
+	ret = check_range_allowed_memory(phys, end);
+	if (WARN_ON(ret))
+		return ret;
+
+	for (; phys < end; phys += PAGE_SIZE) {
+		page = hyp_phys_to_page(phys);
+		if (page->host_state != PKVM_PAGE_SHARED_OWNED)
+			return -EPERM;
+		if (WARN_ON(!page->host_share_guest_count))
+			return -EINVAL;
+	}
+
+	*__phys = kvm_pte_to_phys(pte);
+
+	return 0;
+}
+
+int __pkvm_host_unshare_guest(u64 gfn, struct pkvm_hyp_vm *vm, u64 nr_pages)
+{
+	size_t size = PAGE_SIZE * nr_pages;
+	u64 ipa = hyp_pfn_to_phys(gfn);
+	struct hyp_page *page;
+	u64 phys, end;
+	int ret;
+
+	host_lock_component();
+	guest_lock_component(vm);
+
+	ret = __check_host_shared_guest(vm, &phys, ipa, size);
+	if (ret)
+		goto unlock;
+
+	ret = kvm_pgtable_stage2_unmap(&vm->pgt, ipa, size);
+	if (ret)
+		goto unlock;
+
+	end = phys + size;
+	for (; phys < end; phys += PAGE_SIZE) {
+		page = hyp_phys_to_page(phys);
+		page->host_share_guest_count--;
+		if (!page->host_share_guest_count)
+			page->host_state = PKVM_PAGE_OWNED;
+	}
+
+unlock:
+	guest_unlock_component(vm);
+	host_unlock_component();
+
+	return ret;
+}
+
+static int guest_get_valid_pte(struct pkvm_hyp_vm *vm, u64 *phys, u64 ipa, u8 order, kvm_pte_t *pte)
+{
+	size_t size = PAGE_SIZE << order;
+	s8 level;
+
+	if (order && size != PMD_SIZE)
 		return -EINVAL;
 
 	WARN_ON(kvm_pgtable_get_leaf(&vm->pgt, ipa, pte, &level));
@@ -2665,158 +2255,77 @@ static int guest_get_valid_pte(struct pkvm_hyp_vm *vm, u64 pfn, u64 ipa,
 	if (!kvm_pte_valid(*pte))
 		return -ENOENT;
 
-	if (phys != kvm_pte_to_phys(*pte))
-		return -EINVAL;
+	*phys = kvm_pte_to_phys(*pte);
 
 	return 0;
 }
 
-/*
- * Ideally we would like to use check_unshare()... but this wouldn't let us
- * restrict the unshare range to the actual guest stage-2 mapping.
- */
-static int __check_host_unshare_guest_order(struct pkvm_hyp_vm *vm, u64 pfn,
-					    u64 guest_addr, u8 order)
-{
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	enum pkvm_page_state state;
-	kvm_pte_t pte;
-	int ret;
-
-	ret = guest_get_valid_pte(vm, pfn, guest_addr, order, &pte);
-	if (ret)
-		return ret;
-
-	state = guest_get_page_state(pte, guest_addr) & ~PKVM_PAGE_RESTRICTED_PROT;
-	if (state != PKVM_PAGE_SHARED_BORROWED)
-		return -EPERM;
-
-	return __host_check_page_state_range(host_addr, PAGE_SIZE << order,
-					     PKVM_PAGE_SHARED_OWNED);
-}
-
-int __pkvm_host_unshare_guest(struct pkvm_hyp_vm *vm, u64 pfn, u64 gfn,
-			      u8 order)
-{
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	u64 guest_addr = hyp_pfn_to_phys(gfn);
-	int ret;
-
-	host_lock_component();
-	guest_lock_component(vm);
-
-	ret = __check_host_unshare_guest_order(vm, pfn, guest_addr, order);
-	if (ret)
-		goto unlock;
-
-	ret = kvm_pgtable_stage2_unmap(&vm->pgt, guest_addr, PAGE_SIZE << order);
-	if (ret)
-		goto unlock;
-
-	WARN_ON(__host_set_page_state_range(host_addr, PAGE_SIZE << order,
-					    PKVM_PAGE_OWNED));
-unlock:
-	guest_unlock_component(vm);
-	host_unlock_component();
-
-	return ret;
-}
-
-int __pkvm_relax_perms(struct pkvm_hyp_vcpu *vcpu, u64 pfn, u64 gfn, u8 order,
-		       enum kvm_pgtable_prot prot)
+int __pkvm_host_relax_perms_guest(u64 gfn, struct pkvm_hyp_vcpu *vcpu, enum kvm_pgtable_prot prot)
 {
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
-	u64 guest_addr = hyp_pfn_to_phys(gfn);
+	u64 ipa = hyp_pfn_to_phys(gfn);
 	int ret;
 
-	if ((prot & KVM_PGTABLE_PROT_RWX) != prot)
+	if (WARN_ON(kvm_vm_is_protected(&vm->kvm)))
 		return -EPERM;
 
-	host_lock_component();
+	if (prot & ~KVM_PGTABLE_PROT_RWX)
+		return -EINVAL;
+
 	guest_lock_component(vm);
-
-	ret = __check_host_unshare_guest_order(vm, pfn, guest_addr, order);
-	if (ret)
-		goto unlock;
-
-	ret = __kvm_pgtable_stage2_relax_perms(&vm->pgt, guest_addr, prot, 0);
-unlock:
+	ret = kvm_pgtable_stage2_relax_perms(&vm->pgt, ipa, prot, 0);
 	guest_unlock_component(vm);
-	host_unlock_component();
 
 	return ret;
 }
 
-int __pkvm_wrprotect(struct pkvm_hyp_vm *vm, u64 pfn, u64 gfn, u8 order)
+int __pkvm_host_wrprotect_guest(u64 gfn, struct pkvm_hyp_vm *vm, u64 size)
 {
-	u64 guest_addr = hyp_pfn_to_phys(gfn);
+	u64 ipa = hyp_pfn_to_phys(gfn);
 	int ret;
 
-	host_lock_component();
+	if (WARN_ON(kvm_vm_is_protected(&vm->kvm)))
+		return -EPERM;
+
 	guest_lock_component(vm);
-
-	ret = __check_host_unshare_guest_order(vm, pfn, guest_addr, order);
-	if (ret)
-		goto unlock;
-
-	ret = kvm_pgtable_stage2_wrprotect(&vm->pgt, guest_addr,
-					   PAGE_SIZE << order);
-unlock:
+	ret = kvm_pgtable_stage2_wrprotect(&vm->pgt, ipa, size);
 	guest_unlock_component(vm);
-	host_unlock_component();
 
 	return ret;
 }
 
-int __pkvm_dirty_log(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
+int __pkvm_host_test_clear_young_guest(u64 gfn, u64 size, bool mkold, struct pkvm_hyp_vm *vm)
 {
-	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
-	u64 guest_addr = hyp_pfn_to_phys(gfn);
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	struct pkvm_mem_transition share = {
-		.nr_pages       = 1,
-		.initiator      = {
-			.id     = PKVM_ID_HOST,
-			.addr   = host_addr,
-			.host   = {
-				.completer_addr = guest_addr,
-			},
-		},
-		.completer      = {
-			.id     = PKVM_ID_GUEST,
-			.guest  = {
-				.hyp_vm = vm,
-				.mc = NULL,
-				.phys = host_addr,
-			},
-		},
-	};
-	struct pkvm_checked_mem_transition checked_tx = {
-		.tx             = &share,
-		.nr_pages       = 0,
-	};
+	u64 ipa = hyp_pfn_to_phys(gfn);
 	int ret;
 
-	host_lock_component();
+	if (WARN_ON(kvm_vm_is_protected(&vm->kvm)))
+		return -EPERM;
+
 	guest_lock_component(vm);
-
-	ret = check_unshare(&checked_tx);
-	if (ret)
-		goto unlock;
-
-	ret = kvm_pgtable_stage2_map(&vm->pgt, guest_addr, PAGE_SIZE,
-				     host_addr, KVM_PGTABLE_PROT_RWX,
-				     &hyp_vcpu->vcpu.arch.stage2_mc,
-				     0);
-unlock:
+	ret = kvm_pgtable_stage2_test_clear_young(&vm->pgt, ipa, size, mkold);
 	guest_unlock_component(vm);
-	host_unlock_component();
 
 	return ret;
-
 }
 
-int __pkvm_host_split_guest(u64 pfn, u64 gfn, u64 size, struct pkvm_hyp_vcpu *vcpu)
+kvm_pte_t __pkvm_host_mkyoung_guest(u64 gfn, struct pkvm_hyp_vcpu *vcpu)
+{
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
+	u64 ipa = hyp_pfn_to_phys(gfn);
+	kvm_pte_t pte;
+
+	if (WARN_ON(kvm_vm_is_protected(&vm->kvm)))
+		return 0;
+
+	guest_lock_component(vm);
+	pte = kvm_pgtable_stage2_mkyoung(&vm->pgt, ipa, 0);
+	guest_unlock_component(vm);
+
+	return pte;
+}
+
+int __pkvm_host_split_guest(u64 gfn, u64 size, struct pkvm_hyp_vcpu *vcpu)
 {
 	struct kvm_hyp_memcache *mc = &vcpu->vcpu.arch.stage2_mc;
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
@@ -2840,41 +2349,236 @@ int __pkvm_host_split_guest(u64 pfn, u64 gfn, u64 size, struct pkvm_hyp_vcpu *vc
 	return ret;
 }
 
-int __pkvm_host_donate_guest(struct pkvm_hyp_vcpu *vcpu, u64 pfn, u64 gfn,
-			     u64 nr_pages)
+static void __host_set_owner_guest(struct pkvm_hyp_vcpu *vcpu, u64 phys, u64 ipa,
+				  size_t size, enum host_set_page_state_flags flags)
 {
-	int ret;
-	u64 host_addr = hyp_pfn_to_phys(pfn);
-	u64 guest_addr = hyp_pfn_to_phys(gfn);
+	u64 nr_pages = size >> PAGE_SHIFT;
+
+	WARN_ON(__host_stage2_set_owner_locked(phys, size, PKVM_ID_GUEST, 0, flags));
+	psci_mem_protect_inc(nr_pages);
+}
+
+static void __guest_set_owner_host(struct pkvm_hyp_vcpu *vcpu, u64 phys, u64 ipa,
+				   size_t size, enum host_set_page_state_flags flags)
+{
+	u64 nr_pages = size >> PAGE_SHIFT;
+
+	WARN_ON(__host_stage2_set_owner_locked(phys, size, PKVM_ID_HOST, 0, flags));
+	psci_mem_protect_dec(nr_pages);
+}
+
+int __pkvm_host_donate_guest(u64 pfn, u64 gfn, struct pkvm_hyp_vcpu *vcpu, u64 nr_pages)
+{
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
-	struct pkvm_mem_transition donation = {
-		.nr_pages	= nr_pages,
-		.initiator	= {
-			.id	= PKVM_ID_HOST,
-			.addr	= host_addr,
-			.host	= {
-				.completer_addr = guest_addr,
-			},
-		},
-		.completer	= {
-			.id	= PKVM_ID_GUEST,
-			.guest	= {
-				.hyp_vm = vm,
-				.mc = &vcpu->vcpu.arch.stage2_mc,
-				.phys = host_addr,
-			},
-		},
-	};
+	u64 phys = hyp_pfn_to_phys(pfn);
+	u64 ipa = hyp_pfn_to_phys(gfn);
+	enum kvm_pgtable_prot prot;
+	size_t size;
+	int ret;
+
+	if (check_mul_overflow(nr_pages, PAGE_SIZE, &size))
+		return -EINVAL;
 
 	host_lock_component();
 	guest_lock_component(vm);
 
-	ret = do_donate(&donation);
+	ret = ___host_check_page_state_range(phys, size, PKVM_PAGE_OWNED,
+					     HOST_CHECK_NULL_REFCNT |
+					     HOST_CHECK_IS_MEMORY);
+	if (ret)
+		goto unlock;
 
+	ret = __guest_check_page_state_range(vcpu, ipa, size, PKVM_NOPAGE);
+	if (ret)
+		goto unlock;
+
+	__host_set_owner_guest(vcpu, phys, ipa, size, 0);
+
+	if (pkvm_ipa_range_has_pvmfw(vm, ipa, ipa + size))
+		WARN_ON(pkvm_load_pvmfw_pages(vm, ipa, phys, size));
+
+	prot = pkvm_mkstate(KVM_PGTABLE_PROT_RWX, PKVM_PAGE_OWNED);
+	WARN_ON(kvm_pgtable_stage2_map(&vm->pgt, ipa, size, phys, prot,
+				       &vcpu->vcpu.arch.stage2_mc, 0));
+
+unlock:
 	guest_unlock_component(vm);
 	host_unlock_component();
 
 	return ret;
+}
+
+struct kvm_hyp_pinned_page *hyp_ppages;
+
+static int __copy_hyp_ppages(struct pkvm_hyp_vcpu *vcpu)
+{
+	struct kvm_hyp_pinned_page *ppage, *hyp_ppage;
+
+	WARN_ON(!hyp_ppages);
+
+	ppage = next_kvm_hyp_pinned_page(vcpu->vcpu.arch.hyp_reqs, NULL, true);
+	if (!ppage)
+		return -EINVAL;
+
+	hyp_ppage = hyp_ppages;
+
+	do {
+		memcpy(hyp_ppage, ppage, sizeof(*ppage));
+		ppage = next_kvm_hyp_pinned_page(vcpu->vcpu.arch.hyp_reqs, ppage, true);
+		hyp_ppage++; /* No risk to overflow hyp_ppages */
+	} while (ppage);
+
+	hyp_ppage->order = 0xFF;
+
+	return 0;
+}
+
+#define for_each_hyp_ppage(hyp_ppage)						\
+	for (hyp_ppage = hyp_ppages; (hyp_ppage)->order != 0xFF; (hyp_ppage)++)
+
+int __pkvm_host_donate_sglist_guest(struct pkvm_hyp_vcpu *vcpu)
+{
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
+	struct kvm_hyp_pinned_page *ppage = hyp_ppages;
+	u64 phys, ipa;
+	int ret;
+	size_t size;
+
+	host_lock_component();
+	guest_lock_component(vm);
+
+	ret = __copy_hyp_ppages(vcpu);
+	if (ret)
+		goto unlock;
+
+	for_each_hyp_ppage(ppage) {
+		phys = hyp_pfn_to_phys(ppage->pfn);
+		ipa = hyp_pfn_to_phys(ppage->gfn);
+
+		if (check_shl_overflow(PAGE_SIZE, ppage->order, &size)) {
+			ret = -EINVAL;
+			goto err_page_state;
+		}
+
+		ret = ___host_check_page_state_range(phys, size, PKVM_PAGE_OWNED,
+						     HOST_CHECK_NULL_REFCNT |
+						     HOST_CHECK_IS_MEMORY);
+		if (ret)
+			goto err_page_state;
+
+		ret = __guest_check_page_state_range(vcpu, ipa, size, PKVM_NOPAGE);
+		if (ret)
+			goto err_page_state;
+
+		__host_set_owner_guest(vcpu, phys, ipa, size, HOST_SET_NO_COMPLETE);
+	}
+	__host_stage2_set_owner_complete(PKVM_ID_GUEST, 0);
+
+	for_each_hyp_ppage(ppage) {
+		size_t size = PAGE_SIZE << ppage->order;
+		u64 phys = hyp_pfn_to_phys(ppage->pfn);
+		u64 ipa = hyp_pfn_to_phys(ppage->gfn);
+		enum kvm_pgtable_prot prot;
+
+		if (pkvm_ipa_range_has_pvmfw(vm, ipa, ipa + size))
+			WARN_ON(pkvm_load_pvmfw_pages(vm, ipa, phys, size));
+
+		prot = pkvm_mkstate(KVM_PGTABLE_PROT_RWX, PKVM_PAGE_OWNED);
+		WARN_ON(kvm_pgtable_stage2_map(&vm->pgt, ipa, size, phys, prot,
+				       &vcpu->vcpu.arch.stage2_mc, 0));
+	}
+
+unlock:
+	guest_unlock_component(vm);
+	host_unlock_component();
+
+	return ret;
+err_page_state:
+	if (ppage == hyp_ppages)
+		goto unlock;
+
+	__host_stage2_set_owner_complete(PKVM_ID_GUEST, 0);
+	while (ppage-- != hyp_ppages) {
+		phys = hyp_pfn_to_phys(ppage->pfn);
+		size = PAGE_SIZE << ppage->order;
+		__guest_set_owner_host(vcpu, phys, ipa, size, HOST_SET_NO_COMPLETE);
+	}
+	__host_stage2_set_owner_complete(PKVM_ID_HOST, 0);
+	goto unlock;
+}
+
+int __pkvm_host_donate_sglist_hyp(struct pkvm_sglist_page *sglist, size_t nr_pages)
+{
+	enum kvm_pgtable_prot prot;
+	int p, ret;
+	size_t size;
+	u64 phys;
+
+	host_lock_component();
+	hyp_lock_component();
+
+	/* Checking we are reading hyp private memory */
+	if (IS_ENABLED(CONFIG_NVHE_EL2_DEBUG))
+		WARN_ON(__hyp_check_page_state_range((u64)sglist, nr_pages * sizeof(*sglist),
+						     PKVM_PAGE_OWNED));
+
+	for (p = 0; p < nr_pages; p++) {
+		phys = hyp_pfn_to_phys(sglist[p].pfn);
+
+		if (check_shl_overflow(PAGE_SIZE, sglist[p].order, &size)) {
+			ret = -EINVAL;
+			goto err_page_state;
+		}
+
+		if (!addr_is_memory(phys)) {
+			ret = -EINVAL;
+			goto err_page_state;
+		}
+
+		ret = ___host_check_page_state_range(phys, size, PKVM_PAGE_OWNED,
+						     HOST_CHECK_NULL_REFCNT | HOST_CHECK_IS_MEMORY);
+		if (ret)
+			goto err_page_state;
+
+		if (IS_ENABLED(CONFIG_NVHE_EL2_DEBUG)) {
+			ret = __hyp_check_page_state_range((u64)__hyp_va(phys), size, PKVM_NOPAGE);
+			if (ret)
+				goto err_page_state;
+		}
+
+		prot = pkvm_mkstate(PAGE_HYP, PKVM_PAGE_OWNED);
+		ret = pkvm_create_mappings_locked(__hyp_va(phys), __hyp_va(phys) + size, prot);
+		if (ret == -ENOMEM)
+			goto err_page_state;
+
+		WARN_ON(ret);
+		WARN_ON(__host_stage2_set_owner_locked(phys, size, PKVM_ID_HYP, 0,
+						       HOST_SET_NO_COMPLETE));
+	}
+
+	__host_stage2_set_owner_complete(PKVM_ID_HYP, 0);
+
+unlock:
+	hyp_unlock_component();
+	host_unlock_component();
+
+	return ret;
+err_page_state:
+
+	__host_stage2_set_owner_complete(PKVM_ID_HYP, 0);
+
+	while (p-- > 0) {
+		phys = hyp_pfn_to_phys(sglist[p].pfn);
+		size = PAGE_SIZE << sglist[p].order;
+
+		WARN_ON(host_stage2_idmap_locked(phys, size, PKVM_HOST_MEM_PROT, false));
+		kvm_iommu_host_stage2_idmap(phys, phys + size, PKVM_HOST_MEM_PROT);
+		pkvm_remove_mappings_locked(__hyp_va(phys), __hyp_va(phys) + size);
+	}
+
+	__host_stage2_set_owner_complete(PKVM_ID_HOST, 0);
+	kvm_iommu_host_stage2_idmap_complete(true);
+	goto unlock;
 }
 
 void hyp_poison_page(phys_addr_t phys, size_t size)
@@ -2909,45 +2613,57 @@ void destroy_hyp_vm_pgt(struct pkvm_hyp_vm *vm)
 	guest_unlock_component(vm);
 }
 
-void drain_hyp_pool(struct pkvm_hyp_vm *vm, struct kvm_hyp_memcache *mc)
+void drain_hyp_pool(struct hyp_pool *pool, struct kvm_hyp_memcache *mc)
 {
-	WARN_ON(reclaim_hyp_pool(&vm->pool, mc, INT_MAX) != -ENOMEM);
+	WARN_ON(reclaim_hyp_pool(pool, mc, INT_MAX) != -ENOMEM);
 }
 
 int __pkvm_host_reclaim_page(struct pkvm_hyp_vm *vm, u64 pfn, u64 ipa, u8 order)
 {
-	phys_addr_t phys = hyp_pfn_to_phys(pfn);
-	size_t page_size = PAGE_SIZE << order;
+	phys_addr_t __phys, phys = hyp_pfn_to_phys(pfn);
+	size_t page_size;
 	kvm_pte_t pte;
 	int ret = 0;
+
+	if (check_shl_overflow(PAGE_SIZE, order, &page_size))
+		return -EINVAL;
+
+	if (!pkvm_hyp_vm_is_protected(vm))
+		return -EPERM;
 
 	host_lock_component();
 	guest_lock_component(vm);
 
-	ret = guest_get_valid_pte(vm, pfn, ipa, order, &pte);
+	ret = guest_get_valid_pte(vm, &__phys, ipa, order, &pte);
 	if (ret)
 		goto unlock;
 
-	/* We could avoid TLB inval, it is done per VMID on the finalize path */
-	WARN_ON(kvm_pgtable_stage2_unmap(&vm->pgt, ipa, page_size));
+	if (phys != __phys) {
+		ret = -EINVAL;
+		goto unlock;
+	}
 
-	switch((int)guest_get_page_state(pte, ipa)) {
+	switch ((int)guest_get_page_state(pte, ipa)) {
 	case PKVM_PAGE_OWNED:
-		WARN_ON(__host_check_page_state_range(phys, page_size, PKVM_NOPAGE));
+		WARN_ON(___host_check_page_state_range(phys, page_size, PKVM_NOPAGE,
+						       HOST_CHECK_IS_MEMORY));
+		/* No vCPUs of the guest can run, doing this prior to stage-2 unmap is OK */
 		hyp_poison_page(phys, page_size);
 		psci_mem_protect_dec(1 << order);
 		break;
-	case PKVM_PAGE_SHARED_BORROWED:
-	case PKVM_PAGE_SHARED_BORROWED | PKVM_PAGE_RESTRICTED_PROT:
-		WARN_ON(__host_check_page_state_range(phys, page_size, PKVM_PAGE_SHARED_OWNED));
-		break;
 	case PKVM_PAGE_SHARED_OWNED:
-		WARN_ON(__host_check_page_state_range(phys, page_size, PKVM_PAGE_SHARED_BORROWED));
+		if (__host_check_page_state_range(phys, page_size, PKVM_PAGE_SHARED_BORROWED)) {
+			/* Presumably a page shared via FF-A, will be handled separately */
+			ret = -EBUSY;
+			goto unlock;
+		}
 		break;
 	default:
 		BUG_ON(1);
 	}
 
+	/* We could avoid TLB inval, it is done per VMID on the finalize path */
+	WARN_ON(kvm_pgtable_stage2_unmap(&vm->pgt, ipa, page_size));
 	WARN_ON(host_stage2_set_owner_locked(phys, page_size, PKVM_ID_HOST));
 
 unlock:
@@ -2961,7 +2677,7 @@ static bool __check_ioguard_page(struct pkvm_hyp_vcpu *hyp_vcpu, u64 ipa)
 {
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
 	kvm_pte_t pte;
-	u32 level;
+	s8 level;
 	int ret;
 
 	ret = kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, &level);
@@ -2973,93 +2689,73 @@ static bool __check_ioguard_page(struct pkvm_hyp_vcpu *hyp_vcpu, u64 ipa)
 		pte == KVM_INVALID_PTE_MMIO_NOTE);
 }
 
+static int guest_request_ioguard_walker(const struct kvm_pgtable_visit_ctx *ctx,
+					enum kvm_pgtable_walk_flags visit)
+{
+
+	struct guest_request_walker_data *data = (struct guest_request_walker_data *)ctx->arg;
+	enum pkvm_page_state state;
+	kvm_pte_t pte = *ctx->ptep;
+	u64 granule_size;
+
+	state = guest_get_page_state(pte, 0) & ~PKVM_MMIO;
+	if (state != PKVM_NOPAGE)
+		return -EPERM;
+
+	granule_size = kvm_granule_size(ctx->level);
+
+	/* First PTE */
+	if (!data->size)
+		data->ipa_start = ctx->addr & ~(granule_size - 1);
+
+	data->size += granule_size;
+
+	return --data->max_ptes > 0 ? 0 : -ERANGE;
+}
+
 int __pkvm_install_ioguard_page(struct pkvm_hyp_vcpu *hyp_vcpu, u64 ipa,
 				u64 nr_pages, u64 *nr_guarded)
 {
 	struct guest_request_walker_data data = GUEST_WALKER_DATA_INIT(PKVM_NOPAGE);
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
 	struct kvm_pgtable_walker walker = {
-		.cb     = guest_request_walker,
+		.cb     = guest_request_ioguard_walker,
 		.flags  = KVM_PGTABLE_WALK_LEAF,
 		.arg    = (void *)&data,
 	};
-	u64 size = nr_pages * PAGE_SIZE;
+	u64 end;
 	int ret;
 
 	if (!test_bit(KVM_ARCH_FLAG_MMIO_GUARD, &vm->kvm.arch.flags))
 		return -EINVAL;
 
-	if (!PAGE_ALIGNED(ipa) || !PAGE_ALIGNED(size) || !size)
+	if (!PAGE_ALIGNED(ipa))
 		return -EINVAL;
 
 	guest_lock_component(vm);
 
-	/* Check we either have NOMAP or NOMAP|MMIO in this range */
-	data.desired_mask = ~PKVM_MMIO;
-	ret = kvm_pgtable_walk(&vm->pgt, ipa, size, &walker);
+	ret = kvm_pgtable_walk(&vm->pgt, ipa, nr_pages << PAGE_SHIFT, &walker);
 	/* Walker reached data.max_ptes */
-	if (ret == -E2BIG)
+	if (ret == -ERANGE)
 		ret = 0;
 	else if (ret)
 		goto unlock;
 
-	/*
-	 * Intersection between the requested region and what has been verified
-	 */
-	size = min(data.size - (ipa - data.ipa_start), size);
-	ret = kvm_pgtable_stage2_annotate(&vm->pgt, ipa, size,
+	/* Intersection between the requested region and what has been verified */
+	end = min(ipa + (nr_pages << PAGE_SHIFT), data.ipa_start + data.size);
+	if (ipa >= end) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	*nr_guarded = (end - ipa) >> PAGE_SHIFT;
+	ret = kvm_pgtable_stage2_annotate(&vm->pgt, ipa, end - ipa,
 					  &hyp_vcpu->vcpu.arch.stage2_mc,
 					  KVM_INVALID_PTE_MMIO_NOTE);
-	if (nr_guarded)
-		*nr_guarded = size >> PAGE_SHIFT;
+
 unlock:
 	guest_unlock_component(vm);
 	return ret;
-}
-
-int __pkvm_remove_ioguard_page(struct pkvm_hyp_vcpu *hyp_vcpu, u64 ipa,
-			       u64 nr_pages, u64 *nr_unguarded)
-{
-	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
-	struct guest_request_walker_data data =
-		GUEST_WALKER_DATA_INIT(PKVM_NOPAGE | PKVM_MMIO);
-	struct kvm_pgtable_walker walker = {
-		.cb     = guest_request_walker,
-		.flags  = KVM_PGTABLE_WALK_LEAF,
-		.arg    = (void *)&data,
-	};
-	u64 size = nr_pages * PAGE_SIZE;
-	int ret;
-
-	if (!test_bit(KVM_ARCH_FLAG_MMIO_GUARD, &vm->kvm.arch.flags))
-		return -EINVAL;
-
-	if (!PAGE_ALIGNED(ipa) || !PAGE_ALIGNED(size) || !size)
-		return -EINVAL;
-
-	guest_lock_component(vm);
-
-	ret = kvm_pgtable_walk(&vm->pgt, ipa, size, &walker);
-	/* Walker reached data.max_ptes */
-	if (ret == -E2BIG)
-		ret = 0;
-	else if (ret)
-		goto unlock;
-
-	/*
-	 * Ioguard is using annotation which has force_pte on.
-	 * We shouldn't get any block mapping
-	 */
-	WARN_ON(data.ipa_start != ipa);
-	WARN_ON(data.size > size);
-
-	ret = kvm_pgtable_stage2_unmap(&vm->pgt, data.ipa_start, data.size);
-
-	if (nr_unguarded)
-		*nr_unguarded = data.size >> PAGE_SHIFT;
-unlock:
-	guest_unlock_component(vm);
-	return WARN_ON(ret);
 }
 
 bool __pkvm_check_ioguard_page(struct pkvm_hyp_vcpu *hyp_vcpu)
@@ -3087,7 +2783,50 @@ bool __pkvm_check_ioguard_page(struct pkvm_hyp_vcpu *hyp_vcpu)
 	return ret;
 }
 
-int host_stage2_get_leaf(phys_addr_t phys, kvm_pte_t *ptep, u32 *level)
+static int __pkvm_remove_ioguard_page(struct pkvm_hyp_vm *vm, u64 ipa)
+{
+	int ret;
+	kvm_pte_t pte;
+	s8 level;
+
+	hyp_assert_lock_held(&vm->pgtable_lock);
+
+	if (!test_bit(KVM_ARCH_FLAG_MMIO_GUARD, &vm->kvm.arch.flags))
+		return -EINVAL;
+
+	if (!PAGE_ALIGNED(ipa))
+		return -EINVAL;
+
+	ret = kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, &level);
+	if (ret)
+		return ret;
+
+	if (BIT(ARM64_HW_PGTABLE_LEVEL_SHIFT(level)) == PAGE_SIZE &&
+	    pte == KVM_INVALID_PTE_MMIO_NOTE)
+		return kvm_pgtable_stage2_unmap(&vm->pgt, ipa, PAGE_SIZE);
+
+	return kvm_pte_valid(pte) ? -EEXIST : -EINVAL;
+}
+
+int __pkvm_install_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
+{
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	u64 ipa = gfn << PAGE_SHIFT;
+	int ret;
+
+	hyp_lock_component();
+	guest_lock_component(vm);
+	ret = __pkvm_remove_ioguard_page(vm, ipa);
+	if (ret)
+		goto out_unlock;
+	ret = pkvm_hyp_donate_guest(hyp_vcpu, pfn, gfn);
+out_unlock:
+	guest_unlock_component(vm);
+	hyp_unlock_component();
+	return ret;
+}
+
+int host_stage2_get_leaf(phys_addr_t phys, kvm_pte_t *ptep, s8 *level)
 {
 	int ret;
 
@@ -3098,116 +2837,454 @@ int host_stage2_get_leaf(phys_addr_t phys, kvm_pte_t *ptep, u32 *level)
 	return ret;
 }
 
-int guest_stage2_pa(struct pkvm_hyp_vm *vm, u64 ipa, phys_addr_t *phys)
+static u64 __pkvm_ptdump_get_host_config(enum pkvm_ptdump_ops op)
 {
-	kvm_pte_t pte;
-	u32 level;
-	int ret;
-
-	guest_lock_component(vm);
-	ret = kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, &level);
-	guest_unlock_component(vm);
-
-	if (ret)
-		return ret;
-
-	if (!kvm_pte_valid(pte) || level != KVM_PGTABLE_MAX_LEVELS - 1)
-		return -EINVAL;
-
-	*phys = kvm_pte_to_phys(pte);
-	return 0;
-}
-
-#ifdef CONFIG_NVHE_EL2_DEBUG
-static void *snap_zalloc_page(void *mc)
-{
-	void *addr;
-	struct kvm_pgtable_snapshot *snap;
-	phys_addr_t *used_pg;
-	unsigned long order;
-
-	snap = container_of(mc, struct kvm_pgtable_snapshot, mc);
-	used_pg = kern_hyp_va(snap->used_pages_hva);
-
-	/* Check if we have space to track the used page */
-	if (snap->used_pages_idx * sizeof(*used_pg) >= snap->num_used_pages * PAGE_SIZE)
-		return NULL;
-
-	addr = pop_hyp_memcache(mc, hyp_phys_to_virt, &order);
-	if (!addr)
-		return addr;
-	used_pg[snap->used_pages_idx++] = hyp_virt_to_phys(addr);
-
-	memset(addr, 0, PAGE_SIZE);
-	return addr;
-}
-
-static void pkvm_stage2_initialize_snapshot(const struct kvm_pgtable *from_pgt,
-					    struct kvm_pgtable *dest_pgt,
-					    struct kvm_pgtable_mm_ops *mm_ops)
-{
-	memset(mm_ops, 0, sizeof(struct kvm_pgtable_mm_ops));
-
-	mm_ops->zalloc_page		= snap_zalloc_page;
-	mm_ops->phys_to_virt		= hyp_phys_to_virt;
-	mm_ops->virt_to_phys		= hyp_virt_to_phys;
-	mm_ops->page_count		= hyp_page_count;
-
-	dest_pgt->mm_ops	= mm_ops;
-	dest_pgt->ia_bits	= from_pgt->ia_bits;
-	dest_pgt->start_level	= from_pgt->start_level;
-	dest_pgt->flags		= from_pgt->flags;
-	dest_pgt->pte_ops	= from_pgt->pte_ops;
-	dest_pgt->pgd		= NULL;
-}
-
-static int __pkvm_stage2_snapshot(struct kvm_pgtable_snapshot *snap,
-				  struct kvm_pgtable *from_pgt,
-				  size_t pgd_len)
-{
-	struct kvm_pgtable *to_pgt;
-	struct kvm_pgtable_mm_ops mm_ops;
-
-	if (snap->used_pages_idx != 0)
-		return -EINVAL;
-
-	to_pgt = &snap->pgtable;
-	pkvm_stage2_initialize_snapshot(from_pgt, to_pgt, &mm_ops);
-
-	if (snap->pgd_pages == 0 || snap->num_used_pages == 0)
-		return 0;
-
-	if (snap->pgd_pages < (pgd_len >> PAGE_SHIFT))
-		return -EINVAL;
-
-	to_pgt->pgd = kern_hyp_va(snap->pgd_hva);
-	return kvm_pgtable_stage2_snapshot(snap, from_pgt, pgd_len);
-}
-
-int __pkvm_guest_stage2_snapshot(struct kvm_pgtable_snapshot *snap,
-				 struct pkvm_hyp_vm *vm)
-{
-	int ret;
-	size_t required_pgd_len;
-
-	guest_lock_component(vm);
-	required_pgd_len = kvm_pgtable_stage2_pgd_size(vm->kvm.arch.vtcr);
-	ret = __pkvm_stage2_snapshot(snap, &vm->pgt, required_pgd_len);
-	guest_unlock_component(vm);
-
-	return ret;
-}
-
-int __pkvm_host_stage2_snapshot(struct kvm_pgtable_snapshot *snap)
-{
-	int ret;
-	size_t required_pgd_len;
+	u64 ret = 0;
 
 	host_lock_component();
-	required_pgd_len = kvm_pgtable_stage2_pgd_size(host_mmu.arch.vtcr);
-	ret = __pkvm_stage2_snapshot(snap, &host_mmu.pgt, required_pgd_len);
+	if (op == PKVM_PTDUMP_GET_LEVEL)
+		ret = host_mmu.pgt.start_level;
+	else
+		ret = host_mmu.pgt.ia_bits;
 	host_unlock_component();
 
 	return ret;
 }
-#endif /* CONFIG_NVHE_EL2_DEBUG */
+
+static u64 __pkvm_ptdump_get_guest_config(pkvm_handle_t handle, enum pkvm_ptdump_ops op)
+{
+	struct pkvm_hyp_vm *vm;
+	u64 ret = 0;
+
+	vm = get_pkvm_hyp_vm(handle);
+	if (!vm)
+		return -EINVAL;
+
+	if (op == PKVM_PTDUMP_GET_LEVEL)
+		ret = vm->pgt.start_level;
+	else
+		ret = vm->pgt.ia_bits;
+
+	put_pkvm_hyp_vm(vm);
+	return ret;
+}
+
+u64 __pkvm_ptdump_get_config(pkvm_handle_t handle, enum pkvm_ptdump_ops op)
+{
+	if (!handle)
+		return __pkvm_ptdump_get_host_config(op);
+
+	return __pkvm_ptdump_get_guest_config(handle, op);
+}
+
+static int pkvm_ptdump_walker(const struct kvm_pgtable_visit_ctx *ctx,
+			      enum kvm_pgtable_walk_flags visit)
+{
+	struct pkvm_ptdump_log_hdr **log_hdr = ctx->arg;
+	ssize_t avail_space = PAGE_SIZE - (*log_hdr)->w_index - sizeof(struct pkvm_ptdump_log_hdr);
+	struct pkvm_ptdump_log *log;
+
+	if (avail_space < sizeof(struct pkvm_ptdump_log)) {
+		if ((*log_hdr)->pfn_next == INVALID_PTDUMP_PFN)
+			return -ENOMEM;
+
+		*log_hdr = hyp_phys_to_virt(hyp_pfn_to_phys((*log_hdr)->pfn_next));
+		WARN_ON((*log_hdr)->w_index);
+	}
+
+	log = (struct pkvm_ptdump_log *)((void *)*log_hdr + (*log_hdr)->w_index +
+					 sizeof(struct pkvm_ptdump_log_hdr));
+	log->pfn = ctx->addr >> PAGE_SHIFT;
+	log->valid = ctx->old & PTE_VALID;
+	log->r = FIELD_GET(KVM_PTE_LEAF_ATTR_LO_S2_S2AP_R, ctx->old);
+	log->w = FIELD_GET(KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W, ctx->old);
+	log->xn = FIELD_GET(KVM_PTE_LEAF_ATTR_HI_S2_XN, ctx->old);
+	log->table = FIELD_GET(KVM_PTE_TYPE, ctx->old);
+	log->level = ctx->level;
+	log->page_state = FIELD_GET(PKVM_PAGE_STATE_PROT_MASK, ctx->old);
+
+	(*log_hdr)->w_index += sizeof(struct pkvm_ptdump_log);
+	return 0;
+}
+
+static void pkvm_ptdump_teardown_log(struct pkvm_ptdump_log_hdr *log_hva,
+				     struct pkvm_ptdump_log_hdr *cur)
+{
+	struct pkvm_ptdump_log_hdr *tmp, *log = (void *)kern_hyp_va(log_hva);
+	bool next_log_invalid = false;
+
+	while (log != cur && !next_log_invalid) {
+		next_log_invalid = log->pfn_next == INVALID_PTDUMP_PFN;
+		tmp = hyp_phys_to_virt(hyp_pfn_to_phys(log->pfn_next));
+		WARN_ON(__pkvm_hyp_donate_host(hyp_virt_to_pfn(log), 1));
+		log = tmp;
+	}
+}
+
+static int pkvm_ptdump_setup_log(struct pkvm_ptdump_log_hdr *log_hva)
+{
+	int ret;
+	struct pkvm_ptdump_log_hdr *log = (void *)kern_hyp_va(log_hva);
+
+	if (!PAGE_ALIGNED(log))
+		return -EINVAL;
+
+	for (;;) {
+		ret = __pkvm_host_donate_hyp(hyp_virt_to_pfn(log), 1);
+		if (ret) {
+			pkvm_ptdump_teardown_log(log_hva, log);
+			return ret;
+		}
+
+		log->w_index = 0;
+		if (log->pfn_next == INVALID_PTDUMP_PFN)
+			break;
+
+		log = hyp_phys_to_virt(hyp_pfn_to_phys(log->pfn_next));
+	}
+
+	return 0;
+}
+
+static int pkvm_ptdump_walk_host(struct kvm_pgtable_walker *walker)
+{
+	int ret;
+
+	host_lock_component();
+	ret = kvm_pgtable_walk(&host_mmu.pgt, 0, BIT(host_mmu.pgt.ia_bits), walker);
+	host_unlock_component();
+
+	return ret;
+}
+
+static int pkvm_ptdump_walk_guest(struct pkvm_hyp_vm *vm, struct kvm_pgtable_walker *walker)
+{
+	int ret;
+
+	guest_lock_component(vm);
+
+	ret = kvm_pgtable_walk(&vm->pgt, 0, BIT(vm->pgt.ia_bits), walker);
+
+	guest_unlock_component(vm);
+
+	return ret;
+}
+
+u64 __pkvm_ptdump_walk_range(pkvm_handle_t handle, struct pkvm_ptdump_log_hdr *log)
+{
+	struct pkvm_hyp_vm *vm;
+	int ret;
+	struct pkvm_ptdump_log_hdr *log_hyp = kern_hyp_va(log);
+	struct kvm_pgtable_walker walker = {
+		.cb     = pkvm_ptdump_walker,
+		.flags  = KVM_PGTABLE_WALK_LEAF,
+		.arg    = &log_hyp,
+	};
+
+	ret = pkvm_ptdump_setup_log(log);
+	if (ret)
+		return ret;
+
+	if (!handle)
+		ret = pkvm_ptdump_walk_host(&walker);
+	else {
+		vm = get_pkvm_hyp_vm(handle);
+		if (!vm) {
+			ret = -EINVAL;
+			goto teardown;
+		}
+
+		ret = pkvm_ptdump_walk_guest(vm, &walker);
+		put_pkvm_hyp_vm(vm);
+	}
+teardown:
+	pkvm_ptdump_teardown_log(log, NULL);
+	return ret;
+}
+
+/* Return PA for an owned guest IPA or request it, and repeat the guest HVC */
+int pkvm_get_guest_pa_request(struct pkvm_hyp_vcpu *hyp_vcpu, u64 ipa,
+			      size_t ipa_size_request, u64 *out_pa, s8 *out_level)
+{
+	struct kvm_hyp_req *req;
+	kvm_pte_t pte;
+	enum pkvm_page_state state;
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	int ret;
+
+	guest_lock_component(vm);
+	ret = kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, out_level);
+	guest_unlock_component(vm);
+	if (ret)
+		return ret;
+
+	if (!kvm_pte_valid(pte)) {
+		/* Page not mapped, create a request*/
+		req = pkvm_hyp_req_reserve(hyp_vcpu, KVM_HYP_REQ_TYPE_MAP);
+		if (!req)
+			return -ENOMEM;
+
+		req->map.guest_ipa = ipa;
+		req->map.size = ipa_size_request;
+		return -ENOENT;
+	}
+
+	state = pkvm_getstate(kvm_pgtable_stage2_pte_prot(pte));
+	if (state != PKVM_PAGE_OWNED)
+		return -EPERM;
+
+	*out_pa = kvm_pte_to_phys(pte);
+	*out_pa |= ipa & (kvm_granule_size(*out_level) - 1) & PAGE_MASK;
+	return 0;
+}
+
+/*
+ * Get a PA of an IPA and pin the memory starting from this PA till
+ *  the requested ipa_size or the end of the page boundary returned in level.
+ */
+int pkvm_get_guest_pa_request_use_dma(struct pkvm_hyp_vcpu *hyp_vcpu, u64 ipa,
+				      size_t ipa_size, u64 *out_pa, s8 *level)
+{
+	int ret;
+	size_t off;
+
+	host_lock_component();
+	ret = pkvm_get_guest_pa_request(hyp_vcpu, ipa, ipa_size,
+					out_pa, level);
+	if (ret)
+		goto out_ret;
+	off = *out_pa - ALIGN_DOWN(*out_pa, kvm_granule_size(*level));
+	WARN_ON(__pkvm_use_dma_locked(*out_pa,
+				      min(kvm_granule_size(*level) - off, ipa_size),
+				      hyp_vcpu));
+out_ret:
+	host_unlock_component();
+	return ret;
+}
+
+#ifdef CONFIG_PKVM_SELFTESTS
+struct pkvm_expected_state {
+	enum pkvm_page_state host;
+	enum pkvm_page_state hyp;
+	enum pkvm_page_state guest[2]; /* [ gfn, gfn + 1 ] */
+};
+
+static struct pkvm_expected_state selftest_state;
+static struct hyp_page *selftest_page;
+
+static struct pkvm_hyp_vm selftest_vm = {
+	.kvm = {
+		.arch = {
+			.mmu = {
+				.arch = &selftest_vm.kvm.arch,
+				.pgt = &selftest_vm.pgt,
+			},
+		},
+	},
+};
+
+static struct pkvm_hyp_vcpu selftest_vcpu = {
+	.vcpu = {
+		.arch = {
+			.hw_mmu = &selftest_vm.kvm.arch.mmu,
+		},
+		.kvm = &selftest_vm.kvm,
+	},
+};
+
+static void init_selftest_vm(void *virt)
+{
+	struct hyp_page *p = hyp_virt_to_page(virt);
+	int i;
+
+	selftest_vm.kvm.arch.mmu.vtcr = host_mmu.arch.mmu.vtcr;
+	WARN_ON(kvm_guest_prepare_stage2(&selftest_vm, virt, 0));
+
+	for (i = 0; i < pkvm_selftest_pages(); i++) {
+		if (p[i].refcount)
+			continue;
+		p[i].refcount = 1;
+		hyp_put_page(&selftest_vm.pool, hyp_page_to_virt(&p[i]));
+	}
+}
+
+static void teardown_selftest_vm(void)
+{
+	destroy_hyp_vm_pgt(&selftest_vm);
+}
+
+static u64 selftest_ipa(void)
+{
+	return BIT(selftest_vm.pgt.ia_bits - 1);
+}
+
+static void assert_page_state(void)
+{
+	void *virt = hyp_page_to_virt(selftest_page);
+	u64 size = PAGE_SIZE << selftest_page->order;
+	struct pkvm_hyp_vcpu *vcpu = &selftest_vcpu;
+	u64 phys = hyp_virt_to_phys(virt);
+	u64 ipa[2] = { selftest_ipa(), selftest_ipa() + PAGE_SIZE };
+
+	host_lock_component();
+	WARN_ON(__host_check_page_state_range(phys, size, selftest_state.host));
+	host_unlock_component();
+
+	hyp_lock_component();
+	WARN_ON(__hyp_check_page_state_range((u64)virt, size, selftest_state.hyp));
+	hyp_unlock_component();
+
+	guest_lock_component(&selftest_vm);
+	WARN_ON(__guest_check_page_state_range(vcpu, ipa[0], size, selftest_state.guest[0]));
+	WARN_ON(__guest_check_page_state_range(vcpu, ipa[1], size, selftest_state.guest[1]));
+	guest_unlock_component(&selftest_vm);
+}
+
+#define assert_transition_res(res, fn, ...)		\
+	do {						\
+		WARN_ON(fn(__VA_ARGS__) != res);	\
+		assert_page_state();			\
+	} while (0)
+
+void pkvm_ownership_selftest(void *base)
+{
+	enum kvm_pgtable_prot prot = KVM_PGTABLE_PROT_RWX;
+	void *virt = hyp_alloc_pages(&host_s2_pool, 0);
+	struct pkvm_hyp_vcpu *vcpu = &selftest_vcpu;
+	struct pkvm_hyp_vm *vm = &selftest_vm;
+	u64 phys, size, pfn, gfn, pa;
+
+	WARN_ON(!virt);
+	selftest_page = hyp_virt_to_page(virt);
+	selftest_page->refcount = 0;
+	init_selftest_vm(base);
+
+	size = PAGE_SIZE << selftest_page->order;
+	phys = hyp_virt_to_phys(virt);
+	pfn = hyp_phys_to_pfn(phys);
+	gfn = hyp_phys_to_pfn(selftest_ipa());
+
+	selftest_state.host = PKVM_NOPAGE;
+	selftest_state.hyp = PKVM_PAGE_OWNED;
+	selftest_state.guest[0] = selftest_state.guest[1] = PKVM_NOPAGE;
+	assert_page_state();
+	assert_transition_res(-EPERM,	__pkvm_host_donate_hyp, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_unshare_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_share_ffa, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_unshare_ffa, pfn, 1);
+	assert_transition_res(-EPERM,	hyp_pin_shared_mem, virt, virt + size);
+	assert_transition_res(-EPERM,	__pkvm_host_share_guest, pfn, gfn, vcpu, prot, 1);
+	assert_transition_res(-ENOENT,	__pkvm_host_unshare_guest, gfn, vm, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_guest, pfn, gfn, vcpu, 1);
+
+	selftest_state.host = PKVM_PAGE_OWNED;
+	selftest_state.hyp = PKVM_NOPAGE;
+	assert_transition_res(0,	__pkvm_hyp_donate_host, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_hyp_donate_host, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_unshare_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_unshare_ffa, pfn, 1);
+	assert_transition_res(-ENOENT,	__pkvm_host_unshare_guest, gfn, vm, 1);
+	assert_transition_res(-EPERM,	hyp_pin_shared_mem, virt, virt + size);
+
+	selftest_state.host = PKVM_PAGE_SHARED_OWNED;
+	selftest_state.hyp = PKVM_PAGE_SHARED_BORROWED;
+	assert_transition_res(0,	__pkvm_host_share_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_share_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_hyp, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_ffa, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_hyp_donate_host, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_guest, pfn, gfn, vcpu, prot, 1);
+	assert_transition_res(-ENOENT,	__pkvm_host_unshare_guest, gfn, vm, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_guest, pfn, gfn, vcpu, 1);
+
+	assert_transition_res(0,	hyp_pin_shared_mem, virt, virt + size);
+	assert_transition_res(0,	hyp_pin_shared_mem, virt, virt + size);
+	hyp_unpin_shared_mem(virt, virt + size);
+	WARN_ON(hyp_page_count(virt) != 1);
+	assert_transition_res(-EBUSY,	__pkvm_host_unshare_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_share_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_hyp, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_ffa, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_hyp_donate_host, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_guest, pfn, gfn, vcpu, prot, 1);
+	assert_transition_res(-ENOENT,	__pkvm_host_unshare_guest, gfn, vm, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_guest, pfn, gfn, vcpu, 1);
+
+	hyp_unpin_shared_mem(virt, virt + size);
+	assert_page_state();
+	WARN_ON(hyp_page_count(virt));
+
+	selftest_state.host = PKVM_PAGE_OWNED;
+	selftest_state.hyp = PKVM_NOPAGE;
+	assert_transition_res(0,	__pkvm_host_unshare_hyp, pfn);
+
+	selftest_state.host = PKVM_PAGE_SHARED_OWNED;
+	selftest_state.hyp = PKVM_NOPAGE;
+	assert_transition_res(0,	__pkvm_host_share_ffa, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_ffa, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_hyp, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_unshare_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_hyp_donate_host, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_guest, pfn, gfn, vcpu, prot, 1);
+	assert_transition_res(-ENOENT,	__pkvm_host_unshare_guest, gfn, vm, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_guest, pfn, gfn, vcpu, 1);
+	assert_transition_res(-EPERM,	hyp_pin_shared_mem, virt, virt + size);
+
+	selftest_state.host = PKVM_PAGE_OWNED;
+	selftest_state.hyp = PKVM_NOPAGE;
+	assert_transition_res(0,	__pkvm_host_unshare_ffa, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_unshare_ffa, pfn, 1);
+
+	selftest_state.host = PKVM_PAGE_SHARED_OWNED;
+	selftest_state.guest[0] = PKVM_PAGE_SHARED_BORROWED;
+	assert_transition_res(0,	__pkvm_host_share_guest, pfn, gfn, vcpu, prot, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_guest, pfn, gfn, vcpu, prot, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_ffa, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_hyp, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_unshare_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_hyp_donate_host, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_guest, pfn, gfn, vcpu, 1);
+	assert_transition_res(-EPERM,	hyp_pin_shared_mem, virt, virt + size);
+
+	selftest_state.guest[1] = PKVM_PAGE_SHARED_BORROWED;
+	assert_transition_res(0,	__pkvm_host_share_guest, pfn, gfn + 1, vcpu, prot, 1);
+	WARN_ON(hyp_virt_to_page(virt)->host_share_guest_count != 2);
+
+	selftest_state.guest[0] = PKVM_NOPAGE;
+	assert_transition_res(0,	__pkvm_host_unshare_guest, gfn, vm, 1);
+
+	selftest_state.guest[1] = PKVM_NOPAGE;
+	selftest_state.host = PKVM_PAGE_OWNED;
+	assert_transition_res(0,	__pkvm_host_unshare_guest, gfn + 1, vm, 1);
+
+	selftest_vm.kvm.arch.pkvm.enabled = true;
+	selftest_state.host = PKVM_NOPAGE;
+	selftest_state.guest[0] = PKVM_PAGE_OWNED;
+	assert_transition_res(0,	__pkvm_host_donate_guest, pfn, gfn, vcpu, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_guest, pfn, gfn, vcpu, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_guest, pfn, gfn + 1, vcpu, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_guest, pfn, gfn, vcpu, prot, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_guest, pfn, gfn + 1, vcpu, prot, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_ffa, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_donate_hyp, pfn, 1);
+	assert_transition_res(-EPERM,	__pkvm_host_share_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_host_unshare_hyp, pfn);
+	assert_transition_res(-EPERM,	__pkvm_hyp_donate_host, pfn, 1);
+
+	selftest_state.host = PKVM_PAGE_OWNED;
+	selftest_state.guest[0] = PKVM_NOPAGE;
+	assert_transition_res(0,	__pkvm_guest_relinquish_to_host, vcpu, gfn * PAGE_SIZE, 0, &pa);
+	WARN_ON(pa != phys);
+
+	selftest_state.host = PKVM_NOPAGE;
+	selftest_state.hyp = PKVM_PAGE_OWNED;
+	assert_transition_res(0,	__pkvm_host_donate_hyp, pfn, 1);
+
+	teardown_selftest_vm();
+	selftest_page->refcount = 1;
+	hyp_put_page(&host_s2_pool, virt);
+}
+#endif

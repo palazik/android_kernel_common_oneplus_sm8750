@@ -16,8 +16,6 @@
 #include <linux/mmc/sdio_func.h>
 #include <linux/mmc/sdio_ids.h>
 
-#include <trace/hooks/mmc.h>
-
 #include "core.h"
 #include "card.h"
 #include "host.h"
@@ -68,7 +66,7 @@ static struct attribute *sdio_std_attrs[] = {
 };
 ATTRIBUTE_GROUPS(sdio_std);
 
-static struct device_type sdio_type = {
+static const struct device_type sdio_type = {
 	.groups = sdio_std_groups,
 };
 
@@ -773,7 +771,7 @@ try_again:
 	 * Read CSD, before selecting the card
 	 */
 	if (!oldcard && mmc_card_sd_combo(card)) {
-		err = mmc_sd_get_csd(card);
+		err = mmc_sd_get_csd(card, false);
 		if (err)
 			goto remove;
 
@@ -1124,8 +1122,6 @@ out:
 	mmc_release_host(host);
 
 	host->pm_flags &= ~MMC_PM_KEEP_POWER;
-	trace_android_vh_mmc_sdio_pm_flag_set(host);
-
 	return err;
 }
 

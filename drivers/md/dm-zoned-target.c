@@ -702,7 +702,7 @@ static int dmz_get_zoned_device(struct dm_target *ti, char *path,
 	}
 
 	bdev = ddev->bdev;
-	if (bdev_zoned_model(bdev) == BLK_ZONED_NONE) {
+	if (!bdev_is_zoned(bdev)) {
 		if (nr_devs == 1) {
 			ti->error = "Invalid regular device";
 			goto err;
@@ -791,10 +791,6 @@ static int dmz_fixup_devices(struct dm_target *ti)
 				return -EINVAL;
 			}
 			zone_nr_sectors = bdev_zone_sectors(bdev);
-			if (!is_power_of_2(zone_nr_sectors)) {
-				ti->error = "Zone size is not a power-of-2 number of sectors";
-				return -EINVAL;
-			}
 			zoned_dev->zone_nr_sectors = zone_nr_sectors;
 			zoned_dev->nr_zones = bdev_nr_zones(bdev);
 		}
@@ -804,10 +800,6 @@ static int dmz_fixup_devices(struct dm_target *ti)
 
 		if (zoned_dev->flags & DMZ_BDEV_REGULAR) {
 			ti->error = "Disk is not a zoned device";
-			return -EINVAL;
-		}
-		if (!is_power_of_2(zoned_dev->zone_nr_sectors)) {
-			ti->error = "Zone size is not a power-of-2 number of sectors";
 			return -EINVAL;
 		}
 		zoned_dev->zone_nr_sectors = bdev_zone_sectors(bdev);
@@ -1004,12 +996,11 @@ static void dmz_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	limits->logical_block_size = DMZ_BLOCK_SIZE;
 	limits->physical_block_size = DMZ_BLOCK_SIZE;
 
-	blk_limits_io_min(limits, DMZ_BLOCK_SIZE);
-	blk_limits_io_opt(limits, DMZ_BLOCK_SIZE);
+	limits->io_min = DMZ_BLOCK_SIZE;
+	limits->io_opt = DMZ_BLOCK_SIZE;
 
 	limits->discard_alignment = 0;
 	limits->discard_granularity = DMZ_BLOCK_SIZE;
-	limits->max_discard_sectors = chunk_sectors;
 	limits->max_hw_discard_sectors = chunk_sectors;
 	limits->max_write_zeroes_sectors = chunk_sectors;
 
@@ -1018,7 +1009,7 @@ static void dmz_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	limits->max_sectors = chunk_sectors;
 
 	/* We are exposing a drive-managed zoned block device */
-	limits->zoned = BLK_ZONED_NONE;
+	limits->features &= ~BLK_FEAT_ZONED;
 }
 
 /*

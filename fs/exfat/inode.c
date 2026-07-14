@@ -94,7 +94,7 @@ int __exfat_write_inode(struct inode *inode, int sync)
 		ep2->dentry.stream.start_clu = EXFAT_FREE_CLUSTER;
 	}
 
-	exfat_update_dir_chksum_with_entry_set(&es);
+	exfat_update_dir_chksum(&es);
 	return exfat_put_dentry_set(&es, sync);
 }
 
@@ -448,16 +448,14 @@ static void exfat_write_failed(struct address_space *mapping, loff_t to)
 
 static int exfat_write_begin(struct file *file, struct address_space *mapping,
 		loff_t pos, unsigned int len,
-		struct page **pagep, void **fsdata)
+		struct folio **foliop, void **fsdata)
 {
 	int ret;
 
 	if (unlikely(exfat_forced_shutdown(mapping->host->i_sb)))
 		return -EIO;
 
-	*pagep = NULL;
-
-	ret = block_write_begin(mapping, pos, len, pagep, exfat_get_block);
+	ret = block_write_begin(mapping, pos, len, foliop, exfat_get_block);
 
 	if (ret < 0)
 		exfat_write_failed(mapping, pos+len);
@@ -467,13 +465,13 @@ static int exfat_write_begin(struct file *file, struct address_space *mapping,
 
 static int exfat_write_end(struct file *file, struct address_space *mapping,
 		loff_t pos, unsigned int len, unsigned int copied,
-		struct page *pagep, void *fsdata)
+		struct folio *folio, void *fsdata)
 {
 	struct inode *inode = mapping->host;
 	struct exfat_inode_info *ei = EXFAT_I(inode);
 	int err;
 
-	err = generic_write_end(file, mapping, pos, len, copied, pagep, fsdata);
+	err = generic_write_end(file, mapping, pos, len, copied, folio, fsdata);
 	if (err < len)
 		exfat_write_failed(mapping, pos+len);
 

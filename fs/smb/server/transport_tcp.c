@@ -37,7 +37,7 @@ struct tcp_transport {
 	unsigned int			nr_iov;
 };
 
-static struct ksmbd_transport_ops ksmbd_tcp_transport_ops;
+static const struct ksmbd_transport_ops ksmbd_tcp_transport_ops;
 
 static void tcp_stop_kthread(struct task_struct *kthread);
 static struct interface *alloc_iface(char *ifname);
@@ -77,7 +77,7 @@ static struct tcp_transport *alloc_transport(struct socket *client_sk)
 	struct tcp_transport *t;
 	struct ksmbd_conn *conn;
 
-	t = kzalloc(sizeof(*t), GFP_KERNEL);
+	t = kzalloc(sizeof(*t), KSMBD_DEFAULT_GFP);
 	if (!t)
 		return NULL;
 	t->sock = client_sk;
@@ -172,7 +172,7 @@ static struct kvec *get_conn_iovec(struct tcp_transport *t, unsigned int nr_segs
 		return t->iov;
 
 	/* not big enough -- allocate a new one and release the old */
-	new_iov = kmalloc_array(nr_segs, sizeof(*new_iov), GFP_KERNEL);
+	new_iov = kmalloc_array(nr_segs, sizeof(*new_iov), KSMBD_DEFAULT_GFP);
 	if (new_iov) {
 		kfree(t->iov);
 		t->iov = new_iov;
@@ -313,7 +313,6 @@ static int ksmbd_kthread_fn(void *p)
 		}
 
 skip_max_ip_conns_limit:
-
 		if (server_conf.max_connections &&
 		    atomic_inc_return(&active_num_conn) > server_conf.max_connections) {
 			pr_info_ratelimited("Limit the maximum number of connections(%u)\n",
@@ -606,9 +605,11 @@ static int ksmbd_netdev_event(struct notifier_block *nb, unsigned long event,
 				return NOTIFY_OK;
 		}
 		if (!iface && bind_additional_ifaces) {
-			iface = alloc_iface(kstrdup(netdev->name, GFP_KERNEL));
+			iface = alloc_iface(kstrdup(netdev->name, KSMBD_DEFAULT_GFP));
 			if (!iface)
 				return NOTIFY_OK;
+			ksmbd_debug(CONN, "netdev-up event: netdev(%s) is going up\n",
+				    iface->name);
 			ret = create_socket(iface);
 			if (ret)
 				break;
@@ -678,7 +679,7 @@ static struct interface *alloc_iface(char *ifname)
 	if (!ifname)
 		return NULL;
 
-	iface = kzalloc(sizeof(struct interface), GFP_KERNEL);
+	iface = kzalloc(sizeof(struct interface), KSMBD_DEFAULT_GFP);
 	if (!iface) {
 		kfree(ifname);
 		return NULL;
@@ -701,7 +702,7 @@ int ksmbd_tcp_set_interfaces(char *ifc_list, int ifc_list_sz)
 	}
 
 	while (ifc_list_sz > 0) {
-		if (!alloc_iface(kstrdup(ifc_list, GFP_KERNEL)))
+		if (!alloc_iface(kstrdup(ifc_list, KSMBD_DEFAULT_GFP)))
 			return -ENOMEM;
 
 		sz = strlen(ifc_list);
@@ -717,7 +718,7 @@ int ksmbd_tcp_set_interfaces(char *ifc_list, int ifc_list_sz)
 	return 0;
 }
 
-static struct ksmbd_transport_ops ksmbd_tcp_transport_ops = {
+static const struct ksmbd_transport_ops ksmbd_tcp_transport_ops = {
 	.read		= ksmbd_tcp_read,
 	.writev		= ksmbd_tcp_writev,
 	.disconnect	= ksmbd_tcp_disconnect,

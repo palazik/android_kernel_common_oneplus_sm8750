@@ -22,6 +22,9 @@
 #include "acl.h"
 #include <trace/events/f2fs.h>
 
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/fs.h>
+
 static inline bool is_extension_exist(const unsigned char *s, const char *sub,
 						bool tmp_ext, bool tmp_dot)
 {
@@ -245,8 +248,8 @@ static struct inode *f2fs_new_inode(struct mnt_idmap *idmap,
 	fi = F2FS_I(inode);
 	inode->i_ino = ino;
 	inode->i_blocks = 0;
-	inode->i_mtime = inode->i_atime = inode_set_ctime_current(inode);
-	fi->i_crtime = inode->i_mtime;
+	simple_inode_init_ts(inode);
+	fi->i_crtime = inode_get_mtime(inode);
 	inode->i_generation = get_random_u32();
 
 	if (S_ISDIR(inode->i_mode))
@@ -377,6 +380,7 @@ static int f2fs_create(struct mnt_idmap *idmap, struct inode *dir,
 	inode->i_mapping->a_ops = &f2fs_dblock_aops;
 	ino = inode->i_ino;
 
+	trace_android_vh_f2fs_create(inode, dentry);
 	f2fs_lock_op(sbi, &lc);
 	err = f2fs_add_link(dentry, inode);
 	if (err)
@@ -479,7 +483,6 @@ static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 	}
 
 	err = f2fs_prepare_lookup(dir, dentry, &fname);
-	generic_set_encrypted_ci_d_ops(dentry);
 	if (err == -ENOENT)
 		goto out_splice;
 	if (err)
@@ -505,6 +508,14 @@ static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 		goto out;
 	}
 
+	if (inode->i_nlink == 0) {
+		f2fs_warn(F2FS_I_SB(inode), "%s: inode (ino=%lx) has zero i_nlink",
+			  __func__, inode->i_ino);
+		err = -EFSCORRUPTED;
+		set_sbi_flag(F2FS_I_SB(inode), SBI_NEED_FSCK);
+		goto out_iput;
+	}
+
 	if (IS_ENCRYPTED(dir) &&
 	    (S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode)) &&
 	    !fscrypt_has_permitted_context(dir, inode)) {
@@ -514,8 +525,7 @@ static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 		goto out_iput;
 	}
 out_splice:
-#if IS_ENABLED(CONFIG_UNICODE)
-	if (!inode && IS_CASEFOLDED(dir)) {
+	if (IS_ENABLED(CONFIG_UNICODE) && !inode && IS_CASEFOLDED(dir)) {
 		/* Eventually we want to call d_add_ci(dentry, NULL)
 		 * for negative dentries in the encoding case as
 		 * well.  For now, prevent the negative dentry
@@ -524,7 +534,7 @@ out_splice:
 		trace_f2fs_lookup_end(dir, dentry, ino, err);
 		return NULL;
 	}
-#endif
+
 	new = d_splice_alias(inode, dentry);
 	trace_f2fs_lookup_end(dir, !IS_ERR_OR_NULL(new) ? new : dentry,
 				ino, IS_ERR(new) ? PTR_ERR(new) : err);
@@ -541,8 +551,8 @@ static int f2fs_unlink(struct inode *dir, struct dentry *dentry)
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct inode *inode = d_inode(dentry);
 	struct f2fs_dir_entry *de;
-	struct f2fs_lock_context lc;
 	struct page *page;
+	struct f2fs_lock_context lc;
 	int err;
 
 	trace_f2fs_unlink_enter(dir, dentry);
@@ -587,16 +597,15 @@ static int f2fs_unlink(struct inode *dir, struct dentry *dentry)
 	f2fs_delete_entry(de, page, dir, inode);
 	f2fs_unlock_op(sbi, &lc);
 
-#if IS_ENABLED(CONFIG_UNICODE)
 	/* VFS negative dentries are incompatible with Encoding and
 	 * Case-insensitiveness. Eventually we'll want avoid
 	 * invalidating the dentries here, alongside with returning the
 	 * negative dentries at f2fs_lookup(), when it is better
 	 * supported by the VFS for the CI case.
 	 */
-	if (IS_CASEFOLDED(dir))
+	if (IS_ENABLED(CONFIG_UNICODE) && IS_CASEFOLDED(dir))
 		d_invalidate(dentry);
-#endif
+
 	if (IS_DIRSYNC(dir))
 		f2fs_sync_fs(sbi->sb, 1);
 fail:

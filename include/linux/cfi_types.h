@@ -50,11 +50,11 @@
 	 * __kcfi_typeid_<func>.						\
 	 */									\
 	__ADDRESSABLE(func);							\
-	/* u32 name __ro_after_init = __kcfi_typeid_<func> */			\
+	/* u32 name = __kcfi_typeid_<func> */					\
 	extern u32 name;							\
 	asm (									\
-	"	.pushsection	.data..ro_after_init,\"aw\",\%progbits	\n"	\
-	"	.type	" #name ",\%object				\n"	\
+	"	.pushsection	.data..ro_after_init,\"aw\",@progbits	\n"	\
+	"	.type	" #name ",@object				\n"	\
 	"	.globl	" #name "					\n"	\
 	"	.p2align	2, 0x0					\n"	\
 	#name ":							\n"	\

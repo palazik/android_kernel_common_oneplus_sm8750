@@ -27,7 +27,7 @@
 #ifndef __L2CAP_H
 #define __L2CAP_H
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/atomic.h>
 #include <linux/android_kabi.h>
 
@@ -285,9 +285,9 @@ struct l2cap_conn_rsp {
 #define L2CAP_CR_LE_BAD_KEY_SIZE	0x0007
 #define L2CAP_CR_LE_ENCRYPTION		0x0008
 #define L2CAP_CR_LE_INVALID_SCID	0x0009
-#define L2CAP_CR_LE_SCID_IN_USE		0X000A
-#define L2CAP_CR_LE_UNACCEPT_PARAMS	0X000B
-#define L2CAP_CR_LE_INVALID_PARAMS	0X000C
+#define L2CAP_CR_LE_SCID_IN_USE		0x000A
+#define L2CAP_CR_LE_UNACCEPT_PARAMS	0x000B
+#define L2CAP_CR_LE_INVALID_PARAMS	0x000C
 
 /* connect/create channel status */
 #define L2CAP_CS_NO_INFO	0x0000
@@ -464,18 +464,24 @@ struct l2cap_le_credits {
 #define L2CAP_ECRED_MAX_CID		5
 
 struct l2cap_ecred_conn_req {
-	__le16 psm;
-	__le16 mtu;
-	__le16 mps;
-	__le16 credits;
+	/* New members must be added within the struct_group() macro below. */
+	__struct_group(l2cap_ecred_conn_req_hdr, hdr, __packed,
+		__le16 psm;
+		__le16 mtu;
+		__le16 mps;
+		__le16 credits;
+	);
 	__le16 scid[];
 } __packed;
 
 struct l2cap_ecred_conn_rsp {
-	__le16 mtu;
-	__le16 mps;
-	__le16 credits;
-	__le16 result;
+	/* New members must be added within the struct_group() macro below. */
+	struct_group_tagged(l2cap_ecred_conn_rsp_hdr, hdr,
+		__le16 mtu;
+		__le16 mps;
+		__le16 credits;
+		__le16 result;
+	);
 	__le16 dcid[];
 };
 
@@ -959,7 +965,7 @@ int l2cap_add_scid(struct l2cap_chan *chan,  __u16 scid);
 struct l2cap_chan *l2cap_chan_create(void);
 void l2cap_chan_close(struct l2cap_chan *chan, int reason);
 int l2cap_chan_connect(struct l2cap_chan *chan, __le16 psm, u16 cid,
-		       bdaddr_t *dst, u8 dst_type);
+		       bdaddr_t *dst, u8 dst_type, u16 timeout);
 int l2cap_chan_reconfigure(struct l2cap_chan *chan, __u16 mtu);
 int l2cap_chan_send(struct l2cap_chan *chan, struct msghdr *msg, size_t len);
 void l2cap_chan_busy(struct l2cap_chan *chan, int busy);
@@ -974,10 +980,6 @@ void l2cap_chan_list(struct l2cap_conn *conn, l2cap_chan_func_t func,
 		     void *data);
 void l2cap_chan_del(struct l2cap_chan *chan, int err);
 void l2cap_send_conn_req(struct l2cap_chan *chan);
-void l2cap_move_start(struct l2cap_chan *chan);
-void l2cap_logical_cfm(struct l2cap_chan *chan, struct hci_chan *hchan,
-		       u8 status);
-void __l2cap_physical_cfm(struct l2cap_chan *chan, int result);
 
 struct l2cap_conn *l2cap_conn_get(struct l2cap_conn *conn);
 struct l2cap_conn *l2cap_conn_hold_unless_zero(struct l2cap_conn *conn);

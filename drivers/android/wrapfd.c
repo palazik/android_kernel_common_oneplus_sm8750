@@ -77,7 +77,7 @@ static int dmabuf_content_create_wrap(struct wrap_content *content,
 	if (fd < 0)
 		return fd;
 
-	file = anon_inode_getfile_secure("[wrapfd]", &wrap_fops, ctx,
+	file = anon_inode_create_getfile("[wrapfd]", &wrap_fops, ctx,
 					 dmabuf_content->writable ? O_RDWR : O_RDONLY, NULL);
 	if (IS_ERR(file)) {
 		put_unused_fd(fd);

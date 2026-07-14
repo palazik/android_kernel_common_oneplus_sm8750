@@ -44,7 +44,7 @@ struct stripe_c {
 	/* Work struct used for triggering events*/
 	struct work_struct trigger_event;
 
-	struct stripe stripe[];
+	struct stripe stripe[] __counted_by(stripes);
 };
 
 /*
@@ -269,7 +269,7 @@ static int stripe_map_range(struct stripe_c *sc, struct bio *bio,
 	return DM_MAPIO_SUBMITTED;
 }
 
-static int stripe_map(struct dm_target *ti, struct bio *bio)
+int stripe_map(struct dm_target *ti, struct bio *bio)
 {
 	struct stripe_c *sc = ti->private;
 	uint32_t stripe;
@@ -457,16 +457,22 @@ static void stripe_io_hints(struct dm_target *ti,
 			    struct queue_limits *limits)
 {
 	struct stripe_c *sc = ti->private;
-	unsigned int chunk_size = sc->chunk_size << SECTOR_SHIFT;
+	unsigned int io_min, io_opt;
 
-	blk_limits_io_min(limits, chunk_size);
-	blk_limits_io_opt(limits, chunk_size * sc->stripes);
+	limits->chunk_sectors = sc->chunk_size;
+
+	if (!check_shl_overflow(sc->chunk_size, SECTOR_SHIFT, &io_min) &&
+	    !check_mul_overflow(io_min, sc->stripes, &io_opt)) {
+		limits->io_min = io_min;
+		limits->io_opt = io_opt;
+	}
 }
 
 static struct target_type stripe_target = {
 	.name   = "striped",
 	.version = {1, 6, 0},
-	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_NOWAIT,
+	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_NOWAIT |
+		    DM_TARGET_PASSES_CRYPTO,
 	.module = THIS_MODULE,
 	.ctr    = stripe_ctr,
 	.dtr    = stripe_dtr,

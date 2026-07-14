@@ -75,10 +75,30 @@ config VFIO_NOIOMMU
 
 	  If you don't know what to do here, say N.
 
+config VFIO_PKVM_IOMMU
+	bool "VFIO pKVM IOMMU"
+	depends on ARM64
+	help
+	  This is needed if you plan to assign devices to pKVM protected virtual
+	  machines. PKVM_IOMMU, mostly does nothing as the hypervisor ensured DMA
+	  isolation and would provide a guest pvIOMMU interface if configured.
+
+	  If you don't know what to do here, say N.
+
 config VFIO_VIRQFD
 	bool
 	select EVENTFD
 	default n
+
+config VFIO_DEBUGFS
+	bool "Export VFIO internals in DebugFS"
+	depends on DEBUG_FS
+	help
+	  Allows exposure of VFIO device internals. This option enables
+	  the use of debugfs by VFIO drivers as required. The device can
+	  cause the VFIO code create a top-level debug/vfio directory
+	  during initialization, and then populate a subdirectory with
+	  entries as required.
 
 source "drivers/vfio/pci/Kconfig"
 source "drivers/vfio/platform/Kconfig"

@@ -11,7 +11,6 @@
 #include <linux/atomic.h>
 #include <linux/crypto.h>
 #include <linux/string.h>
-#include <linux/android_kabi.h>
 
 struct crypto_ahash;
 
@@ -25,26 +24,7 @@ struct crypto_ahash;
  */
 
 /*
- * struct crypto_istat_hash - statistics for has algorithm
- * @hash_cnt:		number of hash requests
- * @hash_tlen:		total data size hashed
- * @err_cnt:		number of error for hash requests
- */
-struct crypto_istat_hash {
-	atomic64_t hash_cnt;
-	atomic64_t hash_tlen;
-	atomic64_t err_cnt;
-};
-
-#ifdef CONFIG_CRYPTO_STATS
-#define HASH_ALG_COMMON_STAT struct crypto_istat_hash stat;
-#else
-#define HASH_ALG_COMMON_STAT
-#endif
-
-/*
  * struct hash_alg_common - define properties of message digest
- * @stat: Statistics for hash algorithm.
  * @digestsize: Size of the result of the transformation. A buffer of this size
  *	        must be available to the @final and @finup calls, so they can
  *	        store the resulting hash into it. For various predefined sizes,
@@ -61,8 +41,6 @@ struct crypto_istat_hash {
  *	  information.
  */
 #define HASH_ALG_COMMON {		\
-	HASH_ALG_COMMON_STAT		\
-					\
 	unsigned int digestsize;	\
 	unsigned int statesize;		\
 					\
@@ -154,6 +132,7 @@ struct ahash_request {
  *	      This is a counterpart to @init_tfm, used to remove
  *	      various changes set in @init_tfm.
  * @clone_tfm: Copy transform into new object, may allocate memory.
+ * @reqsize: Size of the request context.
  * @halg: see struct hash_alg_common
  */
 struct ahash_alg {
@@ -169,6 +148,8 @@ struct ahash_alg {
 	int (*init_tfm)(struct crypto_ahash *tfm);
 	void (*exit_tfm)(struct crypto_ahash *tfm);
 	int (*clone_tfm)(struct crypto_ahash *dst, struct crypto_ahash *src);
+
+	unsigned int reqsize;
 
 	struct hash_alg_common halg;
 };
@@ -224,13 +205,9 @@ struct shash_desc {
  *	      This is a counterpart to @init_tfm, used to remove
  *	      various changes set in @init_tfm.
  * @clone_tfm: Copy transform into new object, may allocate memory.
- * @digestsize: see struct ahash_alg
- * @statesize: see struct ahash_alg
  * @descsize: Size of the operational state for the message digest. This state
  * 	      size is the memory size that needs to be allocated for
  *	      shash_desc.__ctx
- * @stat: Statistics for hash algorithm.
- * @base: internally used
  * @mb_max_msgs: Maximum supported value of num_msgs argument to @finup_mb
  * @halg: see struct hash_alg_common
  * @HASH_ALG_COMMON: see struct hash_alg_common
@@ -248,18 +225,15 @@ struct shash_alg {
 	int (*import)(struct shash_desc *desc, const void *in);
 	int (*setkey)(struct crypto_shash *tfm, const u8 *key,
 		      unsigned int keylen);
+	int (*finup_mb)(struct shash_desc *desc, const u8 * const data[],
+			unsigned int len, u8 * const outs[],
+			unsigned int num_msgs);
 	int (*init_tfm)(struct crypto_shash *tfm);
 	void (*exit_tfm)(struct crypto_shash *tfm);
 	int (*clone_tfm)(struct crypto_shash *dst, struct crypto_shash *src);
 
 	unsigned int descsize;
-
-	ANDROID_BACKPORT_USE(1, int (*finup_mb)(struct shash_desc *desc,
-						const u8 * const data[],
-						unsigned int len,
-						u8 * const outs[],
-						unsigned int num_msgs));
-	ANDROID_BACKPORT_USE(2, unsigned int mb_max_msgs);
+	unsigned int mb_max_msgs;
 
 	union {
 		struct HASH_ALG_COMMON;
@@ -267,19 +241,9 @@ struct shash_alg {
 	};
 };
 #undef HASH_ALG_COMMON
-#undef HASH_ALG_COMMON_STAT
 
 struct crypto_ahash {
-	int (*init)(struct ahash_request *req);
-	int (*update)(struct ahash_request *req);
-	int (*final)(struct ahash_request *req);
-	int (*finup)(struct ahash_request *req);
-	int (*digest)(struct ahash_request *req);
-	int (*export)(struct ahash_request *req, void *out);
-	int (*import)(struct ahash_request *req, const void *in);
-	int (*setkey)(struct crypto_ahash *tfm, const u8 *key,
-		      unsigned int keylen);
-
+	bool using_shash; /* Underlying algorithm is shash, not ahash */
 	unsigned int statesize;
 	unsigned int reqsize;
 	struct crypto_tfm base;
@@ -360,12 +324,6 @@ static inline const char *crypto_ahash_alg_name(struct crypto_ahash *tfm)
 static inline const char *crypto_ahash_driver_name(struct crypto_ahash *tfm)
 {
 	return crypto_tfm_alg_driver_name(crypto_ahash_tfm(tfm));
-}
-
-static inline unsigned int crypto_ahash_alignmask(
-	struct crypto_ahash *tfm)
-{
-	return crypto_tfm_alg_alignmask(crypto_ahash_tfm(tfm));
 }
 
 /**
@@ -539,10 +497,7 @@ int crypto_ahash_digest(struct ahash_request *req);
  *
  * Return: 0 if the export was successful; < 0 if an error occurred
  */
-static inline int crypto_ahash_export(struct ahash_request *req, void *out)
-{
-	return crypto_ahash_reqtfm(req)->export(req, out);
-}
+int crypto_ahash_export(struct ahash_request *req, void *out);
 
 /**
  * crypto_ahash_import() - import message digest state
@@ -555,15 +510,7 @@ static inline int crypto_ahash_export(struct ahash_request *req, void *out)
  *
  * Return: 0 if the import was successful; < 0 if an error occurred
  */
-static inline int crypto_ahash_import(struct ahash_request *req, const void *in)
-{
-	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
-
-	if (crypto_ahash_get_flags(tfm) & CRYPTO_TFM_NEED_KEY)
-		return -ENOKEY;
-
-	return tfm->import(req, in);
-}
+int crypto_ahash_import(struct ahash_request *req, const void *in);
 
 /**
  * crypto_ahash_init() - (re)initialize message digest handle
@@ -576,36 +523,7 @@ static inline int crypto_ahash_import(struct ahash_request *req, const void *in)
  *
  * Return: see crypto_ahash_final()
  */
-static inline int crypto_ahash_init(struct ahash_request *req)
-{
-	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
-
-	if (crypto_ahash_get_flags(tfm) & CRYPTO_TFM_NEED_KEY)
-		return -ENOKEY;
-
-	return tfm->init(req);
-}
-
-static inline struct crypto_istat_hash *hash_get_stat(
-	struct hash_alg_common *alg)
-{
-#ifdef CONFIG_CRYPTO_STATS
-	return &alg->stat;
-#else
-	return NULL;
-#endif
-}
-
-static inline int crypto_hash_errstat(struct hash_alg_common *alg, int err)
-{
-	if (!IS_ENABLED(CONFIG_CRYPTO_STATS))
-		return err;
-
-	if (err && err != -EINPROGRESS && err != -EBUSY)
-		atomic64_inc(&hash_get_stat(alg)->err_cnt);
-
-	return err;
-}
+int crypto_ahash_init(struct ahash_request *req);
 
 /**
  * crypto_ahash_update() - add data to message digest for processing
@@ -618,16 +536,7 @@ static inline int crypto_hash_errstat(struct hash_alg_common *alg, int err)
  *
  * Return: see crypto_ahash_final()
  */
-static inline int crypto_ahash_update(struct ahash_request *req)
-{
-	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
-	struct hash_alg_common *alg = crypto_hash_alg_common(tfm);
-
-	if (IS_ENABLED(CONFIG_CRYPTO_STATS))
-		atomic64_add(req->nbytes, &hash_get_stat(alg)->hash_tlen);
-
-	return crypto_hash_errstat(alg, tfm->update(req));
-}
+int crypto_ahash_update(struct ahash_request *req);
 
 /**
  * DOC: Asynchronous Hash Request Handle
@@ -666,19 +575,20 @@ static inline void ahash_request_set_tfm(struct ahash_request *req,
  *
  * Return: allocated request handle in case of success, or NULL if out of memory
  */
-static inline struct ahash_request *ahash_request_alloc(
+static inline struct ahash_request *ahash_request_alloc_noprof(
 	struct crypto_ahash *tfm, gfp_t gfp)
 {
 	struct ahash_request *req;
 
-	req = kmalloc(sizeof(struct ahash_request) +
-		      crypto_ahash_reqsize(tfm), gfp);
+	req = kmalloc_noprof(sizeof(struct ahash_request) +
+			     crypto_ahash_reqsize(tfm), gfp);
 
 	if (likely(req))
 		ahash_request_set_tfm(req, tfm);
 
 	return req;
 }
+#define ahash_request_alloc(...)	alloc_hooks(ahash_request_alloc_noprof(__VA_ARGS__))
 
 /**
  * ahash_request_free() - zeroize and free the request data structure
@@ -816,12 +726,6 @@ static inline const char *crypto_shash_alg_name(struct crypto_shash *tfm)
 static inline const char *crypto_shash_driver_name(struct crypto_shash *tfm)
 {
 	return crypto_tfm_alg_driver_name(crypto_shash_tfm(tfm));
-}
-
-static inline unsigned int crypto_shash_alignmask(
-	struct crypto_shash *tfm)
-{
-	return crypto_tfm_alg_alignmask(crypto_shash_tfm(tfm));
 }
 
 /**
@@ -985,10 +889,7 @@ int crypto_shash_tfm_digest(struct crypto_shash *tfm, const u8 *data,
  * Context: Any context.
  * Return: 0 if the export creation was successful; < 0 if an error occurred
  */
-static inline int crypto_shash_export(struct shash_desc *desc, void *out)
-{
-	return crypto_shash_alg(desc->tfm)->export(desc, out);
-}
+int crypto_shash_export(struct shash_desc *desc, void *out);
 
 /**
  * crypto_shash_import() - import operational state
@@ -1002,15 +903,7 @@ static inline int crypto_shash_export(struct shash_desc *desc, void *out)
  * Context: Any context.
  * Return: 0 if the import was successful; < 0 if an error occurred
  */
-static inline int crypto_shash_import(struct shash_desc *desc, const void *in)
-{
-	struct crypto_shash *tfm = desc->tfm;
-
-	if (crypto_shash_get_flags(tfm) & CRYPTO_TFM_NEED_KEY)
-		return -ENOKEY;
-
-	return crypto_shash_alg(tfm)->import(desc, in);
-}
+int crypto_shash_import(struct shash_desc *desc, const void *in);
 
 /**
  * crypto_shash_init() - (re)initialize message digest

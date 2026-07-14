@@ -12,8 +12,8 @@ struct cgroup_taskset;
 struct cgroup_subsys;
 struct cgroup_subsys_state;
 DECLARE_HOOK(android_vh_cgroup_set_task,
-	TP_PROTO(int ret, struct task_struct *task),
-	TP_ARGS(ret, task));
+	TP_PROTO(int ret, struct cgroup *cgrp, struct task_struct *task, bool threadgroup),
+	TP_ARGS(ret, cgrp, task, threadgroup));
 
 DECLARE_RESTRICTED_HOOK(android_rvh_refrigerator,
 	TP_PROTO(bool f),

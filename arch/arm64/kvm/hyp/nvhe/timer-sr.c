@@ -86,7 +86,6 @@ int pkvm_timer_init(void)
 	return 0;
 }
 
-
 #define pkvm_time_us_to_ticks(us) ((u64)(us) * timer_freq / SEC_TO_US)
 
 void pkvm_udelay(unsigned long usecs)

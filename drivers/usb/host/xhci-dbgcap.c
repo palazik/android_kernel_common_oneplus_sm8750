@@ -6,13 +6,34 @@
  *
  * Author: Lu Baolu <baolu.lu@linux.intel.com>
  */
+#include <linux/bug.h>
+#include <linux/device.h>
 #include <linux/dma-mapping.h>
-#include <linux/slab.h>
+#include <linux/errno.h>
+#include <linux/kstrtox.h>
+#include <linux/list.h>
 #include <linux/nls.h>
+#include <linux/pm_runtime.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/sysfs.h>
+#include <linux/types.h>
+#include <linux/workqueue.h>
+
+#include <linux/io-64-nonatomic-lo-hi.h>
+
+#include <asm/byteorder.h>
 
 #include "xhci.h"
 #include "xhci-trace.h"
 #include "xhci-dbgcap.h"
+
+static const struct dbc_str dbc_str_default = {
+	.manufacturer = "Linux Foundation",
+	.product = "Linux USB Debug Target",
+	.serial = "0001",
+};
 
 static void dbc_free_ctx(struct device *dev, struct xhci_container_ctx *ctx)
 {
@@ -28,62 +49,13 @@ static void dbc_ring_free(struct device *dev, struct xhci_ring *ring)
 	if (!ring)
 		return;
 
-	if (ring->first_seg && ring->first_seg->trbs) {
+	if (ring->first_seg) {
 		dma_free_coherent(dev, TRB_SEGMENT_SIZE,
 				  ring->first_seg->trbs,
 				  ring->first_seg->dma);
 		kfree(ring->first_seg);
 	}
 	kfree(ring);
-}
-
-static u32 xhci_dbc_populate_strings(struct dbc_str_descs *strings)
-{
-	struct usb_string_descriptor	*s_desc;
-	u32				string_length;
-
-	/* Serial string: */
-	s_desc = (struct usb_string_descriptor *)strings->serial;
-	utf8s_to_utf16s(DBC_STRING_SERIAL, strlen(DBC_STRING_SERIAL),
-			UTF16_LITTLE_ENDIAN, (wchar_t *)s_desc->wData,
-			DBC_MAX_STRING_LENGTH);
-
-	s_desc->bLength		= (strlen(DBC_STRING_SERIAL) + 1) * 2;
-	s_desc->bDescriptorType	= USB_DT_STRING;
-	string_length		= s_desc->bLength;
-	string_length		<<= 8;
-
-	/* Product string: */
-	s_desc = (struct usb_string_descriptor *)strings->product;
-	utf8s_to_utf16s(DBC_STRING_PRODUCT, strlen(DBC_STRING_PRODUCT),
-			UTF16_LITTLE_ENDIAN, (wchar_t *)s_desc->wData,
-			DBC_MAX_STRING_LENGTH);
-
-	s_desc->bLength		= (strlen(DBC_STRING_PRODUCT) + 1) * 2;
-	s_desc->bDescriptorType	= USB_DT_STRING;
-	string_length		+= s_desc->bLength;
-	string_length		<<= 8;
-
-	/* Manufacture string: */
-	s_desc = (struct usb_string_descriptor *)strings->manufacturer;
-	utf8s_to_utf16s(DBC_STRING_MANUFACTURER,
-			strlen(DBC_STRING_MANUFACTURER),
-			UTF16_LITTLE_ENDIAN, (wchar_t *)s_desc->wData,
-			DBC_MAX_STRING_LENGTH);
-
-	s_desc->bLength		= (strlen(DBC_STRING_MANUFACTURER) + 1) * 2;
-	s_desc->bDescriptorType	= USB_DT_STRING;
-	string_length		+= s_desc->bLength;
-	string_length		<<= 8;
-
-	/* String0: */
-	strings->string0[0]	= 4;
-	strings->string0[1]	= USB_DT_STRING;
-	strings->string0[2]	= 0x09;
-	strings->string0[3]	= 0x04;
-	string_length		+= 4;
-
-	return string_length;
 }
 
 static void xhci_dbc_init_ep_contexts(struct xhci_dbc *dbc)
@@ -109,7 +81,65 @@ static void xhci_dbc_init_ep_contexts(struct xhci_dbc *dbc)
 	ep_ctx->deq             = cpu_to_le64(deq | dbc->ring_in->cycle_state);
 }
 
-static void xhci_dbc_init_contexts(struct xhci_dbc *dbc, u32 string_length)
+static u8 get_str_desc_len(const char *desc)
+{
+	return ((struct usb_string_descriptor *)desc)->bLength;
+}
+
+static u32 dbc_prepare_info_context_str_len(struct dbc_str_descs *descs)
+{
+	u32 len;
+
+	len = get_str_desc_len(descs->serial);
+	len <<= 8;
+	len += get_str_desc_len(descs->product);
+	len <<= 8;
+	len += get_str_desc_len(descs->manufacturer);
+	len <<= 8;
+	len += get_str_desc_len(descs->string0);
+
+	return len;
+}
+
+static int xhci_dbc_populate_str_desc(char *desc, const char *src)
+{
+	struct usb_string_descriptor	*s_desc;
+	int				len;
+
+	s_desc = (struct usb_string_descriptor *)desc;
+
+	/* len holds number of 2 byte UTF-16 characters */
+	len = utf8s_to_utf16s(src, strlen(src), UTF16_LITTLE_ENDIAN,
+			      (wchar_t *)s_desc->wData, USB_MAX_STRING_LEN * 2);
+	if (len < 0)
+		return len;
+
+	s_desc->bLength		= len * 2 + 2;
+	s_desc->bDescriptorType	= USB_DT_STRING;
+
+	return s_desc->bLength;
+}
+
+static void xhci_dbc_populate_str_descs(struct dbc_str_descs *str_descs,
+					struct dbc_str *str)
+{
+	/* Serial string: */
+	xhci_dbc_populate_str_desc(str_descs->serial, str->serial);
+
+	/* Product string: */
+	xhci_dbc_populate_str_desc(str_descs->product, str->product);
+
+	/* Manufacturer string: */
+	xhci_dbc_populate_str_desc(str_descs->manufacturer, str->manufacturer);
+
+	/* String0: */
+	str_descs->string0[0]	= 4;
+	str_descs->string0[1]	= USB_DT_STRING;
+	str_descs->string0[2]	= 0x09;
+	str_descs->string0[3]	= 0x04;
+}
+
+static void xhci_dbc_init_contexts(struct xhci_dbc *dbc)
 {
 	struct dbc_info_context	*info;
 	u32			dev_info;
@@ -120,12 +150,12 @@ static void xhci_dbc_init_contexts(struct xhci_dbc *dbc, u32 string_length)
 
 	/* Populate info Context: */
 	info			= (struct dbc_info_context *)dbc->ctx->bytes;
-	dma			= dbc->string_dma;
+	dma			= dbc->str_descs_dma;
 	info->string0		= cpu_to_le64(dma);
-	info->manufacturer	= cpu_to_le64(dma + DBC_MAX_STRING_LENGTH);
-	info->product		= cpu_to_le64(dma + DBC_MAX_STRING_LENGTH * 2);
-	info->serial		= cpu_to_le64(dma + DBC_MAX_STRING_LENGTH * 3);
-	info->length		= cpu_to_le32(string_length);
+	info->manufacturer	= cpu_to_le64(dma + USB_MAX_STRING_DESC_LEN);
+	info->product		= cpu_to_le64(dma + USB_MAX_STRING_DESC_LEN * 2);
+	info->serial		= cpu_to_le64(dma + USB_MAX_STRING_DESC_LEN * 3);
+	info->length		= cpu_to_le32(dbc_prepare_info_context_str_len(dbc->str_descs));
 
 	/* Populate bulk in and out endpoint contexts: */
 	xhci_dbc_init_ep_contexts(dbc);
@@ -385,13 +415,13 @@ static void xhci_dbc_eps_init(struct xhci_dbc *dbc)
 
 static void xhci_dbc_eps_exit(struct xhci_dbc *dbc)
 {
-	memset(dbc->eps, 0, sizeof(struct dbc_ep) * ARRAY_SIZE(dbc->eps));
+	memset(dbc->eps, 0, sizeof_field(struct xhci_dbc, eps));
 }
 
 static int dbc_erst_alloc(struct device *dev, struct xhci_ring *evt_ring,
 		    struct xhci_erst *erst, gfp_t flags)
 {
-	erst->entries = dma_alloc_coherent(dev, sizeof(struct xhci_erst_entry),
+	erst->entries = dma_alloc_coherent(dev, sizeof(*erst->entries),
 					   &erst->erst_dma_addr, flags);
 	if (!erst->entries)
 		return -ENOMEM;
@@ -405,9 +435,8 @@ static int dbc_erst_alloc(struct device *dev, struct xhci_ring *evt_ring,
 
 static void dbc_erst_free(struct device *dev, struct xhci_erst *erst)
 {
-	if (erst->entries)
-		dma_free_coherent(dev, sizeof(struct xhci_erst_entry),
-				  erst->entries, erst->erst_dma_addr);
+	dma_free_coherent(dev, sizeof(*erst->entries), erst->entries,
+			  erst->erst_dma_addr);
 	erst->entries = NULL;
 }
 
@@ -444,7 +473,7 @@ static void xhci_dbc_ring_init(struct xhci_ring *ring)
 		trb->link.segment_ptr = cpu_to_le64(ring->first_seg->dma);
 		trb->link.control = cpu_to_le32(LINK_TOGGLE | TRB_TYPE(TRB_LINK));
 	}
-	xhci_initialize_ring_info(ring, 1);
+	xhci_initialize_ring_info(ring);
 }
 
 static int xhci_dbc_reinit_ep_rings(struct xhci_dbc *dbc)
@@ -510,7 +539,6 @@ static int xhci_dbc_mem_init(struct xhci_dbc *dbc, gfp_t flags)
 {
 	int			ret;
 	dma_addr_t		deq;
-	u32			string_length;
 	struct device		*dev = dbc->dev;
 
 	/* Allocate various rings for events and transfers: */
@@ -537,30 +565,30 @@ static int xhci_dbc_mem_init(struct xhci_dbc *dbc, gfp_t flags)
 		goto ctx_fail;
 
 	/* Allocate the string table: */
-	dbc->string_size = sizeof(struct dbc_str_descs);
-	dbc->string = dma_alloc_coherent(dev, dbc->string_size,
-					 &dbc->string_dma, flags);
-	if (!dbc->string)
-		goto string_fail;
+	dbc->str_descs_size = sizeof(*dbc->str_descs);
+	dbc->str_descs = dma_alloc_coherent(dev, dbc->str_descs_size,
+					    &dbc->str_descs_dma, flags);
+	if (!dbc->str_descs)
+		goto str_descs_fail;
 
 	/* Setup ERST register: */
-	writel(dbc->erst.erst_size, &dbc->regs->ersts);
+	writel(dbc->erst.num_entries, &dbc->regs->ersts);
 
 	lo_hi_writeq(dbc->erst.erst_dma_addr, &dbc->regs->erstba);
 	deq = xhci_trb_virt_to_dma(dbc->ring_evt->deq_seg,
 				   dbc->ring_evt->dequeue);
 	lo_hi_writeq(deq, &dbc->regs->erdp);
 
-	/* Setup strings and contexts: */
-	string_length = xhci_dbc_populate_strings(dbc->string);
-	xhci_dbc_init_contexts(dbc, string_length);
+	/* Setup string descriptors and contexts: */
+	xhci_dbc_populate_str_descs(dbc->str_descs, &dbc->str);
+	xhci_dbc_init_contexts(dbc);
 
 	xhci_dbc_eps_init(dbc);
 	dbc->state = DS_INITIALIZED;
 
 	return 0;
 
-string_fail:
+str_descs_fail:
 	dbc_free_ctx(dev, dbc->ctx);
 	dbc->ctx = NULL;
 ctx_fail:
@@ -585,11 +613,8 @@ static void xhci_dbc_mem_cleanup(struct xhci_dbc *dbc)
 
 	xhci_dbc_eps_exit(dbc);
 
-	if (dbc->string) {
-		dma_free_coherent(dbc->dev, dbc->string_size,
-				  dbc->string, dbc->string_dma);
-		dbc->string = NULL;
-	}
+	dma_free_coherent(dbc->dev, dbc->str_descs_size, dbc->str_descs, dbc->str_descs_dma);
+	dbc->str_descs = NULL;
 
 	dbc_free_ctx(dbc->dev, dbc->ctx);
 	dbc->ctx = NULL;
@@ -639,7 +664,7 @@ static int xhci_do_dbc_start(struct xhci_dbc *dbc)
 static int xhci_do_dbc_stop(struct xhci_dbc *dbc)
 {
 	if (dbc->state == DS_DISABLED)
-		return -1;
+		return -EINVAL;
 
 	writel(0, &dbc->regs->control);
 	dbc->state = DS_DISABLED;
@@ -696,11 +721,11 @@ static void xhci_dbc_stop(struct xhci_dbc *dbc)
 	spin_lock_irqsave(&dbc->lock, flags);
 	ret = xhci_do_dbc_stop(dbc);
 	spin_unlock_irqrestore(&dbc->lock, flags);
+	if (ret)
+		return;
 
-	if (!ret) {
-		xhci_dbc_mem_cleanup(dbc);
-		pm_runtime_put_sync(dbc->dev); /* note, was self.controller */
-	}
+	xhci_dbc_mem_cleanup(dbc);
+	pm_runtime_put_sync(dbc->dev); /* note, was self.controller */
 }
 
 static void
@@ -1013,38 +1038,28 @@ static void xhci_dbc_handle_events(struct work_struct *work)
 			 msecs_to_jiffies(poll_interval));
 }
 
+static const char * const dbc_state_strings[DS_MAX] = {
+	[DS_DISABLED] = "disabled",
+	[DS_INITIALIZED] = "initialized",
+	[DS_ENABLED] = "enabled",
+	[DS_CONNECTED] = "connected",
+	[DS_CONFIGURED] = "configured",
+};
+
 static ssize_t dbc_show(struct device *dev,
 			struct device_attribute *attr,
 			char *buf)
 {
-	const char		*p;
 	struct xhci_dbc		*dbc;
 	struct xhci_hcd		*xhci;
 
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
 	dbc = xhci->dbc;
 
-	switch (dbc->state) {
-	case DS_DISABLED:
-		p = "disabled";
-		break;
-	case DS_INITIALIZED:
-		p = "initialized";
-		break;
-	case DS_ENABLED:
-		p = "enabled";
-		break;
-	case DS_CONNECTED:
-		p = "connected";
-		break;
-	case DS_CONFIGURED:
-		p = "configured";
-		break;
-	default:
-		p = "unknown";
-	}
+	if (dbc->state >= ARRAY_SIZE(dbc_state_strings))
+		return sysfs_emit(buf, "unknown\n");
 
-	return sprintf(buf, "%s\n", p);
+	return sysfs_emit(buf, "%s\n", dbc_state_strings[dbc->state]);
 }
 
 static ssize_t dbc_store(struct device *dev,
@@ -1057,9 +1072,9 @@ static ssize_t dbc_store(struct device *dev,
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
 	dbc = xhci->dbc;
 
-	if (!strncmp(buf, "enable", 6))
+	if (sysfs_streq(buf, "enable"))
 		xhci_dbc_start(dbc);
-	else if (!strncmp(buf, "disable", 7))
+	else if (sysfs_streq(buf, "disable"))
 		xhci_dbc_stop(dbc);
 	else
 		return -EINVAL;
@@ -1077,7 +1092,7 @@ static ssize_t dbc_idVendor_show(struct device *dev,
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
 	dbc = xhci->dbc;
 
-	return sprintf(buf, "%04x\n", dbc->idVendor);
+	return sysfs_emit(buf, "%04x\n", dbc->idVendor);
 }
 
 static ssize_t dbc_idVendor_store(struct device *dev,
@@ -1089,9 +1104,11 @@ static ssize_t dbc_idVendor_store(struct device *dev,
 	void __iomem		*ptr;
 	u16			value;
 	u32			dev_info;
+	int ret;
 
-	if (kstrtou16(buf, 0, &value))
-		return -EINVAL;
+	ret = kstrtou16(buf, 0, &value);
+	if (ret)
+		return ret;
 
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
 	dbc = xhci->dbc;
@@ -1117,7 +1134,7 @@ static ssize_t dbc_idProduct_show(struct device *dev,
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
 	dbc = xhci->dbc;
 
-	return sprintf(buf, "%04x\n", dbc->idProduct);
+	return sysfs_emit(buf, "%04x\n", dbc->idProduct);
 }
 
 static ssize_t dbc_idProduct_store(struct device *dev,
@@ -1129,9 +1146,11 @@ static ssize_t dbc_idProduct_store(struct device *dev,
 	void __iomem		*ptr;
 	u32			dev_info;
 	u16			value;
+	int ret;
 
-	if (kstrtou16(buf, 0, &value))
-		return -EINVAL;
+	ret = kstrtou16(buf, 0, &value);
+	if (ret)
+		return ret;
 
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
 	dbc = xhci->dbc;
@@ -1156,7 +1175,7 @@ static ssize_t dbc_bcdDevice_show(struct device *dev,
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
 	dbc = xhci->dbc;
 
-	return sprintf(buf, "%04x\n", dbc->bcdDevice);
+	return sysfs_emit(buf, "%04x\n", dbc->bcdDevice);
 }
 
 static ssize_t dbc_bcdDevice_store(struct device *dev,
@@ -1168,9 +1187,11 @@ static ssize_t dbc_bcdDevice_store(struct device *dev,
 	void __iomem *ptr;
 	u32 dev_info;
 	u16 value;
+	int ret;
 
-	if (kstrtou16(buf, 0, &value))
-		return -EINVAL;
+	ret = kstrtou16(buf, 0, &value);
+	if (ret)
+		return ret;
 
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
 	dbc = xhci->dbc;
@@ -1186,6 +1207,108 @@ static ssize_t dbc_bcdDevice_store(struct device *dev,
 	return size;
 }
 
+static ssize_t dbc_manufacturer_show(struct device *dev,
+				      struct device_attribute *attr,
+				      char *buf)
+{
+	struct xhci_hcd	*xhci = hcd_to_xhci(dev_get_drvdata(dev));
+	struct xhci_dbc	*dbc = xhci->dbc;
+
+	return sysfs_emit(buf, "%s\n", dbc->str.manufacturer);
+}
+
+static ssize_t dbc_manufacturer_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t size)
+{
+	struct xhci_hcd	*xhci = hcd_to_xhci(dev_get_drvdata(dev));
+	struct xhci_dbc	*dbc = xhci->dbc;
+	size_t len;
+
+	if (dbc->state != DS_DISABLED)
+		return -EBUSY;
+
+	len = strcspn(buf, "\n");
+	if (!len)
+		return -EINVAL;
+
+	if (len > USB_MAX_STRING_LEN)
+		return -E2BIG;
+
+	memcpy(dbc->str.manufacturer, buf, len);
+	dbc->str.manufacturer[len] = '\0';
+
+	return size;
+}
+
+static ssize_t dbc_product_show(struct device *dev,
+				 struct device_attribute *attr,
+				 char *buf)
+{
+	struct xhci_hcd	*xhci = hcd_to_xhci(dev_get_drvdata(dev));
+	struct xhci_dbc	*dbc = xhci->dbc;
+
+	return sysfs_emit(buf, "%s\n", dbc->str.product);
+}
+
+static ssize_t dbc_product_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t size)
+{
+	struct xhci_hcd	*xhci = hcd_to_xhci(dev_get_drvdata(dev));
+	struct xhci_dbc	*dbc = xhci->dbc;
+	size_t len;
+
+	if (dbc->state != DS_DISABLED)
+		return -EBUSY;
+
+	len = strcspn(buf, "\n");
+	if (!len)
+		return -EINVAL;
+
+	if (len > USB_MAX_STRING_LEN)
+		return -E2BIG;
+
+	memcpy(dbc->str.product, buf, len);
+	dbc->str.product[len] = '\0';
+
+	return size;
+}
+
+static ssize_t dbc_serial_show(struct device *dev,
+			    struct device_attribute *attr,
+			    char *buf)
+{
+	struct xhci_hcd	*xhci = hcd_to_xhci(dev_get_drvdata(dev));
+	struct xhci_dbc	*dbc = xhci->dbc;
+
+	return sysfs_emit(buf, "%s\n", dbc->str.serial);
+}
+
+static ssize_t dbc_serial_store(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t size)
+{
+	struct xhci_hcd	*xhci = hcd_to_xhci(dev_get_drvdata(dev));
+	struct xhci_dbc	*dbc = xhci->dbc;
+	size_t len;
+
+	if (dbc->state != DS_DISABLED)
+		return -EBUSY;
+
+	len = strcspn(buf, "\n");
+	if (!len)
+		return -EINVAL;
+
+	if (len > USB_MAX_STRING_LEN)
+		return -E2BIG;
+
+	memcpy(dbc->str.serial, buf, len);
+	dbc->str.serial[len] = '\0';
+
+	return size;
+}
+
 static ssize_t dbc_bInterfaceProtocol_show(struct device *dev,
 				 struct device_attribute *attr,
 				 char *buf)
@@ -1196,7 +1319,7 @@ static ssize_t dbc_bInterfaceProtocol_show(struct device *dev,
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
 	dbc = xhci->dbc;
 
-	return sprintf(buf, "%02x\n", dbc->bInterfaceProtocol);
+	return sysfs_emit(buf, "%02x\n", dbc->bInterfaceProtocol);
 }
 
 static ssize_t dbc_bInterfaceProtocol_store(struct device *dev,
@@ -1210,9 +1333,13 @@ static ssize_t dbc_bInterfaceProtocol_store(struct device *dev,
 	u8 value;
 	int ret;
 
-	/* bInterfaceProtocol is 8 bit, but xhci only supports values 0 and 1 */
+	/* bInterfaceProtocol is 8 bit, but... */
 	ret = kstrtou8(buf, 0, &value);
-	if (ret || value > 1)
+	if (ret)
+		return ret;
+
+	/* ...xhci only supports values 0 and 1 */
+	if (value > 1)
 		return -EINVAL;
 
 	xhci = hcd_to_xhci(dev_get_drvdata(dev));
@@ -1269,22 +1396,25 @@ static DEVICE_ATTR_RW(dbc);
 static DEVICE_ATTR_RW(dbc_idVendor);
 static DEVICE_ATTR_RW(dbc_idProduct);
 static DEVICE_ATTR_RW(dbc_bcdDevice);
+static DEVICE_ATTR_RW(dbc_serial);
+static DEVICE_ATTR_RW(dbc_product);
+static DEVICE_ATTR_RW(dbc_manufacturer);
 static DEVICE_ATTR_RW(dbc_bInterfaceProtocol);
 static DEVICE_ATTR_RW(dbc_poll_interval_ms);
 
-static struct attribute *dbc_dev_attributes[] = {
+static struct attribute *dbc_dev_attrs[] = {
 	&dev_attr_dbc.attr,
 	&dev_attr_dbc_idVendor.attr,
 	&dev_attr_dbc_idProduct.attr,
 	&dev_attr_dbc_bcdDevice.attr,
+	&dev_attr_dbc_serial.attr,
+	&dev_attr_dbc_product.attr,
+	&dev_attr_dbc_manufacturer.attr,
 	&dev_attr_dbc_bInterfaceProtocol.attr,
 	&dev_attr_dbc_poll_interval_ms.attr,
 	NULL
 };
-
-static const struct attribute_group dbc_dev_attrib_grp = {
-	.attrs = dbc_dev_attributes,
-};
+ATTRIBUTE_GROUPS(dbc_dev);
 
 struct xhci_dbc *
 xhci_alloc_dbc(struct device *dev, void __iomem *base, const struct dbc_driver *driver)
@@ -1305,13 +1435,16 @@ xhci_alloc_dbc(struct device *dev, void __iomem *base, const struct dbc_driver *
 	dbc->bInterfaceProtocol = DBC_PROTOCOL;
 	dbc->poll_interval = DBC_POLL_INTERVAL_DEFAULT;
 
+	/* initialize serial, product and manufacturer with default values */
+	dbc->str = dbc_str_default;
+
 	if (readl(&dbc->regs->control) & DBC_CTRL_DBC_ENABLE)
 		goto err;
 
 	INIT_DELAYED_WORK(&dbc->event_work, xhci_dbc_handle_events);
 	spin_lock_init(&dbc->lock);
 
-	ret = sysfs_create_group(&dev->kobj, &dbc_dev_attrib_grp);
+	ret = sysfs_create_groups(&dev->kobj, dbc_dev_groups);
 	if (ret)
 		goto err;
 
@@ -1330,7 +1463,7 @@ void xhci_dbc_remove(struct xhci_dbc *dbc)
 	xhci_dbc_stop(dbc);
 
 	/* remove sysfs files */
-	sysfs_remove_group(&dbc->dev->kobj, &dbc_dev_attrib_grp);
+	sysfs_remove_groups(&dbc->dev->kobj, dbc_dev_groups);
 
 	kfree(dbc);
 }

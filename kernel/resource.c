@@ -27,6 +27,8 @@
 #include <linux/mount.h>
 #include <linux/resource_ext.h>
 #include <uapi/linux/magic.h>
+#include <linux/string.h>
+#include <linux/vmalloc.h>
 #include <asm/io.h>
 
 
@@ -46,36 +48,19 @@ struct resource iomem_resource = {
 };
 EXPORT_SYMBOL(iomem_resource);
 
-/* constraints to be met while allocating resources */
-struct resource_constraint {
-	resource_size_t min, max, align;
-	resource_size_t (*alignf)(void *, const struct resource *,
-			resource_size_t, resource_size_t);
-	void *alignf_data;
-};
-
 static DEFINE_RWLOCK(resource_lock);
 
-static struct resource *next_resource(struct resource *p)
+static struct resource *next_resource(struct resource *p, bool skip_children)
 {
-	if (p->child)
+	if (!skip_children && p->child)
 		return p->child;
 	while (!p->sibling && p->parent)
 		p = p->parent;
 	return p->sibling;
 }
 
-static struct resource *next_resource_skip_children(struct resource *p)
-{
-	while (!p->sibling && p->parent)
-		p = p->parent;
-	return p->sibling;
-}
-
 #define for_each_resource(_root, _p, _skip_children) \
-	for ((_p) = (_root)->child; (_p); \
-	     (_p) = (_skip_children) ? next_resource_skip_children(_p) : \
-				       next_resource(_p))
+	for ((_p) = (_root)->child; (_p); (_p) = next_resource(_p, _skip_children))
 
 #ifdef CONFIG_PROC_FS
 
@@ -100,8 +85,10 @@ static void *r_start(struct seq_file *m, loff_t *pos)
 static void *r_next(struct seq_file *m, void *v, loff_t *pos)
 {
 	struct resource *p = v;
+
 	(*pos)++;
-	return (void *)next_resource(p);
+
+	return (void *)next_resource(p, false);
 }
 
 static void r_stop(struct seq_file *m, void *v)
@@ -446,6 +433,58 @@ int walk_system_ram_res(u64 start, u64 end, void *arg,
 }
 
 /*
+ * This function, being a variant of walk_system_ram_res(), calls the @func
+ * callback against all memory ranges of type System RAM which are marked as
+ * IORESOURCE_SYSTEM_RAM and IORESOUCE_BUSY in reversed order, i.e., from
+ * higher to lower.
+ */
+int walk_system_ram_res_rev(u64 start, u64 end, void *arg,
+				int (*func)(struct resource *, void *))
+{
+	struct resource res, *rams;
+	int rams_size = 16, i;
+	unsigned long flags;
+	int ret = -1;
+
+	/* create a list */
+	rams = kvcalloc(rams_size, sizeof(struct resource), GFP_KERNEL);
+	if (!rams)
+		return ret;
+
+	flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
+	i = 0;
+	while ((start < end) &&
+		(!find_next_iomem_res(start, end, flags, IORES_DESC_NONE, &res))) {
+		if (i >= rams_size) {
+			/* re-alloc */
+			struct resource *rams_new;
+
+			rams_new = kvrealloc(rams, (rams_size + 16) * sizeof(struct resource),
+					     GFP_KERNEL);
+			if (!rams_new)
+				goto out;
+
+			rams = rams_new;
+			rams_size += 16;
+		}
+
+		rams[i++] = res;
+		start = res.end + 1;
+	}
+
+	/* go reverse */
+	for (i--; i >= 0; i--) {
+		ret = (*func)(&rams[i], arg);
+		if (ret)
+			break;
+	}
+
+out:
+	kvfree(rams);
+	return ret;
+}
+
+/*
  * This function calls the @func callback against all memory ranges, which
  * are ranges marked as IORESOURCE_MEM and IORESOUCE_BUSY.
  */
@@ -604,14 +643,6 @@ void __weak arch_remove_reservations(struct resource *avail)
 {
 }
 
-static resource_size_t simple_align_resource(void *data,
-					     const struct resource *avail,
-					     resource_size_t size,
-					     resource_size_t align)
-{
-	return avail->start;
-}
-
 static void resource_clip(struct resource *res, resource_size_t min,
 			  resource_size_t max)
 {
@@ -622,16 +653,16 @@ static void resource_clip(struct resource *res, resource_size_t min,
 }
 
 /*
- * Find empty slot in the resource tree with the given range and
+ * Find empty space in the resource tree with the given range and
  * alignment constraints
  */
-static int __find_resource(struct resource *root, struct resource *old,
-			 struct resource *new,
-			 resource_size_t  size,
-			 struct resource_constraint *constraint)
+static int __find_resource_space(struct resource *root, struct resource *old,
+				 struct resource *new, resource_size_t size,
+				 struct resource_constraint *constraint)
 {
 	struct resource *this = root->child;
 	struct resource tmp = *new, avail, alloc;
+	resource_alignf alignf = constraint->alignf;
 
 	tmp.start = root->start;
 	/*
@@ -660,8 +691,12 @@ static int __find_resource(struct resource *root, struct resource *old,
 		avail.flags = new->flags & ~IORESOURCE_UNSET;
 		if (avail.start >= tmp.start) {
 			alloc.flags = avail.flags;
-			alloc.start = constraint->alignf(constraint->alignf_data, &avail,
-					size, constraint->align);
+			if (alignf) {
+				alloc.start = alignf(constraint->alignf_data,
+						     &avail, size, constraint->align);
+			} else {
+				alloc.start = avail.start;
+			}
 			alloc.end = alloc.start + size - 1;
 			if (alloc.start <= alloc.end &&
 			    resource_contains(&avail, &alloc)) {
@@ -681,15 +716,27 @@ next:		if (!this || this->end == root->end)
 	return -EBUSY;
 }
 
-/*
- * Find empty slot in the resource tree given range and alignment.
+/**
+ * find_resource_space - Find empty space in the resource tree
+ * @root:	Root resource descriptor
+ * @new:	Resource descriptor awaiting an empty resource space
+ * @size:	The minimum size of the empty space
+ * @constraint:	The range and alignment constraints to be met
+ *
+ * Finds an empty space under @root in the resource tree satisfying range and
+ * alignment @constraints.
+ *
+ * Return:
+ * * %0		- if successful, @new members start, end, and flags are altered.
+ * * %-EBUSY	- if no empty space was found.
  */
-static int find_resource(struct resource *root, struct resource *new,
+int find_resource_space(struct resource *root, struct resource *new,
 			resource_size_t size,
-			struct resource_constraint  *constraint)
+			struct resource_constraint *constraint)
 {
-	return  __find_resource(root, NULL, new, size, constraint);
+	return  __find_resource_space(root, NULL, new, size, constraint);
 }
+EXPORT_SYMBOL_GPL(find_resource_space);
 
 /**
  * reallocate_resource - allocate a slot in the resource tree given range & alignment.
@@ -711,7 +758,7 @@ static int reallocate_resource(struct resource *root, struct resource *old,
 
 	write_lock(&resource_lock);
 
-	if ((err = __find_resource(root, old, &new, newsize, constraint)))
+	if ((err = __find_resource_space(root, old, &new, newsize, constraint)))
 		goto out;
 
 	if (resource_contains(&new, old)) {
@@ -755,17 +802,11 @@ out:
 int allocate_resource(struct resource *root, struct resource *new,
 		      resource_size_t size, resource_size_t min,
 		      resource_size_t max, resource_size_t align,
-		      resource_size_t (*alignf)(void *,
-						const struct resource *,
-						resource_size_t,
-						resource_size_t),
+		      resource_alignf alignf,
 		      void *alignf_data)
 {
 	int err;
 	struct resource_constraint constraint;
-
-	if (!alignf)
-		alignf = simple_align_resource;
 
 	constraint.min = min;
 	constraint.max = max;
@@ -780,7 +821,7 @@ int allocate_resource(struct resource *root, struct resource *new,
 	}
 
 	write_lock(&resource_lock);
-	err = find_resource(root, new, size, &constraint);
+	err = find_resource_space(root, new, size, &constraint);
 	if (err >= 0 && __request_resource(root, new))
 		err = -EBUSY;
 	write_unlock(&resource_lock);
@@ -1819,7 +1860,11 @@ EXPORT_SYMBOL(resource_list_free);
 #ifdef CONFIG_GET_FREE_REGION
 #define GFR_DESCENDING		(1UL << 0)
 #define GFR_REQUEST_REGION	(1UL << 1)
-#define GFR_DEFAULT_ALIGN (1UL << PA_SECTION_SHIFT)
+#ifdef PA_SECTION_SHIFT
+#define GFR_DEFAULT_ALIGN	(1UL << PA_SECTION_SHIFT)
+#else
+#define GFR_DEFAULT_ALIGN	PAGE_SIZE
+#endif
 
 static resource_size_t gfr_start(struct resource *base, resource_size_t size,
 				 resource_size_t align, unsigned long flags)
@@ -1831,7 +1876,7 @@ static resource_size_t gfr_start(struct resource *base, resource_size_t size,
 		return end - size + 1;
 	}
 
-	return ALIGN(base->start, align);
+	return ALIGN(max(base->start, align), align);
 }
 
 static bool gfr_continue(struct resource *base, resource_size_t addr,
@@ -2005,7 +2050,7 @@ struct resource *alloc_free_mem_region(struct resource *base,
 	return get_free_mem_region(NULL, base, size, align, name,
 				   IORES_DESC_NONE, flags);
 }
-EXPORT_SYMBOL_NS_GPL(alloc_free_mem_region, CXL);
+EXPORT_SYMBOL_GPL(alloc_free_mem_region);
 #endif /* CONFIG_GET_FREE_REGION */
 
 static int __init strict_iomem(char *str)

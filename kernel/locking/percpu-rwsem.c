@@ -10,6 +10,7 @@
 #include <linux/sched/debug.h>
 #include <linux/errno.h>
 #include <trace/events/lock.h>
+
 #include <trace/hooks/dtask.h>
 
 /*
@@ -246,11 +247,11 @@ static bool readers_active_check(struct percpu_rw_semaphore *sem)
 
 void __sched percpu_down_write(struct percpu_rw_semaphore *sem)
 {
+	bool contended = false;
 	bool complete = false;
 
 	might_sleep();
 	rwsem_acquire(&sem->dep_map, 0, 0, _RET_IP_);
-	trace_contention_begin(sem, LCB_F_PERCPU | LCB_F_WRITE);
 
 	/* Notify readers to take the slow path. */
 	rcu_sync_enter(&sem->rss);
@@ -259,8 +260,11 @@ void __sched percpu_down_write(struct percpu_rw_semaphore *sem)
 	 * Try set sem->block; this provides writer-writer exclusion.
 	 * Having sem->block set makes new readers block.
 	 */
-	if (!__percpu_down_write_trylock(sem))
+	if (!__percpu_down_write_trylock(sem)) {
+		trace_contention_begin(sem, LCB_F_PERCPU | LCB_F_WRITE);
 		percpu_rwsem_wait(sem, /* .reader = */ false);
+		contended = true;
+	}
 
 	/* smp_mb() implied by __percpu_down_write_trylock() on success -- D matches A */
 
@@ -274,7 +278,8 @@ void __sched percpu_down_write(struct percpu_rw_semaphore *sem)
 	trace_android_rvh_percpu_rwsem_wait_complete(sem, TASK_UNINTERRUPTIBLE, &complete);
 	if (!complete)
 		rcuwait_wait_event(&sem->writer, readers_active_check(sem), TASK_UNINTERRUPTIBLE);
-	trace_contention_end(sem, 0);
+	if (contended)
+		trace_contention_end(sem, 0);
 	trace_android_vh_record_pcpu_rwsem_starttime(sem, jiffies);
 }
 EXPORT_SYMBOL_GPL(percpu_down_write);

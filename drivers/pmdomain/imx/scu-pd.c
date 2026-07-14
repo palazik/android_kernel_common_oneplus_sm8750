@@ -326,7 +326,6 @@ static void imx_sc_pd_get_console_rsrc(void)
 		return;
 
 	imx_con_rsrc = specs.args[0];
-	of_node_put(specs.np);
 }
 
 static int imx_sc_get_pd_power(struct device *dev, u32 rsrc)
@@ -389,7 +388,7 @@ static int imx_sc_pd_power_off(struct generic_pm_domain *domain)
 	return imx_sc_pd_power(domain, false);
 }
 
-static struct generic_pm_domain *imx_scu_pd_xlate(struct of_phandle_args *spec,
+static struct generic_pm_domain *imx_scu_pd_xlate(const struct of_phandle_args *spec,
 						  void *data)
 {
 	struct generic_pm_domain *domain = ERR_PTR(-ENOENT);

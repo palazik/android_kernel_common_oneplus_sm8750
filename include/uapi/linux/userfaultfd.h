@@ -41,6 +41,7 @@
 			   UFFD_FEATURE_WP_HUGETLBFS_SHMEM |	\
 			   UFFD_FEATURE_WP_UNPOPULATED |	\
 			   UFFD_FEATURE_POISON |		\
+			   UFFD_FEATURE_WP_ASYNC |		\
 			   UFFD_FEATURE_MOVE)
 #define UFFD_API_IOCTLS				\
 	((__u64)1 << _UFFDIO_REGISTER |		\
@@ -222,6 +223,11 @@ struct uffdio_api {
 	 * & hugetlbfs, so this flag only affects anonymous memory behavior
 	 * when userfault write-protection mode is registered.
 	 *
+	 * UFFD_FEATURE_WP_ASYNC indicates that userfaultfd write-protection
+	 * asynchronous mode is supported in which the write fault is
+	 * automatically resolved and write-protection is un-set.
+	 * It implies UFFD_FEATURE_WP_UNPOPULATED.
+	 *
 	 * UFFD_FEATURE_MOVE indicates that the kernel supports moving an
 	 * existing page contents from userspace.
 	 */
@@ -240,6 +246,7 @@ struct uffdio_api {
 #define UFFD_FEATURE_WP_HUGETLBFS_SHMEM		(1<<12)
 #define UFFD_FEATURE_WP_UNPOPULATED		(1<<13)
 #define UFFD_FEATURE_POISON			(1<<14)
+#define UFFD_FEATURE_WP_ASYNC			(1<<15)
 #define UFFD_FEATURE_MOVE			(1<<16)
 	__u64 features;
 
@@ -359,15 +366,6 @@ struct uffdio_move {
 	 */
 #define UFFDIO_MOVE_MODE_DONTWAKE		((__u64)1<<0)
 #define UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES	((__u64)1<<1)
-	/*
-	 * To confirm if the ioctl has fixes to avoid panic when src folio is
-	 * in swap-cache. Also, to avoid livelock when multiple threads try
-	 * to move same src folio. It's a KMI workaround and cannot be relied
-	 * upon by userspace.
-	 *
-	 * 61: confirm if anon_vma lock has been removed from MOVE ioctl.
-	 */
-#define UFFDIO_MOVE_MODE_CONFIRM_FIXED		((__u64)1<<61)
 	__u64 mode;
 	/*
 	 * "move" is written by the ioctl and must be at the end: the

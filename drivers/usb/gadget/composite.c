@@ -20,7 +20,7 @@
 #include <linux/usb/android_accessory.h>
 #include <linux/usb/otg.h>
 #include <linux/usb/webusb.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include "u_os_desc.h"
 #include "android_configfs_uevent.h"
@@ -1795,14 +1795,14 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
 	android_set_connected(&cdev->android_opts);
 
 	if (w_length > USB_COMP_EP0_BUFSIZ) {
-		if (ctrl->bRequestType == USB_DIR_OUT) {
-			goto done;
-		} else {
+		if (ctrl->bRequestType & USB_DIR_IN) {
 			/* Cast away the const, we are going to overwrite on purpose. */
 			__le16 *temp = (__le16 *)&ctrl->wLength;
 
 			*temp = cpu_to_le16(USB_COMP_EP0_BUFSIZ);
 			w_length = USB_COMP_EP0_BUFSIZ;
+		} else {
+			goto done;
 		}
 	}
 
@@ -2852,5 +2852,6 @@ void usb_composite_overwrite_options(struct usb_composite_dev *cdev,
 }
 EXPORT_SYMBOL_GPL(usb_composite_overwrite_options);
 
+MODULE_DESCRIPTION("infrastructure for Composite USB Gadgets");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("David Brownell");

@@ -48,6 +48,7 @@
 #include <linux/audit.h>
 #include <linux/vmalloc.h>
 #include <linux/lsm_hooks.h>
+#include <linux/parser.h>
 #include <net/netlabel.h>
 
 #include "flask.h"
@@ -635,8 +636,7 @@ static void context_struct_compute_av(struct policydb *policydb,
 	}
 
 	if (unlikely(!tclass || tclass > policydb->p_classes.nprim)) {
-		if (printk_ratelimit())
-			pr_warn("SELinux:  Invalid class %hu\n", tclass);
+		pr_warn_ratelimited("SELinux:  Invalid class %u\n", tclass);
 		return;
 	}
 
@@ -1328,8 +1328,19 @@ static int security_sid_to_context_core(u32 sid, char **scontext,
 	if (!selinux_initialized()) {
 		if (sid <= SECINITSID_NUM) {
 			char *scontextp;
-			const char *s = initial_sid_to_string[sid];
+			const char *s;
 
+			/*
+			 * Before the policy is loaded, translate
+			 * SECINITSID_INIT to "kernel", because systemd and
+			 * libselinux < 2.6 take a getcon_raw() result that is
+			 * both non-null and not "kernel" to mean that a policy
+			 * is already loaded.
+			 */
+			if (sid == SECINITSID_INIT)
+				sid = SECINITSID_KERNEL;
+
+			s = initial_sid_to_string[sid];
 			if (!s)
 				return -EINVAL;
 			*scontext_len = strlen(s) + 1;
@@ -1800,22 +1811,9 @@ retry:
 			newcontext.role = OBJECT_R_VAL;
 	}
 
-	/* Set the type to default values. */
-	if (cladatum && cladatum->default_type == DEFAULT_SOURCE) {
-		newcontext.type = scontext->type;
-	} else if (cladatum && cladatum->default_type == DEFAULT_TARGET) {
-		newcontext.type = tcontext->type;
-	} else {
-		if ((tclass == policydb->process_class) || sock) {
-			/* Use the type of process. */
-			newcontext.type = scontext->type;
-		} else {
-			/* Use the type of the related object. */
-			newcontext.type = tcontext->type;
-		}
-	}
-
-	/* Look for a type transition/member/change rule. */
+	/* Set the type.
+	 * Look for a type transition/member/change rule.
+	 */
 	avkey.source_type = scontext->type;
 	avkey.target_type = tcontext->type;
 	avkey.target_class = tclass;
@@ -1833,9 +1831,24 @@ retry:
 		}
 	}
 
+	/* If a permanent rule is found, use the type from
+	 * the type transition/member/change rule. Otherwise,
+	 * set the type to its default values.
+	 */
 	if (avnode) {
-		/* Use the type from the type transition/member/change rule. */
 		newcontext.type = avnode->datum.u.data;
+	} else if (cladatum && cladatum->default_type == DEFAULT_SOURCE) {
+		newcontext.type = scontext->type;
+	} else if (cladatum && cladatum->default_type == DEFAULT_TARGET) {
+		newcontext.type = tcontext->type;
+	} else {
+		if ((tclass == policydb->process_class) || sock) {
+			/* Use the type of process. */
+			newcontext.type = scontext->type;
+		} else {
+			/* Use the type of the related object. */
+			newcontext.type = tcontext->type;
+		}
 	}
 
 	/* if we have a objname this is a file trans check so check those rules */
@@ -1874,11 +1887,17 @@ retry:
 			goto out_unlock;
 	}
 	/* Obtain the sid for the context. */
-	rc = sidtab_context_to_sid(sidtab, &newcontext, out_sid);
-	if (rc == -ESTALE) {
-		rcu_read_unlock();
-		context_destroy(&newcontext);
-		goto retry;
+	if (context_cmp(scontext, &newcontext))
+		*out_sid = ssid;
+	else if (context_cmp(tcontext, &newcontext))
+		*out_sid = tsid;
+	else {
+		rc = sidtab_context_to_sid(sidtab, &newcontext, out_sid);
+		if (rc == -ESTALE) {
+			rcu_read_unlock();
+			context_destroy(&newcontext);
+			goto retry;
+		}
 	}
 out_unlock:
 	rcu_read_unlock();
@@ -2118,13 +2137,31 @@ static void security_load_policycaps(struct selinux_policy *policy)
 		WRITE_ONCE(selinux_state.policycap[i],
 			ebitmap_get_bit(&p->policycaps, i));
 
+	WRITE_ONCE(selinux_memfd_class_policycap, ebitmap_get_bit(&p->policycaps,
+								  POLICYDB_CAP_MEMFD_CLASS));
+
+	WRITE_ONCE(selinux_seclabel_wildcard_policycap,
+		   ebitmap_get_bit(&p->policycaps,
+				   POLICYDB_CAP_GENFS_SECLABEL_WILDCARD));
+
 	for (i = 0; i < ARRAY_SIZE(selinux_policycap_names); i++)
 		pr_info("SELinux:  policy capability %s=%d\n",
 			selinux_policycap_names[i],
 			ebitmap_get_bit(&p->policycaps, i));
 
+	pr_info("SELinux: policy capability %s=%d\n",
+		POLICYDB_CAP_MEMFD_CLASS_NAME,
+		ebitmap_get_bit(&p->policycaps, POLICYDB_CAP_MEMFD_CLASS));
+
+	pr_info("SELinux: policy capability %s=%d\n",
+		POLICYDB_CAP_GENFS_SECLABEL_WILDCARD_NAME,
+		ebitmap_get_bit(&p->policycaps,
+				POLICYDB_CAP_GENFS_SECLABEL_WILDCARD));
+
 	ebitmap_for_each_positive_bit(&p->policycaps, node, i) {
-		if (i >= ARRAY_SIZE(selinux_policycap_names))
+		if (i >= ARRAY_SIZE(selinux_policycap_names) &&
+		    i != POLICYDB_CAP_MEMFD_CLASS &&
+		    i != POLICYDB_CAP_GENFS_SECLABEL_WILDCARD)
 			pr_info("SELinux:  unknown policy capability %u\n",
 				i);
 	}
@@ -2836,6 +2873,7 @@ static inline int __security_genfs_sid(struct selinux_policy *policy,
 	struct genfs *genfs;
 	struct ocontext *c;
 	int cmp = 0;
+	bool wildcard;
 
 	while (path[0] == '/' && path[1] == '/')
 		path++;
@@ -2852,11 +2890,20 @@ static inline int __security_genfs_sid(struct selinux_policy *policy,
 	if (!genfs || cmp)
 		return -ENOENT;
 
+	wildcard = ebitmap_get_bit(&policy->policydb.policycaps,
+				   POLICYDB_CAP_GENFS_SECLABEL_WILDCARD);
 	for (c = genfs->head; c; c = c->next) {
-		size_t len = strlen(c->u.name);
-		if ((!c->v.sclass || sclass == c->v.sclass) &&
-		    (strncmp(c->u.name, path, len) == 0))
-			break;
+		if (!c->v.sclass || sclass == c->v.sclass) {
+			if (wildcard) {
+				if (match_wildcard(c->u.name, path))
+					break;
+			} else {
+				size_t len = strlen(c->u.name);
+
+				if ((strncmp(c->u.name, path, len)) == 0)
+					break;
+			}
+		}
 	}
 
 	if (!c)

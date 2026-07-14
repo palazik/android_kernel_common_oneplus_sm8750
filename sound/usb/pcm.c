@@ -150,8 +150,8 @@ find_format(struct list_head *fmt_list_head, snd_pcm_format_t format,
 
 const struct audioformat *
 snd_usb_find_format(struct list_head *fmt_list_head, snd_pcm_format_t format,
-	    unsigned int rate, unsigned int channels, bool strict_match,
-	    struct snd_usb_substream *subs)
+		    unsigned int rate, unsigned int channels, bool strict_match,
+		    struct snd_usb_substream *subs)
 {
 	return find_format(fmt_list_head, format, rate, channels, strict_match,
 			subs);
@@ -169,7 +169,7 @@ find_substream_format(struct snd_usb_substream *subs,
 
 const struct audioformat *
 snd_usb_find_substream_format(struct snd_usb_substream *subs,
-		      const struct snd_pcm_hw_params *params)
+			      const struct snd_pcm_hw_params *params)
 {
 	return find_substream_format(subs, params);
 }
@@ -480,7 +480,7 @@ static void close_endpoints(struct snd_usb_audio *chip,
 }
 
 int snd_usb_hw_params(struct snd_usb_substream *subs,
-				struct snd_pcm_hw_params *hw_params)
+		      struct snd_pcm_hw_params *hw_params)
 {
 	struct snd_usb_audio *chip = subs->stream->chip;
 	const struct audioformat *fmt;
@@ -599,7 +599,7 @@ EXPORT_SYMBOL_GPL(snd_usb_hw_params);
  * that.
  */
 static int snd_usb_pcm_hw_params(struct snd_pcm_substream *substream,
-			     struct snd_pcm_hw_params *hw_params)
+				 struct snd_pcm_hw_params *hw_params)
 {
 	struct snd_usb_substream *subs = substream->runtime->private_data;
 

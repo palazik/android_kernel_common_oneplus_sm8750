@@ -67,8 +67,6 @@ struct net {
 						 */
 	spinlock_t		rules_mod_lock;
 
-	atomic_t		dev_unreg_count;
-
 	unsigned int		dev_base_seq;	/* protected by rtnl_mutex */
 	u32			ifindex;
 
@@ -82,6 +80,7 @@ struct net {
 						 * or to unregister pernet ops
 						 * (pernet_ops_rwsem write locked).
 						 */
+	struct llist_node	defer_free_list;
 	struct llist_node	cleanup_list;	/* namespaces on death row */
 
 #ifdef CONFIG_KEYS
@@ -384,11 +383,7 @@ static inline void put_net_track(struct net *net, netns_tracker *tracker)
 
 typedef struct {
 #ifdef CONFIG_NET_NS
-#ifdef __GENKSYMS__
-	struct net *net;
-#else
 	struct net __rcu *net;
-#endif
 #endif
 } possible_net_t;
 
@@ -470,8 +465,11 @@ struct pernet_operations {
 	void (*pre_exit)(struct net *net);
 	void (*exit)(struct net *net);
 	void (*exit_batch)(struct list_head *net_exit_list);
-	unsigned int *id;
-	size_t size;
+	/* Following method is called with RTNL held. */
+	void (*exit_batch_rtnl)(struct list_head *net_exit_list,
+				struct list_head *dev_kill_list);
+	unsigned int * const id;
+	const size_t size;
 };
 
 /*

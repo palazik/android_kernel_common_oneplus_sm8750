@@ -277,7 +277,8 @@ static int sco_connect(struct sock *sk)
 	}
 
 	hcon = hci_connect_sco(hdev, type, &sco_pi(sk)->dst,
-			       sco_pi(sk)->setting, &sco_pi(sk)->codec);
+			       sco_pi(sk)->setting, &sco_pi(sk)->codec,
+			       sk->sk_sndtimeo);
 	if (IS_ERR(hcon)) {
 		err = PTR_ERR(hcon);
 		goto unlock;
@@ -432,8 +433,6 @@ static void sco_sock_cleanup_listen(struct sock *parent)
 	while ((sk = bt_accept_dequeue(parent, NULL))) {
 		sco_sock_close(sk);
 		sco_sock_kill(sk);
-		/* Drop the reference handed back by bt_accept_dequeue(). */
-		sock_put(sk);
 	}
 
 	parent->sk_state  = BT_CLOSED;
@@ -684,7 +683,7 @@ done:
 }
 
 static int sco_sock_accept(struct socket *sock, struct socket *newsock,
-			   int flags, bool kern)
+			   struct proto_accept_arg *arg)
 {
 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
 	struct sock *sk = sock->sk, *ch;
@@ -693,7 +692,7 @@ static int sco_sock_accept(struct socket *sock, struct socket *newsock,
 
 	lock_sock(sk);
 
-	timeo = sock_rcvtimeo(sk, flags & O_NONBLOCK);
+	timeo = sock_rcvtimeo(sk, arg->flags & O_NONBLOCK);
 
 	BT_DBG("sk %p timeo %ld", sk, timeo);
 
@@ -706,13 +705,8 @@ static int sco_sock_accept(struct socket *sock, struct socket *newsock,
 		}
 
 		ch = bt_accept_dequeue(sk, newsock);
-		if (ch) {
-			/* Drop the bridging ref from bt_accept_dequeue();
-			 * the grafted socket keeps ch alive from here.
-			 */
-			sock_put(ch);
+		if (ch)
 			break;
-		}
 
 		if (!timeo) {
 			err = -EAGAIN;
@@ -889,7 +883,7 @@ static int sco_sock_setsockopt(struct socket *sock, int level, int optname,
 			break;
 		}
 
-		err = bt_copy_from_sockptr(&opt, sizeof(opt), optval, optlen);
+		err = copy_safe_from_sockptr(&opt, sizeof(opt), optval, optlen);
 		if (err)
 			break;
 
@@ -908,8 +902,8 @@ static int sco_sock_setsockopt(struct socket *sock, int level, int optname,
 
 		voice.setting = sco_pi(sk)->setting;
 
-		err = bt_copy_from_sockptr(&voice, sizeof(voice), optval,
-					   optlen);
+		err = copy_safe_from_sockptr(&voice, sizeof(voice), optval,
+					     optlen);
 		if (err)
 			break;
 
@@ -932,7 +926,7 @@ static int sco_sock_setsockopt(struct socket *sock, int level, int optname,
 		break;
 
 	case BT_PKT_STATUS:
-		err = bt_copy_from_sockptr(&opt, sizeof(opt), optval, optlen);
+		err = copy_safe_from_sockptr(&opt, sizeof(opt), optval, optlen);
 		if (err)
 			break;
 
@@ -975,7 +969,8 @@ static int sco_sock_setsockopt(struct socket *sock, int level, int optname,
 			break;
 		}
 
-		err = bt_copy_from_sockptr(buffer, optlen, optval, optlen);
+		err = copy_struct_from_sockptr(buffer, sizeof(buffer), optval,
+					       optlen);
 		if (err) {
 			hci_dev_put(hdev);
 			break;
@@ -983,7 +978,8 @@ static int sco_sock_setsockopt(struct socket *sock, int level, int optname,
 
 		codecs = (void *)buffer;
 
-		if (codecs->num_codecs > 1) {
+		if (codecs->num_codecs != 1 ||
+		    optlen < struct_size(codecs, codecs, codecs->num_codecs)) {
 			hci_dev_put(hdev);
 			err = -EINVAL;
 			break;

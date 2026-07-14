@@ -20,7 +20,6 @@
 #include <linux/if_vlan.h>
 #include <linux/jhash.h>
 #include <linux/jiffies.h>
-#include <linux/kernel.h>
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/lockdep.h>
@@ -31,6 +30,7 @@
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/sprintf.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
 #include <linux/workqueue.h>
@@ -1224,7 +1224,6 @@ static void batadv_bla_purge_backbone_gw(struct batadv_priv *bat_priv, int now)
 	struct hlist_head *head;
 	struct batadv_hashtable *hash;
 	spinlock_t *list_lock;	/* protects write access to the hash lists */
-	bool purged;
 	int i;
 
 	hash = bat_priv->bla.backbone_hash;
@@ -1235,45 +1234,30 @@ static void batadv_bla_purge_backbone_gw(struct batadv_priv *bat_priv, int now)
 		head = &hash->table[i];
 		list_lock = &hash->list_locks[i];
 
-		do {
-			purged = false;
+		spin_lock_bh(list_lock);
+		hlist_for_each_entry_safe(backbone_gw, node_tmp,
+					  head, hash_entry) {
+			if (now)
+				goto purge_now;
+			if (!batadv_has_timed_out(backbone_gw->lasttime,
+						  BATADV_BLA_BACKBONE_TIMEOUT))
+				continue;
 
-			spin_lock_bh(list_lock);
-			hlist_for_each_entry_safe(backbone_gw, node_tmp,
-						  head, hash_entry) {
-				if (now)
-					goto purge_now;
-				if (!batadv_has_timed_out(backbone_gw->lasttime,
-							  BATADV_BLA_BACKBONE_TIMEOUT))
-					continue;
-
-				batadv_dbg(BATADV_DBG_BLA, backbone_gw->bat_priv,
-					   "%s(): backbone gw %pM timed out\n",
-					   __func__, backbone_gw->orig);
+			batadv_dbg(BATADV_DBG_BLA, backbone_gw->bat_priv,
+				   "%s(): backbone gw %pM timed out\n",
+				   __func__, backbone_gw->orig);
 
 purge_now:
-				purged = true;
+			/* don't wait for the pending request anymore */
+			if (atomic_read(&backbone_gw->request_sent))
+				atomic_dec(&bat_priv->bla.num_requests);
 
-				/* don't wait for the pending request anymore */
-				if (atomic_read(&backbone_gw->request_sent))
-					atomic_dec(&bat_priv->bla.num_requests);
+			batadv_bla_del_backbone_claims(backbone_gw);
 
-				batadv_bla_del_backbone_claims(backbone_gw);
-
-				hlist_del_rcu(&backbone_gw->hash_entry);
-				break;
-			}
-			spin_unlock_bh(list_lock);
-
-			if (purged) {
-				/* reference for pending report_work */
-				if (cancel_work_sync(&backbone_gw->report_work))
-					batadv_backbone_gw_put(backbone_gw);
-
-				/* reference for hash_entry */
-				batadv_backbone_gw_put(backbone_gw);
-			}
-		} while (purged);
+			hlist_del_rcu(&backbone_gw->hash_entry);
+			batadv_backbone_gw_put(backbone_gw);
+		}
+		spin_unlock_bh(list_lock);
 	}
 }
 

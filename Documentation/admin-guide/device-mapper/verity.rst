@@ -146,7 +146,7 @@ try_verify_in_tasklet
     verify data blocks in bottom half instead of workqueue. This option can
     reduce IO latency. The size limits can be configured via
     /sys/module/dm_verity/parameters/use_bh_bytes. The four parameters
-    correspond to limits for IOPRIO_CLASS_NONE,IOPRIO_CLASS_RT,
+    correspond to limits for IOPRIO_CLASS_NONE, IOPRIO_CLASS_RT,
     IOPRIO_CLASS_BE and IOPRIO_CLASS_IDLE in turn.
     For example:
     <none>,<rt>,<be>,<idle>
@@ -227,8 +227,10 @@ is available at the cryptsetup project's wiki page
 
 Status
 ======
-V (for Valid) is returned if every check performed so far was valid.
-If any check failed, C (for Corruption) is returned.
+1. V (for Valid) is returned if every check performed so far was valid.
+   If any check failed, C (for Corruption) is returned.
+2. Number of corrected blocks by Forward Error Correction.
+   '-' if Forward Error Correction is not enabled.
 
 Example
 =======

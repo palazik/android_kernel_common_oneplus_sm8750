@@ -8,6 +8,7 @@
 
 #include <linux/const.h>
 #include <linux/cache.h>
+#include <linux/prctl.h>
 
 #include <vdso/processor.h>
 
@@ -25,7 +26,7 @@
 
 #ifdef CONFIG_64BIT
 #define DEFAULT_MAP_WINDOW	(UL(1) << (MMAP_VA_BITS - 1))
-#define STACK_TOP_MAX		TASK_SIZE
+#define STACK_TOP_MAX		TASK_SIZE_64
 #else
 #define DEFAULT_MAP_WINDOW	TASK_SIZE
 #define STACK_TOP_MAX		TASK_SIZE
@@ -33,6 +34,12 @@
 #define STACK_ALIGN		16
 
 #define STACK_TOP		DEFAULT_MAP_WINDOW
+
+#ifdef CONFIG_MMU
+#define user_max_virt_addr() arch_get_mmap_end(ULONG_MAX, 0, 0)
+#else
+#define user_max_virt_addr() 0
+#endif /* CONFIG_MMU */
 
 /*
  * This decides where the kernel will search for a free chunk of vm
@@ -45,6 +52,7 @@
 #endif
 
 #ifndef __ASSEMBLY__
+#include <linux/cpumask.h>
 
 struct task_struct;
 struct pt_regs;
@@ -97,7 +105,14 @@ struct thread_struct {
 	u32 riscv_v_flags;
 	u32 vstate_ctrl;
 	struct __riscv_v_ext_state vstate;
+	unsigned long align_ctl;
 	struct __riscv_v_ext_state kernel_vstate;
+#ifdef CONFIG_SMP
+	/* Flush the icache on migration */
+	bool force_icache_flush;
+	/* A forced icache flush is not needed if migrating to the previous cpu. */
+	unsigned int prev_cpu;
+#endif
 };
 
 /* Whitelist the fstate from the task_struct for hardened usercopy */
@@ -110,6 +125,7 @@ static inline void arch_thread_struct_whitelist(unsigned long *offset,
 
 #define INIT_THREAD {					\
 	.sp = sizeof(init_stack) + (long)&init_stack,	\
+	.align_ctl = PR_UNALIGN_NOPRINT,		\
 }
 
 #define task_pt_regs(tsk)						\
@@ -132,6 +148,8 @@ static inline void wait_for_interrupt(void)
 	__asm__ __volatile__ ("wfi");
 }
 
+extern phys_addr_t dma32_phys_limit;
+
 struct device_node;
 int riscv_of_processor_hartid(struct device_node *node, unsigned long *hartid);
 int riscv_early_of_processor_hartid(struct device_node *node, unsigned long *hartid);
@@ -149,6 +167,15 @@ extern unsigned long signal_minsigstksz __ro_after_init;
 extern long riscv_v_vstate_ctrl_set_current(unsigned long arg);
 extern long riscv_v_vstate_ctrl_get_current(void);
 #endif /* CONFIG_RISCV_ISA_V */
+
+extern int get_unalign_ctl(struct task_struct *tsk, unsigned long addr);
+extern int set_unalign_ctl(struct task_struct *tsk, unsigned int val);
+
+#define GET_UNALIGN_CTL(tsk, addr)	get_unalign_ctl((tsk), (addr))
+#define SET_UNALIGN_CTL(tsk, val)	set_unalign_ctl((tsk), (val))
+
+#define RISCV_SET_ICACHE_FLUSH_CTX(arg1, arg2)	riscv_set_icache_flush_ctx(arg1, arg2)
+extern int riscv_set_icache_flush_ctx(unsigned long ctx, unsigned long per_thread);
 
 #endif /* __ASSEMBLY__ */
 

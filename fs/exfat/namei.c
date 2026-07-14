@@ -546,6 +546,7 @@ static int exfat_create(struct mnt_idmap *idmap, struct inode *dir,
 	struct exfat_dir_entry info;
 	loff_t i_pos;
 	int err;
+	loff_t size = i_size_read(dir);
 
 	if (unlikely(exfat_forced_shutdown(sb)))
 		return -EIO;
@@ -559,7 +560,7 @@ static int exfat_create(struct mnt_idmap *idmap, struct inode *dir,
 
 	inode_inc_iversion(dir);
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
-	if (IS_DIRSYNC(dir))
+	if (IS_DIRSYNC(dir) && size != i_size_read(dir))
 		exfat_sync_inode(dir);
 	else
 		mark_inode_dirty(dir);
@@ -634,17 +635,28 @@ static int exfat_find(struct inode *dir, struct qstr *qname,
 
 	info->type = exfat_get_entry_type(ep);
 	info->attr = le16_to_cpu(ep->dentry.file.attr);
-	info->size = le64_to_cpu(ep2->dentry.stream.valid_size);
 	info->valid_size = le64_to_cpu(ep2->dentry.stream.valid_size);
 	info->size = le64_to_cpu(ep2->dentry.stream.size);
+
+	info->start_clu = le32_to_cpu(ep2->dentry.stream.start_clu);
+	if (!is_valid_cluster(sbi, info->start_clu) && info->size) {
+		exfat_warn(sb, "start_clu is invalid cluster(0x%x)",
+				info->start_clu);
+		info->size = 0;
+		info->valid_size = 0;
+	}
+
+	if (info->valid_size > info->size) {
+		exfat_warn(sb, "valid_size(%lld) is greater than size(%lld)",
+				info->valid_size, info->size);
+		info->valid_size = info->size;
+	}
+
 	if (info->size == 0) {
 		info->flags = ALLOC_NO_FAT_CHAIN;
 		info->start_clu = EXFAT_EOF_CLUSTER;
-	} else {
+	} else
 		info->flags = ep2->dentry.stream.flags;
-		info->start_clu =
-			le32_to_cpu(ep2->dentry.stream.start_clu);
-	}
 
 	exfat_get_entry_time(sbi, &info->crtime,
 			     ep->dentry.file.create_tz,
@@ -662,6 +674,16 @@ static int exfat_find(struct inode *dir, struct qstr *qname,
 			     ep->dentry.file.access_date,
 			     0);
 	exfat_put_dentry_set(&es, false);
+
+	if (info->valid_size < 0) {
+		exfat_fs_error(sb, "data valid size is invalid(%lld)", info->valid_size);
+		return -EIO;
+	}
+
+	if (unlikely(EXFAT_B_TO_CLU_ROUND_UP(info->size, sbi) > sbi->used_clusters)) {
+		exfat_fs_error(sb, "data size is invalid(%lld)", info->size);
+		return -EIO;
+	}
 
 	if (ei->start_clu == EXFAT_FREE_CLUSTER) {
 		exfat_fs_error(sb,
@@ -806,10 +828,7 @@ static int exfat_unlink(struct inode *dir, struct dentry *dentry)
 	inode_inc_iversion(dir);
 	simple_inode_init_ts(dir);
 	exfat_truncate_inode_atime(dir);
-	if (IS_DIRSYNC(dir))
-		exfat_sync_inode(dir);
-	else
-		mark_inode_dirty(dir);
+	mark_inode_dirty(dir);
 
 	clear_nlink(inode);
 	simple_inode_init_ts(inode);
@@ -830,6 +849,7 @@ static int exfat_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	struct exfat_chain cdir;
 	loff_t i_pos;
 	int err;
+	loff_t size = i_size_read(dir);
 
 	if (unlikely(exfat_forced_shutdown(sb)))
 		return -EIO;
@@ -843,7 +863,7 @@ static int exfat_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	inode_inc_iversion(dir);
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
-	if (IS_DIRSYNC(dir))
+	if (IS_DIRSYNC(dir) && size != i_size_read(dir))
 		exfat_sync_inode(dir);
 	else
 		mark_inode_dirty(dir);
@@ -1258,6 +1278,7 @@ static int exfat_rename(struct mnt_idmap *idmap,
 	struct super_block *sb = old_dir->i_sb;
 	loff_t i_pos;
 	int err;
+	loff_t size = i_size_read(new_dir);
 
 	/*
 	 * The VFS already checks for existence, so for local filesystems
@@ -1279,7 +1300,7 @@ static int exfat_rename(struct mnt_idmap *idmap,
 	simple_rename_timestamp(old_dir, old_dentry, new_dir, new_dentry);
 	EXFAT_I(new_dir)->i_crtime = current_time(new_dir);
 	exfat_truncate_inode_atime(new_dir);
-	if (IS_DIRSYNC(new_dir))
+	if (IS_DIRSYNC(new_dir) && size != i_size_read(new_dir))
 		exfat_sync_inode(new_dir);
 	else
 		mark_inode_dirty(new_dir);
@@ -1300,9 +1321,7 @@ static int exfat_rename(struct mnt_idmap *idmap,
 	}
 
 	inode_inc_iversion(old_dir);
-	if (IS_DIRSYNC(old_dir))
-		exfat_sync_inode(old_dir);
-	else
+	if (new_dir != old_dir)
 		mark_inode_dirty(old_dir);
 
 	if (new_inode) {

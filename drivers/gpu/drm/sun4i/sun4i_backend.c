@@ -69,7 +69,9 @@ static void sun4i_backend_disable_color_correction(struct sunxi_engine *engine)
 			   SUN4I_BACKEND_OCCTL_ENABLE, 0);
 }
 
-static void sun4i_backend_commit(struct sunxi_engine *engine)
+static void sun4i_backend_commit(struct sunxi_engine *engine,
+				 struct drm_crtc *crtc,
+				 struct drm_atomic_state *state)
 {
 	DRM_DEBUG_DRIVER("Committing changes\n");
 
@@ -878,8 +880,7 @@ static int sun4i_backend_bind(struct device *dev, struct device *master,
 						     &sun4i_backend_regmap_config);
 	if (IS_ERR(backend->engine.regs)) {
 		dev_err(dev, "Couldn't create the backend regmap\n");
-		ret = PTR_ERR(backend->engine.regs);
-		goto err_disable_ram_clk;
+		return PTR_ERR(backend->engine.regs);
 	}
 
 	list_add_tail(&backend->engine.list, &drv->engine_list);

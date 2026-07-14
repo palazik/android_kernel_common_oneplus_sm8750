@@ -22,6 +22,8 @@
 #include <linux/security.h>
 #include <linux/btf_ids.h>
 #include <linux/bpf_mem_alloc.h>
+#include <linux/kasan.h>
+#include <linux/uaccess.h>
 
 #include "../../lib/kstrtox.h"
 
@@ -110,7 +112,7 @@ const struct bpf_func_proto bpf_map_pop_elem_proto = {
 	.gpl_only	= false,
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_CONST_MAP_PTR,
-	.arg2_type	= ARG_PTR_TO_MAP_VALUE | MEM_UNINIT,
+	.arg2_type	= ARG_PTR_TO_MAP_VALUE | MEM_UNINIT | MEM_WRITE,
 };
 
 BPF_CALL_2(bpf_map_peek_elem, struct bpf_map *, map, void *, value)
@@ -123,7 +125,7 @@ const struct bpf_func_proto bpf_map_peek_elem_proto = {
 	.gpl_only	= false,
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_CONST_MAP_PTR,
-	.arg2_type	= ARG_PTR_TO_MAP_VALUE | MEM_UNINIT,
+	.arg2_type	= ARG_PTR_TO_MAP_VALUE | MEM_UNINIT | MEM_WRITE,
 };
 
 BPF_CALL_3(bpf_map_lookup_percpu_elem, struct bpf_map *, map, void *, key, u32, cpu)
@@ -158,6 +160,7 @@ const struct bpf_func_proto bpf_get_smp_processor_id_proto = {
 	.func		= bpf_get_smp_processor_id,
 	.gpl_only	= false,
 	.ret_type	= RET_INTEGER,
+	.allow_fastcall	= true,
 };
 
 BPF_CALL_0(bpf_get_numa_node_id)
@@ -526,8 +529,6 @@ BPF_CALL_4(bpf_strtol, const char *, buf, size_t, buf_len, u64, flags,
 	err = __bpf_strtoll(buf, buf_len, flags, &_res);
 	if (err < 0)
 		return err;
-	if (_res != (long)_res)
-		return -ERANGE;
 	*res = _res;
 	return err;
 }
@@ -539,7 +540,7 @@ const struct bpf_func_proto bpf_strtol_proto = {
 	.arg1_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
 	.arg2_type	= ARG_CONST_SIZE,
 	.arg3_type	= ARG_ANYTHING,
-	.arg4_type	= ARG_PTR_TO_FIXED_SIZE_MEM | MEM_UNINIT | MEM_ALIGNED,
+	.arg4_type	= ARG_PTR_TO_FIXED_SIZE_MEM | MEM_UNINIT | MEM_WRITE | MEM_ALIGNED,
 	.arg4_size	= sizeof(s64),
 };
 
@@ -556,8 +557,6 @@ BPF_CALL_4(bpf_strtoul, const char *, buf, size_t, buf_len, u64, flags,
 		return err;
 	if (is_negative)
 		return -EINVAL;
-	if (_res != (unsigned long)_res)
-		return -ERANGE;
 	*res = _res;
 	return err;
 }
@@ -569,7 +568,7 @@ const struct bpf_func_proto bpf_strtoul_proto = {
 	.arg1_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
 	.arg2_type	= ARG_CONST_SIZE,
 	.arg3_type	= ARG_ANYTHING,
-	.arg4_type	= ARG_PTR_TO_FIXED_SIZE_MEM | MEM_UNINIT | MEM_ALIGNED,
+	.arg4_type	= ARG_PTR_TO_FIXED_SIZE_MEM | MEM_UNINIT | MEM_WRITE | MEM_ALIGNED,
 	.arg4_size	= sizeof(u64),
 };
 
@@ -718,7 +717,7 @@ BPF_CALL_2(bpf_per_cpu_ptr, const void *, ptr, u32, cpu)
 	if (cpu >= nr_cpu_ids)
 		return (unsigned long)NULL;
 
-	return (unsigned long)per_cpu_ptr((const void __percpu *)ptr, cpu);
+	return (unsigned long)per_cpu_ptr((const void __percpu *)(const uintptr_t)ptr, cpu);
 }
 
 const struct bpf_func_proto bpf_per_cpu_ptr_proto = {
@@ -731,7 +730,7 @@ const struct bpf_func_proto bpf_per_cpu_ptr_proto = {
 
 BPF_CALL_1(bpf_this_cpu_ptr, const void *, percpu_ptr)
 {
-	return (unsigned long)this_cpu_ptr((const void __percpu *)percpu_ptr);
+	return (unsigned long)this_cpu_ptr((const void __percpu *)(const uintptr_t)percpu_ptr);
 }
 
 const struct bpf_func_proto bpf_this_cpu_ptr_proto = {
@@ -849,13 +848,7 @@ int bpf_bprintf_prepare(char *fmt, u32 fmt_size, const u64 *raw_args,
 		data->buf = buffers->buf;
 
 	for (i = 0; i < fmt_size; i++) {
-		unsigned char c = fmt[i];
-
-		/*
-		 * Permit bytes >= 0x80 in plain text so UTF-8 literals can pass
-		 * through unchanged, while still rejecting ASCII control bytes.
-		 */
-		if (isascii(c) && !isprint(c) && !isspace(c)) {
+		if ((!isprint(fmt[i]) && !isspace(fmt[i])) || !isascii(fmt[i])) {
 			err = -EINVAL;
 			goto out;
 		}
@@ -877,15 +870,6 @@ int bpf_bprintf_prepare(char *fmt, u32 fmt_size, const u64 *raw_args,
 		 * always access fmt[i + 1], in the worst case it will be a 0
 		 */
 		i++;
-		c = fmt[i];
-		/*
-		 * The format parser below only understands ASCII conversion
-		 * specifiers and modifiers, so reject non-ASCII after '%'.
-		 */
-		if (!isascii(c)) {
-			err = -EINVAL;
-			goto out;
-		}
 
 		/* skip optional "[0 +-][num]" width formatting field */
 		while (fmt[i] == '0' || fmt[i] == '+'  || fmt[i] == '-' ||
@@ -1108,7 +1092,10 @@ struct bpf_async_cb {
 	struct bpf_prog *prog;
 	void __rcu *callback_fn;
 	void *value;
-	struct rcu_head rcu;
+	union {
+		struct rcu_head rcu;
+		struct work_struct delete_work;
+	};
 	u64 flags;
 };
 
@@ -1134,11 +1121,18 @@ struct bpf_hrtimer {
 	atomic_t cancelling;
 };
 
-/* the actual struct hidden inside uapi struct bpf_timer */
+struct bpf_work {
+	struct bpf_async_cb cb;
+	struct work_struct work;
+	struct work_struct delete_work;
+};
+
+/* the actual struct hidden inside uapi struct bpf_timer and bpf_wq */
 struct bpf_async_kern {
 	union {
 		struct bpf_async_cb *cb;
 		struct bpf_hrtimer *timer;
+		struct bpf_work *work;
 	};
 	/* bpf_spin_lock is used here instead of spinlock_t to make
 	 * sure that it always fits into space reserved by struct bpf_timer
@@ -1149,6 +1143,7 @@ struct bpf_async_kern {
 
 enum bpf_async_type {
 	BPF_ASYNC_TYPE_TIMER = 0,
+	BPF_ASYNC_TYPE_WQ,
 };
 
 static DEFINE_PER_CPU(struct bpf_hrtimer *, hrtimer_running);
@@ -1192,11 +1187,71 @@ out:
 	return HRTIMER_NORESTART;
 }
 
+static void bpf_wq_work(struct work_struct *work)
+{
+	struct bpf_work *w = container_of(work, struct bpf_work, work);
+	struct bpf_async_cb *cb = &w->cb;
+	struct bpf_map *map = cb->map;
+	bpf_callback_t callback_fn;
+	void *value = cb->value;
+	void *key;
+	u32 idx;
+
+	BTF_TYPE_EMIT(struct bpf_wq);
+
+	callback_fn = READ_ONCE(cb->callback_fn);
+	if (!callback_fn)
+		return;
+
+	if (map->map_type == BPF_MAP_TYPE_ARRAY) {
+		struct bpf_array *array = container_of(map, struct bpf_array, map);
+
+		/* compute the key */
+		idx = ((char *)value - array->value) / array->elem_size;
+		key = &idx;
+	} else { /* hash or lru */
+		key = value - round_up(map->key_size, 8);
+	}
+
+        rcu_read_lock_trace();
+        migrate_disable();
+
+	callback_fn((u64)(long)map, (u64)(long)key, (u64)(long)value, 0, 0);
+
+	migrate_enable();
+	rcu_read_unlock_trace();
+}
+
+static void bpf_wq_delete_work(struct work_struct *work)
+{
+	struct bpf_work *w = container_of(work, struct bpf_work, delete_work);
+
+	cancel_work_sync(&w->work);
+
+	kfree_rcu(w, cb.rcu);
+}
+
+static void bpf_timer_delete_work(struct work_struct *work)
+{
+	struct bpf_hrtimer *t = container_of(work, struct bpf_hrtimer, cb.delete_work);
+
+	/* Cancel the timer and wait for callback to complete if it was running.
+	 * If hrtimer_cancel() can be safely called it's safe to call
+	 * kfree_rcu(t) right after for both preallocated and non-preallocated
+	 * maps.  The async->cb = NULL was already done and no code path can see
+	 * address 't' anymore. Timer if armed for existing bpf_hrtimer before
+	 * bpf_timer_cancel_and_free will have been cancelled.
+	 */
+	hrtimer_cancel(&t->timer);
+	kfree_rcu(t, cb.rcu);
+}
+
 static int __bpf_async_init(struct bpf_async_kern *async, struct bpf_map *map, u64 flags,
 			    enum bpf_async_type type)
 {
 	struct bpf_async_cb *cb;
 	struct bpf_hrtimer *t;
+	struct bpf_work *w;
 	clockid_t clockid;
 	size_t size;
 	int ret = 0;
@@ -1207,6 +1262,9 @@ static int __bpf_async_init(struct bpf_async_kern *async, struct bpf_map *map, u
 	switch (type) {
 	case BPF_ASYNC_TYPE_TIMER:
 		size = sizeof(struct bpf_hrtimer);
+		break;
+	case BPF_ASYNC_TYPE_WQ:
+		size = sizeof(struct bpf_work);
 		break;
 	default:
 		return -EINVAL;
@@ -1229,14 +1287,24 @@ static int __bpf_async_init(struct bpf_async_kern *async, struct bpf_map *map, u
 		goto out;
 	}
 
-	if (type == BPF_ASYNC_TYPE_TIMER) {
+	switch (type) {
+	case BPF_ASYNC_TYPE_TIMER:
 		clockid = flags & (MAX_CLOCKS - 1);
 		t = (struct bpf_hrtimer *)cb;
 
 		atomic_set(&t->cancelling, 0);
+		INIT_WORK(&t->cb.delete_work, bpf_timer_delete_work);
 		hrtimer_init(&t->timer, clockid, HRTIMER_MODE_REL_SOFT);
 		t->timer.function = bpf_timer_cb;
 		cb->value = (void *)async - map->record->timer_off;
+		break;
+	case BPF_ASYNC_TYPE_WQ:
+		w = (struct bpf_work *)cb;
+
+		INIT_WORK(&w->work, bpf_wq_work);
+		INIT_WORK(&w->delete_work, bpf_wq_delete_work);
+		cb->value = (void *)async - map->record->wq_off;
+		break;
 	}
 	cb->map = map;
 	cb->prog = NULL;
@@ -1291,22 +1359,23 @@ static const struct bpf_func_proto bpf_timer_init_proto = {
 	.arg3_type	= ARG_ANYTHING,
 };
 
-BPF_CALL_3(bpf_timer_set_callback, struct bpf_async_kern *, timer, void *, callback_fn,
-	   struct bpf_prog_aux *, aux)
+static int __bpf_async_set_callback(struct bpf_async_kern *async, void *callback_fn,
+				    struct bpf_prog_aux *aux, unsigned int flags,
+				    enum bpf_async_type type)
 {
 	struct bpf_prog *prev, *prog = aux->prog;
-	struct bpf_hrtimer *t;
+	struct bpf_async_cb *cb;
 	int ret = 0;
 
 	if (in_nmi())
 		return -EOPNOTSUPP;
-	__bpf_spin_lock_irqsave(&timer->lock);
-	t = timer->timer;
-	if (!t) {
+	__bpf_spin_lock_irqsave(&async->lock);
+	cb = async->cb;
+	if (!cb) {
 		ret = -EINVAL;
 		goto out;
 	}
-	if (!atomic64_read(&t->cb.map->usercnt)) {
+	if (!atomic64_read(&cb->map->usercnt)) {
 		/* maps with timers must be either held by user space
 		 * or pinned in bpffs. Otherwise timer might still be
 		 * running even when bpf prog is detached and user space
@@ -1315,7 +1384,7 @@ BPF_CALL_3(bpf_timer_set_callback, struct bpf_async_kern *, timer, void *, callb
 		ret = -EPERM;
 		goto out;
 	}
-	prev = t->cb.prog;
+	prev = cb->prog;
 	if (prev != prog) {
 		/* Bump prog refcnt once. Every bpf_timer_set_callback()
 		 * can pick different callback_fn-s within the same prog.
@@ -1328,12 +1397,18 @@ BPF_CALL_3(bpf_timer_set_callback, struct bpf_async_kern *, timer, void *, callb
 		if (prev)
 			/* Drop prev prog refcnt when swapping with new prog */
 			bpf_prog_put(prev);
-		t->cb.prog = prog;
+		cb->prog = prog;
 	}
-	rcu_assign_pointer(t->cb.callback_fn, callback_fn);
+	rcu_assign_pointer(cb->callback_fn, callback_fn);
 out:
-	__bpf_spin_unlock_irqrestore(&timer->lock);
+	__bpf_spin_unlock_irqrestore(&async->lock);
 	return ret;
+}
+
+BPF_CALL_3(bpf_timer_set_callback, struct bpf_async_kern *, timer, void *, callback_fn,
+	   struct bpf_prog_aux *, aux)
+{
+	return __bpf_async_set_callback(timer, callback_fn, aux, 0, BPF_ASYNC_TYPE_TIMER);
 }
 
 static const struct bpf_func_proto bpf_timer_set_callback_proto = {
@@ -1352,7 +1427,7 @@ BPF_CALL_3(bpf_timer_start, struct bpf_async_kern *, timer, u64, nsecs, u64, fla
 
 	if (in_nmi())
 		return -EOPNOTSUPP;
-	if (flags > BPF_F_TIMER_ABS)
+	if (flags & ~(BPF_F_TIMER_ABS | BPF_F_TIMER_CPU_PIN))
 		return -EINVAL;
 	__bpf_spin_lock_irqsave(&timer->lock);
 	t = timer->timer;
@@ -1365,6 +1440,9 @@ BPF_CALL_3(bpf_timer_start, struct bpf_async_kern *, timer, u64, nsecs, u64, fla
 		mode = HRTIMER_MODE_ABS_SOFT;
 	else
 		mode = HRTIMER_MODE_REL_SOFT;
+
+	if (flags & BPF_F_TIMER_CPU_PIN)
+		mode |= HRTIMER_MODE_PINNED;
 
 	hrtimer_start(&t->timer, ns_to_ktime(nsecs), mode);
 out:
@@ -1462,57 +1540,114 @@ static const struct bpf_func_proto bpf_timer_cancel_proto = {
 	.arg1_type	= ARG_PTR_TO_TIMER,
 };
 
+static struct bpf_async_cb *__bpf_async_cancel_and_free(struct bpf_async_kern *async)
+{
+	struct bpf_async_cb *cb;
+
+	/* Performance optimization: read async->cb without lock first. */
+	if (!READ_ONCE(async->cb))
+		return NULL;
+
+	__bpf_spin_lock_irqsave(&async->lock);
+	/* re-read it under lock */
+	cb = async->cb;
+	if (!cb)
+		goto out;
+	drop_prog_refcnt(cb);
+	/* The subsequent bpf_timer_start/cancel() helpers won't be able to use
+	 * this timer, since it won't be initialized.
+	 */
+	WRITE_ONCE(async->cb, NULL);
+out:
+	__bpf_spin_unlock_irqrestore(&async->lock);
+	return cb;
+}
+
 /* This function is called by map_delete/update_elem for individual element and
  * by ops->map_release_uref when the user space reference to a map reaches zero.
  */
 void bpf_timer_cancel_and_free(void *val)
 {
-	struct bpf_async_kern *timer = val;
 	struct bpf_hrtimer *t;
 
-	/* Performance optimization: read timer->timer without lock first. */
-	if (!READ_ONCE(timer->timer))
-		return;
+	t = (struct bpf_hrtimer *)__bpf_async_cancel_and_free(val);
 
-	__bpf_spin_lock_irqsave(&timer->lock);
-	/* re-read it under lock */
-	t = timer->timer;
-	if (!t)
-		goto out;
-	drop_prog_refcnt(&t->cb);
-	/* The subsequent bpf_timer_start/cancel() helpers won't be able to use
-	 * this timer, since it won't be initialized.
-	 */
-	WRITE_ONCE(timer->timer, NULL);
-out:
-	__bpf_spin_unlock_irqrestore(&timer->lock);
 	if (!t)
 		return;
-	/* Cancel the timer and wait for callback to complete if it was running.
-	 * If hrtimer_cancel() can be safely called it's safe to call kfree(t)
-	 * right after for both preallocated and non-preallocated maps.
-	 * The timer->timer = NULL was already done and no code path can
-	 * see address 't' anymore.
-	 *
-	 * Check that bpf_map_delete/update_elem() wasn't called from timer
-	 * callback_fn. In such case don't call hrtimer_cancel() (since it will
-	 * deadlock) and don't call hrtimer_try_to_cancel() (since it will just
-	 * return -1). Though callback_fn is still running on this cpu it's
+	/* We check that bpf_map_delete/update_elem() was called from timer
+	 * callback_fn. In such case we don't call hrtimer_cancel() (since it
+	 * will deadlock) and don't call hrtimer_try_to_cancel() (since it will
+	 * just return -1). Though callback_fn is still running on this cpu it's
 	 * safe to do kfree(t) because bpf_timer_cb() read everything it needed
 	 * from 't'. The bpf subprog callback_fn won't be able to access 't',
-	 * since timer->timer = NULL was already done. The timer will be
+	 * since async->cb = NULL was already done. The timer will be
 	 * effectively cancelled because bpf_timer_cb() will return
 	 * HRTIMER_NORESTART.
+	 *
+	 * However, it is possible the timer callback_fn calling us armed the
+	 * timer _before_ calling us, such that failing to cancel it here will
+	 * cause it to possibly use struct hrtimer after freeing bpf_hrtimer.
+	 * Therefore, we _need_ to cancel any outstanding timers before we do
+	 * kfree_rcu, even though no more timers can be armed.
+	 *
+	 * Moreover, we need to schedule work even if timer does not belong to
+	 * the calling callback_fn, as on two different CPUs, we can end up in a
+	 * situation where both sides run in parallel, try to cancel one
+	 * another, and we end up waiting on both sides in hrtimer_cancel
+	 * without making forward progress, since timer1 depends on time2
+	 * callback to finish, and vice versa.
+	 *
+	 *  CPU 1 (timer1_cb)			CPU 2 (timer2_cb)
+	 *  bpf_timer_cancel_and_free(timer2)	bpf_timer_cancel_and_free(timer1)
+	 *
+	 * To avoid these issues, punt to workqueue context when we are in a
+	 * timer callback.
 	 */
-	if (this_cpu_read(hrtimer_running) != t)
-		hrtimer_cancel(&t->timer);
-	kfree_rcu(t, cb.rcu);
+	if (this_cpu_read(hrtimer_running)) {
+		queue_work(system_unbound_wq, &t->cb.delete_work);
+		return;
+	}
+
+	if (IS_ENABLED(CONFIG_PREEMPT_RT)) {
+		/* If the timer is running on other CPU, also use a kworker to
+		 * wait for the completion of the timer instead of trying to
+		 * acquire a sleepable lock in hrtimer_cancel() to wait for its
+		 * completion.
+		 */
+		if (hrtimer_try_to_cancel(&t->timer) >= 0)
+			kfree_rcu(t, cb.rcu);
+		else
+			queue_work(system_unbound_wq, &t->cb.delete_work);
+	} else {
+		bpf_timer_delete_work(&t->cb.delete_work);
+	}
 }
 
-BPF_CALL_2(bpf_kptr_xchg, void *, map_value, void *, ptr)
+/* This function is called by map_delete/update_elem for individual element and
+ * by ops->map_release_uref when the user space reference to a map reaches zero.
+ */
+void bpf_wq_cancel_and_free(void *val)
 {
-	unsigned long *kptr = map_value;
+	struct bpf_work *work;
 
+	BTF_TYPE_EMIT(struct bpf_wq);
+
+	work = (struct bpf_work *)__bpf_async_cancel_and_free(val);
+	if (!work)
+		return;
+	/* Trigger cancel of the sleepable work, but *do not* wait for
+	 * it to finish if it was running as we might not be in a
+	 * sleepable context.
+	 * kfree will be called once the work has finished.
+	 */
+	schedule_work(&work->delete_work);
+}
+
+BPF_CALL_2(bpf_kptr_xchg, void *, dst, void *, ptr)
+{
+	unsigned long *kptr = dst;
+
+	/* This helper may be inlined by verifier. */
 	return xchg(kptr, (unsigned long)ptr);
 }
 
@@ -1525,7 +1660,7 @@ static const struct bpf_func_proto bpf_kptr_xchg_proto = {
 	.gpl_only     = false,
 	.ret_type     = RET_PTR_TO_BTF_ID_OR_NULL,
 	.ret_btf_id   = BPF_PTR_POISON,
-	.arg1_type    = ARG_PTR_TO_KPTR,
+	.arg1_type    = ARG_KPTR_XCHG_DEST,
 	.arg2_type    = ARG_PTR_TO_BTF_ID_OR_NULL | OBJ_RELEASE,
 	.arg2_btf_id  = BPF_PTR_POISON,
 };
@@ -1538,7 +1673,7 @@ static const struct bpf_func_proto bpf_kptr_xchg_proto = {
 #define DYNPTR_SIZE_MASK	0xFFFFFF
 #define DYNPTR_RDONLY_BIT	BIT(31)
 
-static bool __bpf_dynptr_is_rdonly(const struct bpf_dynptr_kern *ptr)
+bool __bpf_dynptr_is_rdonly(const struct bpf_dynptr_kern *ptr)
 {
 	return ptr->size & DYNPTR_RDONLY_BIT;
 }
@@ -1631,7 +1766,7 @@ static const struct bpf_func_proto bpf_dynptr_from_mem_proto = {
 	.arg1_type	= ARG_PTR_TO_UNINIT_MEM,
 	.arg2_type	= ARG_CONST_SIZE_OR_ZERO,
 	.arg3_type	= ARG_ANYTHING,
-	.arg4_type	= ARG_PTR_TO_DYNPTR | DYNPTR_TYPE_LOCAL | MEM_UNINIT,
+	.arg4_type	= ARG_PTR_TO_DYNPTR | DYNPTR_TYPE_LOCAL | MEM_UNINIT | MEM_WRITE,
 };
 
 BPF_CALL_5(bpf_dynptr_read, void *, dst, u32, len, const struct bpf_dynptr_kern *, src,
@@ -1778,7 +1913,7 @@ const struct bpf_func_proto bpf_probe_read_kernel_str_proto __weak;
 const struct bpf_func_proto bpf_task_pt_regs_proto __weak;
 
 const struct bpf_func_proto *
-bpf_base_func_proto(enum bpf_func_id func_id)
+bpf_base_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
 	switch (func_id) {
 	case BPF_FUNC_map_lookup_elem:
@@ -1825,11 +1960,15 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 		return &bpf_strtol_proto;
 	case BPF_FUNC_strtoul:
 		return &bpf_strtoul_proto;
+	case BPF_FUNC_get_current_pid_tgid:
+		return &bpf_get_current_pid_tgid_proto;
+	case BPF_FUNC_get_ns_current_pid_tgid:
+		return &bpf_get_ns_current_pid_tgid_proto;
 	default:
 		break;
 	}
 
-	if (!bpf_capable())
+	if (!bpf_token_capable(prog->aux->token, CAP_BPF))
 		return NULL;
 
 	switch (func_id) {
@@ -1887,7 +2026,7 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 		break;
 	}
 
-	if (!perfmon_capable())
+	if (!bpf_token_capable(prog->aux->token, CAP_PERFMON))
 		return NULL;
 
 	switch (func_id) {
@@ -1919,8 +2058,7 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 		return NULL;
 	}
 }
-
-void __bpf_obj_drop_impl(void *p, const struct btf_record *rec);
+EXPORT_SYMBOL_GPL(bpf_base_func_proto);
 
 void bpf_list_head_free(const struct btf_field *field, void *list_head,
 			struct bpf_spin_lock *spin_lock)
@@ -1953,7 +2091,7 @@ unlock:
 		 * bpf_list_head which needs to be freed.
 		 */
 		migrate_disable();
-		__bpf_obj_drop_impl(obj, field->graph_root.value_rec);
+		__bpf_obj_drop_impl(obj, field->graph_root.value_rec, false);
 		migrate_enable();
 	}
 }
@@ -1992,14 +2130,12 @@ void bpf_rb_root_free(const struct btf_field *field, void *rb_root,
 
 
 		migrate_disable();
-		__bpf_obj_drop_impl(obj, field->graph_root.value_rec);
+		__bpf_obj_drop_impl(obj, field->graph_root.value_rec, false);
 		migrate_enable();
 	}
 }
 
-__diag_push();
-__diag_ignore_all("-Wmissing-prototypes",
-		  "Global functions as their definitions will be in vmlinux BTF");
+__bpf_kfunc_start_defs();
 
 __bpf_kfunc void *bpf_obj_new_impl(u64 local_type_id__k, void *meta__ign)
 {
@@ -2015,9 +2151,19 @@ __bpf_kfunc void *bpf_obj_new_impl(u64 local_type_id__k, void *meta__ign)
 	return p;
 }
 
-/* Must be called under migrate_disable(), as required by bpf_mem_free */
-void __bpf_obj_drop_impl(void *p, const struct btf_record *rec)
+__bpf_kfunc void *bpf_percpu_obj_new_impl(u64 local_type_id__k, void *meta__ign)
 {
+	u64 size = local_type_id__k;
+
+	/* The verifier has ensured that meta__ign must be NULL */
+	return bpf_mem_alloc(&bpf_global_percpu_ma, size);
+}
+
+/* Must be called under migrate_disable(), as required by bpf_mem_free */
+void __bpf_obj_drop_impl(void *p, const struct btf_record *rec, bool percpu)
+{
+	struct bpf_mem_alloc *ma;
+
 	if (rec && rec->refcount_off >= 0 &&
 	    !refcount_dec_and_test((refcount_t *)(p + rec->refcount_off))) {
 		/* Object is refcounted and refcount_dec didn't result in 0
@@ -2029,10 +2175,11 @@ void __bpf_obj_drop_impl(void *p, const struct btf_record *rec)
 	if (rec)
 		bpf_obj_free_fields(rec, p);
 
-	if (rec && rec->refcount_off >= 0)
-		bpf_mem_free_rcu(&bpf_global_ma, p);
+	if (percpu)
+		ma = &bpf_global_percpu_ma;
 	else
-		bpf_mem_free(&bpf_global_ma, p);
+		ma = &bpf_global_ma;
+	bpf_mem_free_rcu(ma, p);
 }
 
 __bpf_kfunc void bpf_obj_drop_impl(void *p__alloc, void *meta__ign)
@@ -2040,7 +2187,13 @@ __bpf_kfunc void bpf_obj_drop_impl(void *p__alloc, void *meta__ign)
 	struct btf_struct_meta *meta = meta__ign;
 	void *p = p__alloc;
 
-	__bpf_obj_drop_impl(p, meta ? meta->record : NULL);
+	__bpf_obj_drop_impl(p, meta ? meta->record : NULL, false);
+}
+
+__bpf_kfunc void bpf_percpu_obj_drop_impl(void *p__alloc, void *meta__ign)
+{
+	/* The verifier has ensured that meta__ign must be NULL */
+	bpf_mem_free_rcu(&bpf_global_percpu_ma, p__alloc);
 }
 
 __bpf_kfunc void *bpf_refcount_acquire_impl(void *p__refcounted_kptr, void *meta__ign)
@@ -2078,7 +2231,7 @@ static int __bpf_list_add(struct bpf_list_node_kern *node,
 	 */
 	if (cmpxchg(&node->owner, NULL, BPF_PTR_POISON)) {
 		/* Only called from BPF prog, no need to migrate_disable */
-		__bpf_obj_drop_impl((void *)n - off, rec);
+		__bpf_obj_drop_impl((void *)n - off, rec, false);
 		return -EINVAL;
 	}
 
@@ -2177,7 +2330,7 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
 	 */
 	if (cmpxchg(&node->owner, NULL, BPF_PTR_POISON)) {
 		/* Only called from BPF prog, no need to migrate_disable */
-		__bpf_obj_drop_impl((void *)n - off, rec);
+		__bpf_obj_drop_impl((void *)n - off, rec, false);
 		return -EINVAL;
 	}
 
@@ -2329,6 +2482,48 @@ __bpf_kfunc long bpf_task_under_cgroup(struct task_struct *task,
 	rcu_read_unlock();
 	return ret;
 }
+
+BPF_CALL_2(bpf_current_task_under_cgroup, struct bpf_map *, map, u32, idx)
+{
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+	struct cgroup *cgrp;
+
+	if (unlikely(idx >= array->map.max_entries))
+		return -E2BIG;
+
+	cgrp = READ_ONCE(array->ptrs[idx]);
+	if (unlikely(!cgrp))
+		return -EAGAIN;
+
+	return task_under_cgroup_hierarchy(current, cgrp);
+}
+
+const struct bpf_func_proto bpf_current_task_under_cgroup_proto = {
+	.func           = bpf_current_task_under_cgroup,
+	.gpl_only       = false,
+	.ret_type       = RET_INTEGER,
+	.arg1_type      = ARG_CONST_MAP_PTR,
+	.arg2_type      = ARG_ANYTHING,
+};
+
+/**
+ * bpf_task_get_cgroup1 - Acquires the associated cgroup of a task within a
+ * specific cgroup1 hierarchy. The cgroup1 hierarchy is identified by its
+ * hierarchy ID.
+ * @task: The target task
+ * @hierarchy_id: The ID of a cgroup1 hierarchy
+ *
+ * On success, the cgroup is returen. On failure, NULL is returned.
+ */
+__bpf_kfunc struct cgroup *
+bpf_task_get_cgroup1(struct task_struct *task, int hierarchy_id)
+{
+	struct cgroup *cgrp = task_get_cgroup1(task, hierarchy_id);
+
+	if (IS_ERR(cgrp))
+		return NULL;
+	return cgrp;
+}
 #endif /* CONFIG_CGROUPS */
 
 /**
@@ -2352,7 +2547,7 @@ __bpf_kfunc struct task_struct *bpf_task_from_pid(s32 pid)
 
 /**
  * bpf_dynptr_slice() - Obtain a read-only pointer to the dynptr data.
- * @ptr: The dynptr whose data slice to retrieve
+ * @p: The dynptr whose data slice to retrieve
  * @offset: Offset into the dynptr
  * @buffer__opt: User-provided buffer to copy contents into.  May be NULL
  * @buffer__szk: Size (in bytes) of the buffer if present. This is the
@@ -2378,9 +2573,10 @@ __bpf_kfunc struct task_struct *bpf_task_from_pid(s32 pid)
  * provided buffer, with its contents containing the data, if unable to obtain
  * direct pointer)
  */
-__bpf_kfunc void *bpf_dynptr_slice(const struct bpf_dynptr_kern *ptr, u32 offset,
+__bpf_kfunc void *bpf_dynptr_slice(const struct bpf_dynptr *p, u32 offset,
 				   void *buffer__opt, u32 buffer__szk)
 {
+	const struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)p;
 	enum bpf_dynptr_type type;
 	u32 len = buffer__szk;
 	int err;
@@ -2422,7 +2618,7 @@ __bpf_kfunc void *bpf_dynptr_slice(const struct bpf_dynptr_kern *ptr, u32 offset
 
 /**
  * bpf_dynptr_slice_rdwr() - Obtain a writable pointer to the dynptr data.
- * @ptr: The dynptr whose data slice to retrieve
+ * @p: The dynptr whose data slice to retrieve
  * @offset: Offset into the dynptr
  * @buffer__opt: User-provided buffer to copy contents into. May be NULL
  * @buffer__szk: Size (in bytes) of the buffer if present. This is the
@@ -2462,16 +2658,18 @@ __bpf_kfunc void *bpf_dynptr_slice(const struct bpf_dynptr_kern *ptr, u32 offset
  * provided buffer, with its contents containing the data, if unable to obtain
  * direct pointer)
  */
-__bpf_kfunc void *bpf_dynptr_slice_rdwr(const struct bpf_dynptr_kern *ptr, u32 offset,
+__bpf_kfunc void *bpf_dynptr_slice_rdwr(const struct bpf_dynptr *p, u32 offset,
 					void *buffer__opt, u32 buffer__szk)
 {
+	const struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)p;
+
 	if (!ptr->data || __bpf_dynptr_is_rdonly(ptr))
 		return NULL;
 
 	/* bpf_dynptr_slice_rdwr is the same logic as bpf_dynptr_slice.
 	 *
 	 * For skb-type dynptrs, it is safe to write into the returned pointer
-	 * if the bpf program allows skb data writes. There are two possiblities
+	 * if the bpf program allows skb data writes. There are two possibilities
 	 * that may occur when calling bpf_dynptr_slice_rdwr:
 	 *
 	 * 1) The requested slice is in the head of the skb. In this case, the
@@ -2490,11 +2688,12 @@ __bpf_kfunc void *bpf_dynptr_slice_rdwr(const struct bpf_dynptr_kern *ptr, u32 o
 	 * will be copied out into the buffer and the user will need to call
 	 * bpf_dynptr_write() to commit changes.
 	 */
-	return bpf_dynptr_slice(ptr, offset, buffer__opt, buffer__szk);
+	return bpf_dynptr_slice(p, offset, buffer__opt, buffer__szk);
 }
 
-__bpf_kfunc int bpf_dynptr_adjust(struct bpf_dynptr_kern *ptr, u32 start, u32 end)
+__bpf_kfunc int bpf_dynptr_adjust(const struct bpf_dynptr *p, u32 start, u32 end)
 {
+	struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)p;
 	u32 size;
 
 	if (!ptr->data || start > end)
@@ -2511,36 +2710,45 @@ __bpf_kfunc int bpf_dynptr_adjust(struct bpf_dynptr_kern *ptr, u32 start, u32 en
 	return 0;
 }
 
-__bpf_kfunc bool bpf_dynptr_is_null(struct bpf_dynptr_kern *ptr)
+__bpf_kfunc bool bpf_dynptr_is_null(const struct bpf_dynptr *p)
 {
+	struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)p;
+
 	return !ptr->data;
 }
 
-__bpf_kfunc bool bpf_dynptr_is_rdonly(struct bpf_dynptr_kern *ptr)
+__bpf_kfunc bool bpf_dynptr_is_rdonly(const struct bpf_dynptr *p)
 {
+	struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)p;
+
 	if (!ptr->data)
 		return false;
 
 	return __bpf_dynptr_is_rdonly(ptr);
 }
 
-__bpf_kfunc __u32 bpf_dynptr_size(const struct bpf_dynptr_kern *ptr)
+__bpf_kfunc __u32 bpf_dynptr_size(const struct bpf_dynptr *p)
 {
+	struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)p;
+
 	if (!ptr->data)
 		return -EINVAL;
 
 	return __bpf_dynptr_size(ptr);
 }
 
-__bpf_kfunc int bpf_dynptr_clone(struct bpf_dynptr_kern *ptr,
-				 struct bpf_dynptr_kern *clone__uninit)
+__bpf_kfunc int bpf_dynptr_clone(const struct bpf_dynptr *p,
+				 struct bpf_dynptr *clone__uninit)
 {
+	struct bpf_dynptr_kern *clone = (struct bpf_dynptr_kern *)clone__uninit;
+	struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)p;
+
 	if (!ptr->data) {
-		bpf_dynptr_set_null(clone__uninit);
+		bpf_dynptr_set_null(clone);
 		return -EINVAL;
 	}
 
-	*clone__uninit = *ptr;
+	*clone = *ptr;
 
 	return 0;
 }
@@ -2550,9 +2758,9 @@ __bpf_kfunc void *bpf_cast_to_kern_ctx(void *obj)
 	return obj;
 }
 
-__bpf_kfunc void *bpf_rdonly_cast(void *obj__ign, u32 btf_id__k)
+__bpf_kfunc void *bpf_rdonly_cast(const void *obj__ign, u32 btf_id__k)
 {
-	return obj__ign;
+	return (void *)obj__ign;
 }
 
 __bpf_kfunc void bpf_rcu_read_lock(void)
@@ -2565,15 +2773,690 @@ __bpf_kfunc void bpf_rcu_read_unlock(void)
 	rcu_read_unlock();
 }
 
-__diag_pop();
+struct bpf_throw_ctx {
+	struct bpf_prog_aux *aux;
+	u64 sp;
+	u64 bp;
+	int cnt;
+};
 
-BTF_SET8_START(generic_btf_ids)
-#ifdef CONFIG_KEXEC_CORE
+static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
+{
+	struct bpf_throw_ctx *ctx = cookie;
+	struct bpf_prog *prog;
+
+	/*
+	 * The RCU read lock is held to safely traverse the latch tree, but we
+	 * don't need its protection when accessing the prog, since it has an
+	 * active stack frame on the current stack trace, and won't disappear.
+	 */
+	rcu_read_lock();
+	prog = bpf_prog_ksym_find(ip);
+	rcu_read_unlock();
+	if (!prog)
+		return !ctx->cnt;
+	ctx->cnt++;
+	if (bpf_is_subprog(prog))
+		return true;
+	ctx->aux = prog->aux;
+	ctx->sp = sp;
+	ctx->bp = bp;
+	return false;
+}
+
+__bpf_kfunc void bpf_throw(u64 cookie)
+{
+	struct bpf_throw_ctx ctx = {};
+
+	arch_bpf_stack_walk(bpf_stack_walker, &ctx);
+	WARN_ON_ONCE(!ctx.aux);
+	if (ctx.aux)
+		WARN_ON_ONCE(!ctx.aux->exception_boundary);
+	WARN_ON_ONCE(!ctx.bp);
+	WARN_ON_ONCE(!ctx.cnt);
+	/* Prevent KASAN false positives for CONFIG_KASAN_STACK by unpoisoning
+	 * deeper stack depths than ctx.sp as we do not return from bpf_throw,
+	 * which skips compiler generated instrumentation to do the same.
+	 */
+	kasan_unpoison_task_stack_below((void *)(long)ctx.sp);
+	ctx.aux->bpf_exception_cb(cookie, ctx.sp, ctx.bp, 0, 0);
+	WARN(1, "A call to BPF exception callback should never return\n");
+}
+
+__bpf_kfunc int bpf_wq_init(struct bpf_wq *wq, void *p__map, unsigned int flags)
+{
+	struct bpf_async_kern *async = (struct bpf_async_kern *)wq;
+	struct bpf_map *map = p__map;
+
+	BUILD_BUG_ON(sizeof(struct bpf_async_kern) > sizeof(struct bpf_wq));
+	BUILD_BUG_ON(__alignof__(struct bpf_async_kern) != __alignof__(struct bpf_wq));
+
+	if (flags)
+		return -EINVAL;
+
+	return __bpf_async_init(async, map, flags, BPF_ASYNC_TYPE_WQ);
+}
+
+__bpf_kfunc int bpf_wq_start(struct bpf_wq *wq, unsigned int flags)
+{
+	struct bpf_async_kern *async = (struct bpf_async_kern *)wq;
+	struct bpf_work *w;
+
+	if (in_nmi())
+		return -EOPNOTSUPP;
+	if (flags)
+		return -EINVAL;
+	w = READ_ONCE(async->work);
+	if (!w || !READ_ONCE(w->cb.prog))
+		return -EINVAL;
+
+	schedule_work(&w->work);
+	return 0;
+}
+
+__bpf_kfunc int bpf_wq_set_callback_impl(struct bpf_wq *wq,
+					 int (callback_fn)(void *map, int *key, void *value),
+					 unsigned int flags,
+					 void *aux__ign)
+{
+	struct bpf_prog_aux *aux = (struct bpf_prog_aux *)aux__ign;
+	struct bpf_async_kern *async = (struct bpf_async_kern *)wq;
+
+	if (flags)
+		return -EINVAL;
+
+	return __bpf_async_set_callback(async, callback_fn, aux, flags, BPF_ASYNC_TYPE_WQ);
+}
+
+__bpf_kfunc void bpf_preempt_disable(void)
+{
+	preempt_disable();
+}
+
+__bpf_kfunc void bpf_preempt_enable(void)
+{
+	preempt_enable();
+}
+
+struct bpf_iter_bits {
+	__u64 __opaque[2];
+} __aligned(8);
+
+#define BITS_ITER_NR_WORDS_MAX 511
+
+struct bpf_iter_bits_kern {
+	union {
+		__u64 *bits;
+		__u64 bits_copy;
+	};
+	int nr_bits;
+	int bit;
+} __aligned(8);
+
+/* On 64-bit hosts, unsigned long and u64 have the same size, so passing
+ * a u64 pointer and an unsigned long pointer to find_next_bit() will
+ * return the same result, as both point to the same 8-byte area.
+ *
+ * For 32-bit little-endian hosts, using a u64 pointer or unsigned long
+ * pointer also makes no difference. This is because the first iterated
+ * unsigned long is composed of bits 0-31 of the u64 and the second unsigned
+ * long is composed of bits 32-63 of the u64.
+ *
+ * However, for 32-bit big-endian hosts, this is not the case. The first
+ * iterated unsigned long will be bits 32-63 of the u64, so swap these two
+ * ulong values within the u64.
+ */
+static void swap_ulong_in_u64(u64 *bits, unsigned int nr)
+{
+#if (BITS_PER_LONG == 32) && defined(__BIG_ENDIAN)
+	unsigned int i;
+
+	for (i = 0; i < nr; i++)
+		bits[i] = (bits[i] >> 32) | ((u64)(u32)bits[i] << 32);
+#endif
+}
+
+/**
+ * bpf_iter_bits_new() - Initialize a new bits iterator for a given memory area
+ * @it: The new bpf_iter_bits to be created
+ * @unsafe_ptr__ign: A pointer pointing to a memory area to be iterated over
+ * @nr_words: The size of the specified memory area, measured in 8-byte units.
+ * The maximum value of @nr_words is @BITS_ITER_NR_WORDS_MAX. This limit may be
+ * further reduced by the BPF memory allocator implementation.
+ *
+ * This function initializes a new bpf_iter_bits structure for iterating over
+ * a memory area which is specified by the @unsafe_ptr__ign and @nr_words. It
+ * copies the data of the memory area to the newly created bpf_iter_bits @it for
+ * subsequent iteration operations.
+ *
+ * On success, 0 is returned. On failure, ERR is returned.
+ */
+__bpf_kfunc int
+bpf_iter_bits_new(struct bpf_iter_bits *it, const u64 *unsafe_ptr__ign, u32 nr_words)
+{
+	struct bpf_iter_bits_kern *kit = (void *)it;
+	u32 nr_bytes = nr_words * sizeof(u64);
+	u32 nr_bits = BYTES_TO_BITS(nr_bytes);
+	int err;
+
+	BUILD_BUG_ON(sizeof(struct bpf_iter_bits_kern) != sizeof(struct bpf_iter_bits));
+	BUILD_BUG_ON(__alignof__(struct bpf_iter_bits_kern) !=
+		     __alignof__(struct bpf_iter_bits));
+
+	kit->nr_bits = 0;
+	kit->bits_copy = 0;
+	kit->bit = -1;
+
+	if (!unsafe_ptr__ign || !nr_words)
+		return -EINVAL;
+	if (nr_words > BITS_ITER_NR_WORDS_MAX)
+		return -E2BIG;
+
+	/* Optimization for u64 mask */
+	if (nr_bits == 64) {
+		err = bpf_probe_read_kernel_common(&kit->bits_copy, nr_bytes, unsafe_ptr__ign);
+		if (err)
+			return -EFAULT;
+
+		swap_ulong_in_u64(&kit->bits_copy, nr_words);
+
+		kit->nr_bits = nr_bits;
+		return 0;
+	}
+
+	if (bpf_mem_alloc_check_size(false, nr_bytes))
+		return -E2BIG;
+
+	/* Fallback to memalloc */
+	kit->bits = bpf_mem_alloc(&bpf_global_ma, nr_bytes);
+	if (!kit->bits)
+		return -ENOMEM;
+
+	err = bpf_probe_read_kernel_common(kit->bits, nr_bytes, unsafe_ptr__ign);
+	if (err) {
+		bpf_mem_free(&bpf_global_ma, kit->bits);
+		return err;
+	}
+
+	swap_ulong_in_u64(kit->bits, nr_words);
+
+	kit->nr_bits = nr_bits;
+	return 0;
+}
+
+/**
+ * bpf_iter_bits_next() - Get the next bit in a bpf_iter_bits
+ * @it: The bpf_iter_bits to be checked
+ *
+ * This function returns a pointer to a number representing the value of the
+ * next bit in the bits.
+ *
+ * If there are no further bits available, it returns NULL.
+ */
+__bpf_kfunc int *bpf_iter_bits_next(struct bpf_iter_bits *it)
+{
+	struct bpf_iter_bits_kern *kit = (void *)it;
+	int bit = kit->bit, nr_bits = kit->nr_bits;
+	const void *bits;
+
+	if (!nr_bits || bit >= nr_bits)
+		return NULL;
+
+	bits = nr_bits == 64 ? &kit->bits_copy : kit->bits;
+	bit = find_next_bit(bits, nr_bits, bit + 1);
+	if (bit >= nr_bits) {
+		kit->bit = bit;
+		return NULL;
+	}
+
+	kit->bit = bit;
+	return &kit->bit;
+}
+
+/**
+ * bpf_iter_bits_destroy() - Destroy a bpf_iter_bits
+ * @it: The bpf_iter_bits to be destroyed
+ *
+ * Destroy the resource associated with the bpf_iter_bits.
+ */
+__bpf_kfunc void bpf_iter_bits_destroy(struct bpf_iter_bits *it)
+{
+	struct bpf_iter_bits_kern *kit = (void *)it;
+
+	if (kit->nr_bits <= 64)
+		return;
+	bpf_mem_free(&bpf_global_ma, kit->bits);
+}
+
+/**
+ * bpf_copy_from_user_str() - Copy a string from an unsafe user address
+ * @dst:             Destination address, in kernel space.  This buffer must be
+ *                   at least @dst__sz bytes long.
+ * @dst__sz:         Maximum number of bytes to copy, includes the trailing NUL.
+ * @unsafe_ptr__ign: Source address, in user space.
+ * @flags:           The only supported flag is BPF_F_PAD_ZEROS
+ *
+ * Copies a NUL-terminated string from userspace to BPF space. If user string is
+ * too long this will still ensure zero termination in the dst buffer unless
+ * buffer size is 0.
+ *
+ * If BPF_F_PAD_ZEROS flag is set, memset the tail of @dst to 0 on success and
+ * memset all of @dst on failure.
+ */
+__bpf_kfunc int bpf_copy_from_user_str(void *dst, u32 dst__sz, const void __user *unsafe_ptr__ign, u64 flags)
+{
+	int ret;
+
+	if (unlikely(flags & ~BPF_F_PAD_ZEROS))
+		return -EINVAL;
+
+	if (unlikely(!dst__sz))
+		return 0;
+
+	ret = strncpy_from_user(dst, unsafe_ptr__ign, dst__sz - 1);
+	if (ret < 0) {
+		if (flags & BPF_F_PAD_ZEROS)
+			memset((char *)dst, 0, dst__sz);
+
+		return ret;
+	}
+
+	if (flags & BPF_F_PAD_ZEROS)
+		memset((char *)dst + ret, 0, dst__sz - ret);
+	else
+		((char *)dst)[ret] = '\0';
+
+	return ret + 1;
+}
+
+/*
+ * Kfuncs for string operations.
+ *
+ * Since strings are not necessarily %NUL-terminated, we cannot directly call
+ * in-kernel implementations. Instead, we open-code the implementations using
+ * __get_kernel_nofault instead of plain dereference to make them safe.
+ */
+
+/**
+ * bpf_strcmp - Compare two strings
+ * @s1__ign: One string
+ * @s2__ign: Another string
+ *
+ * Return:
+ * * %0       - Strings are equal
+ * * %-1      - @s1__ign is smaller
+ * * %1       - @s2__ign is smaller
+ * * %-EFAULT - Cannot read one of the strings
+ * * %-E2BIG  - One of strings is too large
+ * * %-ERANGE - One of strings is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strcmp(const char *s1__ign, const char *s2__ign)
+{
+	char c1, c2;
+	int i;
+
+	if (!copy_from_kernel_nofault_allowed(s1__ign, 1) ||
+	    !copy_from_kernel_nofault_allowed(s2__ign, 1)) {
+		return -ERANGE;
+	}
+
+	guard(pagefault)();
+	for (i = 0; i < XATTR_SIZE_MAX; i++) {
+		__get_kernel_nofault(&c1, s1__ign, char, err_out);
+		__get_kernel_nofault(&c2, s2__ign, char, err_out);
+		if (c1 != c2)
+			return c1 < c2 ? -1 : 1;
+		if (c1 == '\0')
+			return 0;
+		s1__ign++;
+		s2__ign++;
+	}
+	return -E2BIG;
+err_out:
+	return -EFAULT;
+}
+
+/**
+ * bpf_strnchr - Find a character in a length limited string
+ * @s__ign: The string to be searched
+ * @count: The number of characters to be searched
+ * @c: The character to search for
+ *
+ * Note that the %NUL-terminator is considered part of the string, and can
+ * be searched for.
+ *
+ * Return:
+ * * >=0      - Index of the first occurrence of @c within @s__ign
+ * * %-ENOENT - @c not found in the first @count characters of @s__ign
+ * * %-EFAULT - Cannot read @s__ign
+ * * %-E2BIG  - @s__ign is too large
+ * * %-ERANGE - @s__ign is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strnchr(const char *s__ign, size_t count, char c)
+{
+	char sc;
+	int i;
+
+	if (!copy_from_kernel_nofault_allowed(s__ign, 1))
+		return -ERANGE;
+
+	guard(pagefault)();
+	for (i = 0; i < count && i < XATTR_SIZE_MAX; i++) {
+		__get_kernel_nofault(&sc, s__ign, char, err_out);
+		if (sc == c)
+			return i;
+		if (sc == '\0')
+			return -ENOENT;
+		s__ign++;
+	}
+	return i == XATTR_SIZE_MAX ? -E2BIG : -ENOENT;
+err_out:
+	return -EFAULT;
+}
+
+/**
+ * bpf_strchr - Find the first occurrence of a character in a string
+ * @s__ign: The string to be searched
+ * @c: The character to search for
+ *
+ * Note that the %NUL-terminator is considered part of the string, and can
+ * be searched for.
+ *
+ * Return:
+ * * >=0      - The index of the first occurrence of @c within @s__ign
+ * * %-ENOENT - @c not found in @s__ign
+ * * %-EFAULT - Cannot read @s__ign
+ * * %-E2BIG  - @s__ign is too large
+ * * %-ERANGE - @s__ign is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strchr(const char *s__ign, char c)
+{
+	return bpf_strnchr(s__ign, XATTR_SIZE_MAX, c);
+}
+
+/**
+ * bpf_strchrnul - Find and return a character in a string, or end of string
+ * @s__ign: The string to be searched
+ * @c: The character to search for
+ *
+ * Return:
+ * * >=0      - Index of the first occurrence of @c within @s__ign or index of
+ *              the null byte at the end of @s__ign when @c is not found
+ * * %-EFAULT - Cannot read @s__ign
+ * * %-E2BIG  - @s__ign is too large
+ * * %-ERANGE - @s__ign is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strchrnul(const char *s__ign, char c)
+{
+	char sc;
+	int i;
+
+	if (!copy_from_kernel_nofault_allowed(s__ign, 1))
+		return -ERANGE;
+
+	guard(pagefault)();
+	for (i = 0; i < XATTR_SIZE_MAX; i++) {
+		__get_kernel_nofault(&sc, s__ign, char, err_out);
+		if (sc == '\0' || sc == c)
+			return i;
+		s__ign++;
+	}
+	return -E2BIG;
+err_out:
+	return -EFAULT;
+}
+
+/**
+ * bpf_strrchr - Find the last occurrence of a character in a string
+ * @s__ign: The string to be searched
+ * @c: The character to search for
+ *
+ * Return:
+ * * >=0      - Index of the last occurrence of @c within @s__ign
+ * * %-ENOENT - @c not found in @s__ign
+ * * %-EFAULT - Cannot read @s__ign
+ * * %-E2BIG  - @s__ign is too large
+ * * %-ERANGE - @s__ign is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strrchr(const char *s__ign, int c)
+{
+	char sc;
+	int i, last = -ENOENT;
+
+	if (!copy_from_kernel_nofault_allowed(s__ign, 1))
+		return -ERANGE;
+
+	guard(pagefault)();
+	for (i = 0; i < XATTR_SIZE_MAX; i++) {
+		__get_kernel_nofault(&sc, s__ign, char, err_out);
+		if (sc == c)
+			last = i;
+		if (sc == '\0')
+			return last;
+		s__ign++;
+	}
+	return -E2BIG;
+err_out:
+	return -EFAULT;
+}
+
+/**
+ * bpf_strnlen - Calculate the length of a length-limited string
+ * @s__ign: The string
+ * @count: The maximum number of characters to count
+ *
+ * Return:
+ * * >=0      - The length of @s__ign
+ * * %-EFAULT - Cannot read @s__ign
+ * * %-E2BIG  - @s__ign is too large
+ * * %-ERANGE - @s__ign is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strnlen(const char *s__ign, size_t count)
+{
+	char c;
+	int i;
+
+	if (!copy_from_kernel_nofault_allowed(s__ign, 1))
+		return -ERANGE;
+
+	guard(pagefault)();
+	for (i = 0; i < count && i < XATTR_SIZE_MAX; i++) {
+		__get_kernel_nofault(&c, s__ign, char, err_out);
+		if (c == '\0')
+			return i;
+		s__ign++;
+	}
+	return i == XATTR_SIZE_MAX ? -E2BIG : i;
+err_out:
+	return -EFAULT;
+}
+
+/**
+ * bpf_strlen - Calculate the length of a string
+ * @s__ign: The string
+ *
+ * Return:
+ * * >=0      - The length of @s__ign
+ * * %-EFAULT - Cannot read @s__ign
+ * * %-E2BIG  - @s__ign is too large
+ * * %-ERANGE - @s__ign is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strlen(const char *s__ign)
+{
+	return bpf_strnlen(s__ign, XATTR_SIZE_MAX);
+}
+
+/**
+ * bpf_strspn - Calculate the length of the initial substring of @s__ign which
+ *              only contains letters in @accept__ign
+ * @s__ign: The string to be searched
+ * @accept__ign: The string to search for
+ *
+ * Return:
+ * * >=0      - The length of the initial substring of @s__ign which only
+ *              contains letters from @accept__ign
+ * * %-EFAULT - Cannot read one of the strings
+ * * %-E2BIG  - One of the strings is too large
+ * * %-ERANGE - One of the strings is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strspn(const char *s__ign, const char *accept__ign)
+{
+	char cs, ca;
+	int i, j;
+
+	if (!copy_from_kernel_nofault_allowed(s__ign, 1) ||
+	    !copy_from_kernel_nofault_allowed(accept__ign, 1)) {
+		return -ERANGE;
+	}
+
+	guard(pagefault)();
+	for (i = 0; i < XATTR_SIZE_MAX; i++) {
+		__get_kernel_nofault(&cs, s__ign, char, err_out);
+		if (cs == '\0')
+			return i;
+		for (j = 0; j < XATTR_SIZE_MAX; j++) {
+			__get_kernel_nofault(&ca, accept__ign + j, char, err_out);
+			if (cs == ca || ca == '\0')
+				break;
+		}
+		if (j == XATTR_SIZE_MAX)
+			return -E2BIG;
+		if (ca == '\0')
+			return i;
+		s__ign++;
+	}
+	return -E2BIG;
+err_out:
+	return -EFAULT;
+}
+
+/**
+ * bpf_strcspn - Calculate the length of the initial substring of @s__ign which
+ *               does not contain letters in @reject__ign
+ * @s__ign: The string to be searched
+ * @reject__ign: The string to search for
+ *
+ * Return:
+ * * >=0      - The length of the initial substring of @s__ign which does not
+ *              contain letters from @reject__ign
+ * * %-EFAULT - Cannot read one of the strings
+ * * %-E2BIG  - One of the strings is too large
+ * * %-ERANGE - One of the strings is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strcspn(const char *s__ign, const char *reject__ign)
+{
+	char cs, cr;
+	int i, j;
+
+	if (!copy_from_kernel_nofault_allowed(s__ign, 1) ||
+	    !copy_from_kernel_nofault_allowed(reject__ign, 1)) {
+		return -ERANGE;
+	}
+
+	guard(pagefault)();
+	for (i = 0; i < XATTR_SIZE_MAX; i++) {
+		__get_kernel_nofault(&cs, s__ign, char, err_out);
+		if (cs == '\0')
+			return i;
+		for (j = 0; j < XATTR_SIZE_MAX; j++) {
+			__get_kernel_nofault(&cr, reject__ign + j, char, err_out);
+			if (cs == cr || cr == '\0')
+				break;
+		}
+		if (j == XATTR_SIZE_MAX)
+			return -E2BIG;
+		if (cr != '\0')
+			return i;
+		s__ign++;
+	}
+	return -E2BIG;
+err_out:
+	return -EFAULT;
+}
+
+/**
+ * bpf_strnstr - Find the first substring in a length-limited string
+ * @s1__ign: The string to be searched
+ * @s2__ign: The string to search for
+ * @len: the maximum number of characters to search
+ *
+ * Return:
+ * * >=0      - Index of the first character of the first occurrence of @s2__ign
+ *              within the first @len characters of @s1__ign
+ * * %-ENOENT - @s2__ign not found in the first @len characters of @s1__ign
+ * * %-EFAULT - Cannot read one of the strings
+ * * %-E2BIG  - One of the strings is too large
+ * * %-ERANGE - One of the strings is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strnstr(const char *s1__ign, const char *s2__ign, size_t len)
+{
+	char c1, c2;
+	int i, j;
+
+	if (!copy_from_kernel_nofault_allowed(s1__ign, 1) ||
+	    !copy_from_kernel_nofault_allowed(s2__ign, 1)) {
+		return -ERANGE;
+	}
+
+	guard(pagefault)();
+	for (i = 0; i < XATTR_SIZE_MAX; i++) {
+		for (j = 0; i + j <= len && j < XATTR_SIZE_MAX; j++) {
+			__get_kernel_nofault(&c2, s2__ign + j, char, err_out);
+			if (c2 == '\0')
+				return i;
+			/*
+			 * We allow reading an extra byte from s2 (note the
+			 * `i + j <= len` above) to cover the case when s2 is
+			 * a suffix of the first len chars of s1.
+			 */
+			if (i + j == len)
+				break;
+			__get_kernel_nofault(&c1, s1__ign + j, char, err_out);
+			if (c1 == '\0')
+				return -ENOENT;
+			if (c1 != c2)
+				break;
+		}
+		if (j == XATTR_SIZE_MAX)
+			return -E2BIG;
+		if (i + j == len)
+			return -ENOENT;
+		s1__ign++;
+	}
+	return -E2BIG;
+err_out:
+	return -EFAULT;
+}
+
+/**
+ * bpf_strstr - Find the first substring in a string
+ * @s1__ign: The string to be searched
+ * @s2__ign: The string to search for
+ *
+ * Return:
+ * * >=0      - Index of the first character of the first occurrence of @s2__ign
+ *              within @s1__ign
+ * * %-ENOENT - @s2__ign is not a substring of @s1__ign
+ * * %-EFAULT - Cannot read one of the strings
+ * * %-E2BIG  - One of the strings is too large
+ * * %-ERANGE - One of the strings is outside of kernel address space
+ */
+__bpf_kfunc int bpf_strstr(const char *s1__ign, const char *s2__ign)
+{
+	return bpf_strnstr(s1__ign, s2__ign, XATTR_SIZE_MAX);
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(generic_btf_ids)
+#ifdef CONFIG_CRASH_DUMP
 BTF_ID_FLAGS(func, crash_kexec, KF_DESTRUCTIVE)
 #endif
 BTF_ID_FLAGS(func, bpf_obj_new_impl, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_percpu_obj_new_impl, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_obj_drop_impl, KF_RELEASE)
-BTF_ID_FLAGS(func, bpf_refcount_acquire_impl, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_percpu_obj_drop_impl, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_refcount_acquire_impl, KF_ACQUIRE | KF_RET_NULL | KF_RCU)
 BTF_ID_FLAGS(func, bpf_list_push_front_impl)
 BTF_ID_FLAGS(func, bpf_list_push_back_impl)
 BTF_ID_FLAGS(func, bpf_list_pop_front, KF_ACQUIRE | KF_RET_NULL)
@@ -2590,9 +3473,11 @@ BTF_ID_FLAGS(func, bpf_cgroup_release, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_cgroup_ancestor, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cgroup_from_id, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_task_under_cgroup, KF_RCU)
+BTF_ID_FLAGS(func, bpf_task_get_cgroup1, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
 #endif
 BTF_ID_FLAGS(func, bpf_task_from_pid, KF_ACQUIRE | KF_RET_NULL)
-BTF_SET8_END(generic_btf_ids)
+BTF_ID_FLAGS(func, bpf_throw)
+BTF_KFUNCS_END(generic_btf_ids)
 
 static const struct btf_kfunc_id_set generic_kfunc_set = {
 	.owner = THIS_MODULE,
@@ -2608,7 +3493,7 @@ BTF_ID(struct, cgroup)
 BTF_ID(func, bpf_cgroup_release_dtor)
 #endif
 
-BTF_SET8_START(common_btf_ids)
+BTF_KFUNCS_START(common_btf_ids)
 BTF_ID_FLAGS(func, bpf_cast_to_kern_ctx)
 BTF_ID_FLAGS(func, bpf_rdonly_cast)
 BTF_ID_FLAGS(func, bpf_rcu_read_lock)
@@ -2618,17 +3503,52 @@ BTF_ID_FLAGS(func, bpf_dynptr_slice_rdwr, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_iter_num_new, KF_ITER_NEW)
 BTF_ID_FLAGS(func, bpf_iter_num_next, KF_ITER_NEXT | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_iter_num_destroy, KF_ITER_DESTROY)
+BTF_ID_FLAGS(func, bpf_iter_task_vma_new, KF_ITER_NEW | KF_RCU)
+BTF_ID_FLAGS(func, bpf_iter_task_vma_next, KF_ITER_NEXT | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_iter_task_vma_destroy, KF_ITER_DESTROY)
+#ifdef CONFIG_CGROUPS
+BTF_ID_FLAGS(func, bpf_iter_css_task_new, KF_ITER_NEW | KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, bpf_iter_css_task_next, KF_ITER_NEXT | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_iter_css_task_destroy, KF_ITER_DESTROY)
+BTF_ID_FLAGS(func, bpf_iter_css_new, KF_ITER_NEW | KF_TRUSTED_ARGS | KF_RCU_PROTECTED)
+BTF_ID_FLAGS(func, bpf_iter_css_next, KF_ITER_NEXT | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_iter_css_destroy, KF_ITER_DESTROY)
+#endif
+BTF_ID_FLAGS(func, bpf_iter_task_new, KF_ITER_NEW | KF_TRUSTED_ARGS | KF_RCU_PROTECTED)
+BTF_ID_FLAGS(func, bpf_iter_task_next, KF_ITER_NEXT | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_iter_task_destroy, KF_ITER_DESTROY)
 BTF_ID_FLAGS(func, bpf_dynptr_adjust)
 BTF_ID_FLAGS(func, bpf_dynptr_is_null)
 BTF_ID_FLAGS(func, bpf_dynptr_is_rdonly)
 BTF_ID_FLAGS(func, bpf_dynptr_size)
 BTF_ID_FLAGS(func, bpf_dynptr_clone)
+BTF_ID_FLAGS(func, bpf_modify_return_test_tp)
+BTF_ID_FLAGS(func, bpf_wq_init)
+BTF_ID_FLAGS(func, bpf_wq_set_callback_impl)
+BTF_ID_FLAGS(func, bpf_wq_start)
+BTF_ID_FLAGS(func, bpf_preempt_disable)
+BTF_ID_FLAGS(func, bpf_preempt_enable)
+BTF_ID_FLAGS(func, bpf_iter_bits_new, KF_ITER_NEW)
+BTF_ID_FLAGS(func, bpf_iter_bits_next, KF_ITER_NEXT | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_iter_bits_destroy, KF_ITER_DESTROY)
+BTF_ID_FLAGS(func, bpf_copy_from_user_str, KF_SLEEPABLE)
 #ifdef CONFIG_DMA_SHARED_BUFFER
 BTF_ID_FLAGS(func, bpf_iter_dmabuf_new, KF_ITER_NEW | KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_iter_dmabuf_next, KF_ITER_NEXT | KF_RET_NULL | KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_iter_dmabuf_destroy, KF_ITER_DESTROY | KF_SLEEPABLE)
 #endif
-BTF_SET8_END(common_btf_ids)
+BTF_ID_FLAGS(func, bpf_strcmp);
+BTF_ID_FLAGS(func, bpf_strchr);
+BTF_ID_FLAGS(func, bpf_strchrnul);
+BTF_ID_FLAGS(func, bpf_strnchr);
+BTF_ID_FLAGS(func, bpf_strrchr);
+BTF_ID_FLAGS(func, bpf_strlen);
+BTF_ID_FLAGS(func, bpf_strnlen);
+BTF_ID_FLAGS(func, bpf_strspn);
+BTF_ID_FLAGS(func, bpf_strcspn);
+BTF_ID_FLAGS(func, bpf_strstr);
+BTF_ID_FLAGS(func, bpf_strnstr);
+BTF_KFUNCS_END(common_btf_ids)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {
 	.owner = THIS_MODULE,
@@ -2653,7 +3573,10 @@ static int __init kfunc_init(void)
 
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &generic_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &generic_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &generic_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_CGROUP_SKB, &generic_kfunc_set);
 	ret = ret ?: register_btf_id_dtor_kfuncs(generic_dtors,
 						  ARRAY_SIZE(generic_dtors),
 						  THIS_MODULE);
@@ -2661,3 +3584,24 @@ static int __init kfunc_init(void)
 }
 
 late_initcall(kfunc_init);
+
+/* Get a pointer to dynptr data up to len bytes for read only access. If
+ * the dynptr doesn't have continuous data up to len bytes, return NULL.
+ */
+const void *__bpf_dynptr_data(const struct bpf_dynptr_kern *ptr, u32 len)
+{
+	const struct bpf_dynptr *p = (struct bpf_dynptr *)ptr;
+
+	return bpf_dynptr_slice(p, 0, NULL, len);
+}
+
+/* Get a pointer to dynptr data up to len bytes for read write access. If
+ * the dynptr doesn't have continuous data up to len bytes, or the dynptr
+ * is read only, return NULL.
+ */
+void *__bpf_dynptr_data_rw(const struct bpf_dynptr_kern *ptr, u32 len)
+{
+	if (__bpf_dynptr_is_rdonly(ptr))
+		return NULL;
+	return (void *)__bpf_dynptr_data(ptr, len);
+}

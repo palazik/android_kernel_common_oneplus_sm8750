@@ -460,7 +460,8 @@ void __init padata_do_multithreaded(struct padata_mt_job *job)
 	struct padata_work my_work, *pw;
 	struct padata_mt_job_state ps;
 	LIST_HEAD(works);
-	int nworks;
+	int nworks, nid;
+	static atomic_t last_used_nid __initdata;
 
 	if (job->size == 0)
 		return;
@@ -502,7 +503,16 @@ void __init padata_do_multithreaded(struct padata_mt_job *job)
 		ps.chunk_size = 1U;
 
 	list_for_each_entry(pw, &works, pw_list)
-		queue_work(system_unbound_wq, &pw->pw_work);
+		if (job->numa_aware) {
+			int old_node = atomic_read(&last_used_nid);
+
+			do {
+				nid = next_node_in(old_node, node_states[N_CPU]);
+			} while (!atomic_try_cmpxchg(&last_used_nid, &old_node, nid));
+			queue_work_node(nid, system_unbound_wq, &pw->pw_work);
+		} else {
+			queue_work(system_unbound_wq, &pw->pw_work);
+		}
 
 	/* Use the current thread, which saves starting a workqueue worker. */
 	padata_work_init(&my_work, padata_mt_helper, &ps, PADATA_WORK_ONSTACK);
@@ -745,22 +755,32 @@ EXPORT_SYMBOL(padata_set_cpumask);
 
 static int __padata_add_cpu(struct padata_instance *pinst, int cpu)
 {
-	int err = padata_replace(pinst);
+	int err = 0;
 
-	if (padata_validate_cpumask(pinst, pinst->cpumask.pcpu) &&
-	    padata_validate_cpumask(pinst, pinst->cpumask.cbcpu))
-		__padata_start(pinst);
+	if (cpumask_test_cpu(cpu, cpu_online_mask)) {
+		err = padata_replace(pinst);
+
+		if (padata_validate_cpumask(pinst, pinst->cpumask.pcpu) &&
+		    padata_validate_cpumask(pinst, pinst->cpumask.cbcpu))
+			__padata_start(pinst);
+	}
 
 	return err;
 }
 
 static int __padata_remove_cpu(struct padata_instance *pinst, int cpu)
 {
-	if (!padata_validate_cpumask(pinst, pinst->cpumask.pcpu) ||
-	    !padata_validate_cpumask(pinst, pinst->cpumask.cbcpu))
-		__padata_stop(pinst);
+	int err = 0;
 
-	return padata_replace(pinst);
+	if (!cpumask_test_cpu(cpu, cpu_online_mask)) {
+		if (!padata_validate_cpumask(pinst, pinst->cpumask.pcpu) ||
+		    !padata_validate_cpumask(pinst, pinst->cpumask.cbcpu))
+			__padata_stop(pinst);
+
+		err = padata_replace(pinst);
+	}
+
+	return err;
 }
 
 static inline int pinst_has_cpu(struct padata_instance *pinst, int cpu)

@@ -4,12 +4,38 @@
 #define __ARM64_KVM_HYPEVENTS_H_
 
 #ifdef __KVM_NVHE_HYPERVISOR__
-#include <nvhe/trace/trace.h>
+#include <nvhe/trace.h>
 #endif
 
 /*
  * Hypervisor events definitions.
  */
+
+#ifdef CONFIG_PKVM_FTRACE
+HYP_EVENT(func,
+	HE_PROTO(unsigned long ip, unsigned long parent),
+	HE_STRUCT(
+		he_field(unsigned long, ip)
+		he_field(unsigned long, parent)
+	),
+	HE_ASSIGN(
+		__entry->ip = ip;
+		__entry->parent = parent;
+	),
+	HE_PRINTK("    %ps <- %ps", (void *)__entry->ip, (void *)__entry->parent)
+);
+
+HYP_EVENT(func_ret,
+	HE_PROTO(unsigned long ip),
+	HE_STRUCT(
+		he_field(unsigned long, ip)
+	),
+	HE_ASSIGN(
+		__entry->ip = ip;
+	),
+	HE_PRINTK("%ps", (void *)__entry->ip)
+);
+#endif
 
 HYP_EVENT(hyp_enter,
 	HE_PROTO(void),
@@ -73,7 +99,7 @@ HYP_EVENT(host_mem_abort,
 );
 
 HYP_EVENT(__hyp_printk,
-	HE_PROTO(const char *fmt, u64 a, u64 b, u64 c, u64 d),
+	HE_PROTO(u8 fmt_id, u64 a, u64 b, u64 c, u64 d),
 	HE_STRUCT(
 		he_field(u8, fmt_id)
 		he_field(u64, a)
@@ -82,7 +108,7 @@ HYP_EVENT(__hyp_printk,
 		he_field(u64, d)
 	),
 	HE_ASSIGN(
-		__entry->fmt_id = hyp_printk_fmt_to_id(fmt);
+		__entry->fmt_id = fmt_id;
 		__entry->a = a;
 		__entry->b = b;
 		__entry->c = c;
@@ -90,31 +116,6 @@ HYP_EVENT(__hyp_printk,
 	),
 	HE_PRINTK_UNKNOWN_FMT(hyp_printk_fmt_from_id(__entry->fmt_id),
 		__entry->a, __entry->b, __entry->c, __entry->d)
-);
-
-HYP_EVENT(host_ffa_call,
-	HE_PROTO(u64 func_id, u64 res_a1, u64 res_a2, u64 res_a3, u64 res_a4, int handled, int err),
-	HE_STRUCT(
-		he_field(u64, func_id)
-		he_field(u64, res_a1)
-		he_field(u64, res_a2)
-		he_field(u64, res_a3)
-		he_field(u64, res_a4)
-		he_field(int, handled)
-		he_field(int, err)
-	),
-	HE_ASSIGN(
-		__entry->func_id = func_id;
-		__entry->res_a1 = res_a1;
-		__entry->res_a2 = res_a2;
-		__entry->res_a3 = res_a3;
-		__entry->res_a4 = res_a4;
-		__entry->handled = handled;
-		__entry->err = err;
-		),
-	HE_PRINTK("ffa_func=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=%llx handled=%d err=%d",
-		  __entry->func_id, __entry->res_a1, __entry->res_a2,
-		  __entry->res_a3, __entry->res_a4, __entry->handled, __entry->err)
 );
 
 HYP_EVENT(psci_mem_protect,
@@ -130,6 +131,26 @@ HYP_EVENT(psci_mem_protect,
 	HE_PRINTK("count=%llu was=%llu", __entry->count, __entry->was)
 );
 
+HYP_EVENT(vcpu_illegal_trap,
+	HE_PROTO(u64 esr),
+	HE_STRUCT(
+		he_field(u64, esr)
+	),
+	HE_ASSIGN(
+		__entry->esr = esr;
+	),
+	HE_PRINTK("esr_el2=%llx", __entry->esr)
+);
+
+#ifdef CONFIG_PKVM_SELFTESTS
+HYP_EVENT(selftest,
+	  HE_PROTO(void),
+	  HE_STRUCT(),
+	  HE_ASSIGN(),
+	  HE_PRINTK(" ")
+);
+#endif
+
 HYP_EVENT(iommu_idmap,
 	HE_PROTO(u64 from, u64 to, int prot),
 	HE_STRUCT(
@@ -144,4 +165,33 @@ HYP_EVENT(iommu_idmap,
 	),
 	HE_PRINTK("from=0x%llx to=0x%llx prot=0x%x", __entry->from, __entry->to, __entry->prot)
 );
-#endif
+
+HYP_EVENT(iommu_idmap_complete,
+	HE_PROTO(bool map),
+	HE_STRUCT(
+		he_field(bool, map)
+	),
+	HE_ASSIGN(
+		__entry->map = map;
+	),
+	HE_PRINTK("map=%d", __entry->map)
+);
+
+HYP_EVENT(power_lock,
+	HE_PROTO(pid_t vm, u64 device, bool lock, int ret),
+	HE_STRUCT(
+		he_field(pid_t, vm)
+		he_field(u64, device)
+		he_field(bool, lock)
+		he_field(int, ret)
+	),
+	HE_ASSIGN(
+		__entry->vm = vm;
+		__entry->device = device;
+		__entry->lock = lock;
+		__entry->ret = ret;
+	),
+	HE_PRINTK("vm=%d device=0x%llx lock=%d ret=%d",
+		  __entry->vm, __entry->device, __entry->lock, __entry->ret)
+);
+#endif /* __ARM64_KVM_HYPEVENTS_H_ */

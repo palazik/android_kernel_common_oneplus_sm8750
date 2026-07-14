@@ -16,18 +16,28 @@ struct pkvm_module_section {
 typedef s32 kvm_nvhe_reloc_t;
 struct pkvm_module_ops;
 
+struct pkvm_el2_sym {
+	char			*name;
+	__le32			*rela_pos;
+	struct list_head	node;
+};
+
 struct pkvm_el2_module {
 	struct pkvm_module_section text;
 	struct pkvm_module_section bss;
 	struct pkvm_module_section rodata;
 	struct pkvm_module_section data;
 	struct pkvm_module_section event_ids;
+	struct pkvm_module_section patchable_function_entries;
 	struct pkvm_module_section sections;
+	void *hyp_va;
 	struct hyp_event *hyp_events;
+	struct hyp_printk_fmt *hyp_printk_fmts;
 	unsigned int nr_hyp_events;
+	unsigned int nr_hyp_printk_fmts;
 	kvm_nvhe_reloc_t *relocs;
 	struct list_head node;
-	unsigned long token;
+	struct list_head ext_symbols;
 	unsigned int nr_relocs;
 	int (*init)(const struct pkvm_module_ops *ops);
 };
@@ -82,8 +92,7 @@ struct plt_entry {
 
 static inline bool is_forbidden_offset_for_adrp(void *place)
 {
-	return IS_ENABLED(CONFIG_ARM64_ERRATUM_843419) &&
-	       cpus_have_const_cap(ARM64_WORKAROUND_843419) &&
+	return cpus_have_final_cap(ARM64_WORKAROUND_843419) &&
 	       ((u64)place & 0xfff) >= 0xff8;
 }
 

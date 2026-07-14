@@ -322,13 +322,12 @@ static int gzvm_drv_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int gzvm_drv_remove(struct platform_device *pdev)
+static void gzvm_drv_remove(struct platform_device *pdev)
 {
 	gzvm_drv_irqfd_exit();
 	misc_deregister(&gzvm_dev);
 	gzvm_drv_debug_exit();
 	gzvm_drv_sysfs_exit();
-	return 0;
 }
 
 static const struct of_device_id gzvm_of_match[] = {

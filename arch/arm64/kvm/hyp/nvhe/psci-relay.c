@@ -24,6 +24,7 @@ void __noreturn __host_enter(struct kvm_cpu_context *host_ctxt);
 
 /* Config options set by the host. */
 struct kvm_host_psci_config __ro_after_init kvm_host_psci_config;
+enum kvm_psci_mem_protect_mode __ro_after_init kvm_psci_mem_protect_mode;
 
 static void (*pkvm_psci_notifier)(enum pkvm_psci_notification, struct user_pt_regs *);
 static void pkvm_psci_notify(enum pkvm_psci_notification notif, struct kvm_cpu_context *host_ctxt)
@@ -234,7 +235,7 @@ asmlinkage void __noreturn __kvm_host_psci_cpu_entry(bool is_cpu_on)
 
 	__hyp_enter();
 
-	host_ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+	host_ctxt = host_data_ptr(host_ctxt);
 
 	if (is_cpu_on)
 		boot_args = this_cpu_ptr(&cpu_on_args);
@@ -247,8 +248,12 @@ asmlinkage void __noreturn __kvm_host_psci_cpu_entry(bool is_cpu_on)
 	if (is_cpu_on)
 		release_boot_args(boot_args);
 
+	write_sysreg_el1(INIT_SCTLR_EL1_MMU_OFF, SYS_SCTLR);
+	write_sysreg(INIT_PSTATE_EL1, SPSR_EL2);
+
 	pkvm_psci_notify(PKVM_PSCI_CPU_ENTRY, host_ctxt);
 	__hyp_exit();
+	hyp_ftrace_ret_flush();
 	__host_enter(host_ctxt);
 }
 
@@ -261,7 +266,12 @@ static u64 psci_mem_protect(s64 offset)
 
 	hyp_assert_lock_held(&mem_protect_lock);
 
-	if (!offset || kvm_host_psci_config.version < PSCI_VERSION(1, 1))
+	if (!offset)
+		return cnt;
+
+	if (kvm_psci_mem_protect_mode == KVM_PSCI_MEM_PROTECT_OFF ||
+	    (kvm_psci_mem_protect_mode != KVM_PSCI_MEM_PROTECT_FORCE &&
+		kvm_host_psci_config.version < PSCI_VERSION(1, 1)))
 		return cnt;
 
 	if (!cnt || !new)

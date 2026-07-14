@@ -720,7 +720,7 @@ static const struct net_device_ops eth_netdev_ops = {
 	.ndo_validate_addr	= eth_validate_addr,
 };
 
-static struct device_type gadget_type = {
+static const struct device_type gadget_type = {
 	.name	= "gadget",
 };
 
@@ -1056,7 +1056,7 @@ int gether_set_ifname(struct net_device *net, const char *name, int len)
 	if (!p || p[1] != 'd' || strchr(p + 2, '%'))
 		return -EINVAL;
 
-	strncpy(net->name, tmp, sizeof(net->name));
+	strscpy(net->name, tmp);
 	dev->ifname_set = true;
 
 	return 0;
@@ -1269,5 +1269,6 @@ void gether_disconnect(struct gether *link)
 }
 EXPORT_SYMBOL_GPL(gether_disconnect);
 
+MODULE_DESCRIPTION("Ethernet-over-USB link layer utilities for Gadget stack");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("David Brownell");

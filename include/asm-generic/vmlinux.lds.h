@@ -3,7 +3,7 @@
  * linker scripts.
  *
  * A minimal linker scripts has following content:
- * [This is a sample, architectures may have special requiriements]
+ * [This is a sample, architectures may have special requirements]
  *
  * OUTPUT_FORMAT(...)
  * OUTPUT_ARCH(...)
@@ -50,6 +50,8 @@
  *               [__nosave_begin, __nosave_end] for the nosave data
  */
 
+#include <asm-generic/codetag.lds.h>
+
 #ifndef LOAD_OFFSET
 #define LOAD_OFFSET 0
 #endif
@@ -85,32 +87,24 @@
 #define ALIGN_FUNCTION()  . = ALIGN(CONFIG_FUNCTION_ALIGNMENT)
 
 /*
- * LD_DEAD_CODE_DATA_ELIMINATION option enables -fdata-sections, which
- * generates .data.identifier sections, which need to be pulled in with
- * .data. We don't want to pull in .data..other sections, which Linux
- * has defined. Same for text and bss.
+ * Support -ffunction-sections by matching .text and .text.*,
+ * but exclude '.text..*'.
  *
- * With LTO_CLANG, the linker also splits sections by default, so we need
- * these macros to combine the sections during the final link.
- *
- * RODATA_MAIN is not used because existing code already defines .rodata.x
- * sections to be brought in with rodata.
+ * Special .text.* sections that are typically grouped separately, such as
+ * .text.unlikely or .text.hot, must be matched explicitly before using
+ * TEXT_MAIN.
  */
-#if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG)
 #define TEXT_MAIN .text .text.[0-9a-zA-Z_]*
-#define DATA_MAIN .data .data.[0-9a-zA-Z_]* .data..L* .data..compoundliteral* .data.$__unnamed_* .data.$L*
+
+/*
+ * Support -fdata-sections by matching .data, .data.*, and others,
+ * but exclude '.data..*'.
+ */
+#define DATA_MAIN .data .data.[0-9a-zA-Z_]* .data.rel.* .data..L* .data..compoundliteral* .data.$__unnamed_* .data.$L*
 #define SDATA_MAIN .sdata .sdata.[0-9a-zA-Z_]*
 #define RODATA_MAIN .rodata .rodata.[0-9a-zA-Z_]* .rodata..L*
 #define BSS_MAIN .bss .bss.[0-9a-zA-Z_]* .bss..L* .bss..compoundliteral*
 #define SBSS_MAIN .sbss .sbss.[0-9a-zA-Z_]*
-#else
-#define TEXT_MAIN .text
-#define DATA_MAIN .data
-#define SDATA_MAIN .sdata
-#define RODATA_MAIN .rodata
-#define BSS_MAIN .bss
-#define SBSS_MAIN .sbss
-#endif
 
 /*
  * GCC 4.5 and later have a 32 bytes section alignment for structures.
@@ -131,7 +125,7 @@
 	*(__dl_sched_class)			\
 	*(__rt_sched_class)			\
 	*(__fair_sched_class)			\
-	*(__hmbird_sched_class)			\
+	*(__ext_sched_class)			\
 	*(__idle_sched_class)			\
 	__sched_class_lowest = .;
 
@@ -359,11 +353,13 @@
 	. = ALIGN(8);							\
 	BOUNDED_SECTION_BY(__dyndbg_classes, ___dyndbg_classes)		\
 	BOUNDED_SECTION_BY(__dyndbg, ___dyndbg)				\
+	CODETAG_SECTIONS()						\
 	LIKELY_PROFILE()		       				\
 	BRANCH_PROFILE()						\
 	TRACE_PRINTKS()							\
 	BPF_RAW_TP()							\
-	TRACEPOINT_STR()
+	TRACEPOINT_STR()						\
+	KUNIT_TABLE()
 
 /*
  * Data section helpers
@@ -391,13 +387,13 @@
 
 #define INIT_TASK_DATA(align)						\
 	. = ALIGN(align);						\
-	__start_init_task = .;						\
+	__start_init_stack = .;						\
 	init_thread_union = .;						\
 	init_stack = .;							\
 	KEEP(*(.data..init_task))					\
 	KEEP(*(.data..init_thread_info))				\
-	. = __start_init_task + THREAD_SIZE;				\
-	__end_init_task = .;
+	. = __start_init_stack + THREAD_SIZE;				\
+	__end_init_stack = .;
 
 #define JUMP_TABLE_DATA							\
 	. = ALIGN(8);							\
@@ -546,24 +542,43 @@
 		__cpuidle_text_end = .;					\
 		__noinstr_text_end = .;
 
+#define TEXT_SPLIT							\
+		__split_text_start = .;					\
+		*(.text.split .text.split.[0-9a-zA-Z_]*)		\
+		__split_text_end = .;
+
+#define TEXT_UNLIKELY							\
+		__unlikely_text_start = .;				\
+		*(.text.unlikely .text.unlikely.*)			\
+		__unlikely_text_end = .;
+
+#define TEXT_HOT							\
+		__hot_text_start = .;					\
+		*(.text.hot .text.hot.*)				\
+		__hot_text_end = .;
+
 /*
  * .text section. Map to function alignment to avoid address changes
  * during second ld run in second ld pass when generating System.map
  *
- * TEXT_MAIN here will match .text.fixup and .text.unlikely if dead
- * code elimination is enabled, so these sections should be converted
- * to use ".." first.
+ * TEXT_MAIN here will match symbols with a fixed pattern (for example,
+ * .text.hot or .text.unlikely).  Match those before TEXT_MAIN to ensure
+ * they get grouped together.
+ *
+ * Also placing .text.hot section at the beginning of a page, this
+ * would help the TLB performance.
  */
 #define TEXT_TEXT							\
 		ALIGN_FUNCTION();					\
-		*(.text.hot .text.hot.*)				\
-		*(TEXT_MAIN .text.fixup)				\
-		*(.text.unlikely .text.unlikely.*)			\
+		*(.text.asan.* .text.tsan.*)				\
 		*(.text.unknown .text.unknown.*)			\
+		TEXT_SPLIT						\
+		TEXT_UNLIKELY						\
+		. = ALIGN(PAGE_SIZE);					\
+		TEXT_HOT						\
+		*(TEXT_MAIN .text.fixup)				\
 		NOINSTR_TEXT						\
-		*(.ref.text)						\
-		*(.text.asan.* .text.tsan.*)
-
+		*(.ref.text)
 
 /* sched.text is aling to function alignment to secure we have same
  * address even at second ld pass when generating System.map */
@@ -689,7 +704,7 @@
 	EARLYCON_TABLE()						\
 	LSM_TABLE()							\
 	EARLY_LSM_TABLE()						\
-	KUNIT_TABLE()
+	KUNIT_INIT_TABLE()
 
 #define INIT_TEXT							\
 	*(.init.text .init.text.*)					\
@@ -909,10 +924,27 @@
 #define CON_INITCALL							\
 	BOUNDED_SECTION_POST_LABEL(.con_initcall.init, __con_initcall, _start, _end)
 
+#define NAMED_SECTION(name) \
+	. = ALIGN(8); \
+	name : AT(ADDR(name) - LOAD_OFFSET) \
+	{ BOUNDED_SECTION_PRE_LABEL(name, name, __start_, __stop_) }
+
+#define RUNTIME_CONST(t,x) NAMED_SECTION(runtime_##t##_##x)
+
+#define RUNTIME_CONST_VARIABLES						\
+		RUNTIME_CONST(shift, d_hash_shift)			\
+		RUNTIME_CONST(ptr, dentry_hashtable)
+
 /* Alignment must be consistent with (kunit_suite *) in include/kunit/test.h */
 #define KUNIT_TABLE()							\
 		. = ALIGN(8);						\
 		BOUNDED_SECTION_POST_LABEL(.kunit_test_suites, __kunit_suites, _start, _end)
+
+/* Alignment must be consistent with (kunit_suite *) in include/kunit/test.h */
+#define KUNIT_INIT_TABLE()						\
+		. = ALIGN(8);						\
+		BOUNDED_SECTION_POST_LABEL(.kunit_init_test_suites, \
+				__kunit_init_suites, _start, _end)
 
 #ifdef CONFIG_BLK_DEV_INITRD
 #define INIT_RAM_FS							\
@@ -965,7 +997,7 @@
  * -fsanitize=thread produce unwanted sections (.eh_frame
  * and .init_array.*), but CONFIG_CONSTRUCTORS wants to
  * keep any .init_array.* sections.
- * https://bugs.llvm.org/show_bug.cgi?id=46478
+ * https://llvm.org/pr46478
  */
 #ifdef CONFIG_UNWIND_TABLES
 #define DISCARD_EH_FRAME

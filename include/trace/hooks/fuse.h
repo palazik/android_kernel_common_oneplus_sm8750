@@ -13,9 +13,9 @@
 
 struct wait_queue_head;
 struct fuse_req;
-DECLARE_HOOK(android_vh_queue_request_and_unlock,
-	TP_PROTO(struct wait_queue_head *wq_head, bool sync),
-	TP_ARGS(wq_head, sync));
+DECLARE_HOOK(android_vh_fuse_request_send,
+	TP_PROTO(struct wait_queue_head *wq_head),
+	TP_ARGS(wq_head));
 DECLARE_HOOK(android_vh_fuse_request_send_ext,
 	TP_PROTO(struct fuse_req *req, struct wait_queue_head *wq_head),
 	TP_ARGS(req, wq_head));

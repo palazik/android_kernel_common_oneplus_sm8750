@@ -19,8 +19,9 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/property.h>
 #include <linux/spinlock.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <asm/byteorder.h>
 #include <linux/input.h>
 #include <linux/wait.h>
@@ -34,6 +35,7 @@
 #include <linux/hid-debug.h>
 #include <linux/hidraw.h>
 #include "usbhid.h"
+#include "hid-pidff.h"
 
 /*
  * Version Information
@@ -281,9 +283,9 @@ static void hid_irq_in(struct urb *urb)
 			break;
 		usbhid_mark_busy(usbhid);
 		if (!test_bit(HID_RESUME_RUNNING, &usbhid->iofl)) {
-			hid_input_report(urb->context, HID_INPUT_REPORT,
-					 urb->transfer_buffer,
-					 urb->actual_length, 1);
+			hid_safe_input_report(urb->context, HID_INPUT_REPORT,
+					      urb->transfer_buffer, urb->transfer_buffer_length,
+					      urb->actual_length, 1);
 			/*
 			 * autosuspend refused while keys are pressed
 			 * because most keyboards don't wake up when
@@ -480,9 +482,10 @@ static void hid_ctrl(struct urb *urb)
 	switch (status) {
 	case 0:			/* success */
 		if (usbhid->ctrl[usbhid->ctrltail].dir == USB_DIR_IN)
-			hid_input_report(urb->context,
+			hid_safe_input_report(urb->context,
 				usbhid->ctrl[usbhid->ctrltail].report->type,
-				urb->transfer_buffer, urb->actual_length, 0);
+				urb->transfer_buffer, urb->transfer_buffer_length,
+				urb->actual_length, 0);
 		break;
 	case -ESHUTDOWN:	/* unplug */
 		unplug = 1;
@@ -1392,6 +1395,7 @@ static int usbhid_probe(struct usb_interface *intf, const struct usb_device_id *
 	hid->hiddev_report_event = hiddev_report_event;
 #endif
 	hid->dev.parent = &intf->dev;
+	device_set_node(&hid->dev, dev_fwnode(&intf->dev));
 	hid->bus = BUS_USB;
 	hid->vendor = le16_to_cpu(dev->descriptor.idVendor);
 	hid->product = le16_to_cpu(dev->descriptor.idProduct);
@@ -1549,7 +1553,7 @@ static int hid_post_reset(struct usb_interface *intf)
 	 * configuration descriptors passed, we already know that
 	 * the size of the HID report descriptor has not changed.
 	 */
-	rdesc = kmalloc(hid->dev_rsize, GFP_NOIO);
+	rdesc = kmalloc(hid->dev_rsize, GFP_KERNEL);
 	if (!rdesc)
 		return -ENOMEM;
 
@@ -1580,7 +1584,6 @@ static int hid_post_reset(struct usb_interface *intf)
 	return 0;
 }
 
-#ifdef CONFIG_PM
 static int hid_resume_common(struct hid_device *hid, bool driver_suspended)
 {
 	int status = 0;
@@ -1672,8 +1675,6 @@ static int hid_reset_resume(struct usb_interface *intf)
 	return status;
 }
 
-#endif /* CONFIG_PM */
-
 static const struct usb_device_id hid_usb_ids[] = {
 	{ .match_flags = USB_DEVICE_ID_MATCH_INT_CLASS,
 		.bInterfaceClass = USB_INTERFACE_CLASS_HID },
@@ -1686,11 +1687,9 @@ static struct usb_driver hid_driver = {
 	.name =		"usbhid",
 	.probe =	usbhid_probe,
 	.disconnect =	usbhid_disconnect,
-#ifdef CONFIG_PM
-	.suspend =	hid_suspend,
-	.resume =	hid_resume,
-	.reset_resume =	hid_reset_resume,
-#endif
+	.suspend =	pm_ptr(hid_suspend),
+	.resume =	pm_ptr(hid_resume),
+	.reset_resume =	pm_ptr(hid_reset_resume),
 	.pre_reset =	hid_pre_reset,
 	.post_reset =	hid_post_reset,
 	.id_table =	hid_usb_ids,

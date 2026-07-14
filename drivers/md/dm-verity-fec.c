@@ -60,8 +60,8 @@ static int fec_decode_rs8(struct dm_verity *v, struct dm_verity_fec_io *fio,
  * to the data block. Caller is responsible for releasing buf.
  */
 static u8 *fec_read_parity(struct dm_verity *v, u64 rsb, int index,
-			   unsigned int *offset, struct dm_buffer **buf,
-			   unsigned int par_buf_offset, unsigned short ioprio)
+			   unsigned int *offset, unsigned int par_buf_offset,
+			   struct dm_buffer **buf, unsigned short ioprio)
 {
 	u64 position, block, rem;
 	u8 *res;
@@ -136,7 +136,8 @@ static int fec_decode_bufs(struct dm_verity *v, struct dm_verity_io *io,
 	u8 *par, *block, par_buf[DM_VERITY_FEC_RSM - DM_VERITY_FEC_MIN_RSN];
 	struct bio *bio = dm_bio_from_per_bio_data(io, v->ti->per_io_data_size);
 
-	par = fec_read_parity(v, rsb, block_offset, &offset, &buf, par_buf_offset, bio_prio(bio));
+	par = fec_read_parity(v, rsb, block_offset, &offset,
+			      par_buf_offset, &buf, bio_prio(bio));
 	if (IS_ERR(par))
 		return PTR_ERR(par);
 
@@ -173,7 +174,8 @@ static int fec_decode_bufs(struct dm_verity *v, struct dm_verity_io *io,
 		if (offset >= v->fec->io_size) {
 			dm_bufio_release(buf);
 
-			par = fec_read_parity(v, rsb, block_offset, &offset, &buf, par_buf_offset, bio_prio(bio));
+			par = fec_read_parity(v, rsb, block_offset, &offset,
+					      par_buf_offset, &buf, bio_prio(bio));
 			if (IS_ERR(par))
 				return PTR_ERR(par);
 		}
@@ -461,6 +463,7 @@ int verity_fec_decode(struct dm_verity *v, struct dm_verity_io *io,
 	}
 
 	memcpy(dest, fio->output, 1 << v->data_dev_block_bits);
+	atomic64_inc(verity_fec_corrected(v));
 
 done:
 	fio->level--;
@@ -645,14 +648,14 @@ int verity_fec_parse_opt_args(struct dm_arg_set *as, struct dm_verity *v,
  */
 int verity_fec_ctr_alloc(struct dm_verity *v)
 {
-	struct dm_verity_fec *f;
+	struct dm_verity_fec_ex *f;
 
-	f = kzalloc(sizeof(struct dm_verity_fec), GFP_KERNEL);
+	f = kzalloc(sizeof(struct dm_verity_fec_ex), GFP_KERNEL);
 	if (!f) {
 		v->ti->error = "Cannot allocate FEC structure";
 		return -ENOMEM;
 	}
-	v->fec = f;
+	v->fec = &f->base;
 
 	return 0;
 }

@@ -9,8 +9,8 @@
 #include <linux/mm.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
-#include <trace/events/geniezone.h>
 #include <linux/soc/mediatek/gzvm_drv.h>
+#include <trace/events/geniezone.h>
 #include <trace/hooks/gzvm.h>
 
 /* maximum size needed for holding an integer */
@@ -212,6 +212,13 @@ static long gzvm_vcpu_ioctl(struct file *filp, unsigned int ioctl,
 	int ret = -ENOTTY;
 	void __user *argp = (void __user *)arg;
 	struct gzvm_vcpu *vcpu = filp->private_data;
+
+	/*
+	 * Reject ioctls issued by a process other than the VM creator
+	 * (cf. KVM's kvm->mm check).
+	 */
+	if (vcpu->gzvm->mm != current->mm)
+		return -EIO;
 
 	switch (ioctl) {
 	case GZVM_RUN:

@@ -1121,7 +1121,7 @@ static void mark_nosave_pages(struct memory_bitmap *bm)
 int create_basic_memory_bitmaps(void)
 {
 	struct memory_bitmap *bm1, *bm2;
-	int error = 0;
+	int error;
 
 	if (forbidden_pages_map && free_pages_map)
 		return 0;
@@ -1365,11 +1365,6 @@ static unsigned int count_highmem_pages(void)
 	}
 	return n;
 }
-#else
-static inline void *saveable_highmem_page(struct zone *z, unsigned long p)
-{
-	return NULL;
-}
 #endif /* CONFIG_HIGHMEM */
 
 /**
@@ -1489,11 +1484,11 @@ static bool copy_data_page(unsigned long dst_pfn, unsigned long src_pfn)
 	s_page = pfn_to_page(src_pfn);
 	d_page = pfn_to_page(dst_pfn);
 	if (PageHighMem(s_page)) {
-		src = kmap_atomic(s_page);
-		dst = kmap_atomic(d_page);
+		src = kmap_local_page(s_page);
+		dst = kmap_local_page(d_page);
 		zeros_only = do_copy_page(dst, src);
-		kunmap_atomic(dst);
-		kunmap_atomic(src);
+		kunmap_local(dst);
+		kunmap_local(src);
 	} else {
 		if (PageHighMem(d_page)) {
 			/*
@@ -1501,9 +1496,9 @@ static bool copy_data_page(unsigned long dst_pfn, unsigned long src_pfn)
 			 * data modified by kmap_atomic()
 			 */
 			zeros_only = safe_copy_page(buffer, s_page);
-			dst = kmap_atomic(d_page);
+			dst = kmap_local_page(d_page);
 			copy_page(dst, buffer);
-			kunmap_atomic(dst);
+			kunmap_local(dst);
 		} else {
 			zeros_only = safe_copy_page(page_address(d_page), s_page);
 		}
@@ -2187,6 +2182,7 @@ unsigned long snapshot_get_image_size(void)
 {
 	return nr_copy_pages + nr_meta_pages + 1;
 }
+EXPORT_SYMBOL_GPL(snapshot_get_image_size);
 
 static int init_header(struct swsusp_info *info)
 {
@@ -2780,7 +2776,7 @@ static void *get_buffer(struct memory_bitmap *bm, struct chain_allocator *ca)
 int snapshot_write_next(struct snapshot_handle *handle)
 {
 	static struct chain_allocator ca;
-	int error = 0;
+	int error;
 
 next:
 	/* Check if we have already loaded the entire image */

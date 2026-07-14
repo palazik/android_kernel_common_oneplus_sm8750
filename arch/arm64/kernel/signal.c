@@ -16,11 +16,10 @@
 #include <linux/uaccess.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
-#include <linux/resume_user_mode.h>
 #include <linux/ratelimit.h>
+#include <linux/rseq.h>
 #include <linux/syscalls.h>
-
-#include <trace/hooks/dtask.h>
+#include <linux/pkeys.h>
 
 #include <asm/daifflags.h>
 #include <asm/debug-monitors.h>
@@ -62,13 +61,68 @@ struct rt_sigframe_user_layout {
 	unsigned long tpidr2_offset;
 	unsigned long za_offset;
 	unsigned long zt_offset;
+	unsigned long fpmr_offset;
+	unsigned long poe_offset;
 	unsigned long extra_offset;
 	unsigned long end_offset;
+};
+
+/*
+ * Holds any EL0-controlled state that influences unprivileged memory accesses.
+ * This includes both accesses done in userspace and uaccess done in the kernel.
+ *
+ * This state needs to be carefully managed to ensure that it doesn't cause
+ * uaccess to fail when setting up the signal frame, and the signal handler
+ * itself also expects a well-defined state when entered.
+ */
+struct user_access_state {
+	u64 por_el0;
 };
 
 #define BASE_SIGFRAME_SIZE round_up(sizeof(struct rt_sigframe), 16)
 #define TERMINATOR_SIZE round_up(sizeof(struct _aarch64_ctx), 16)
 #define EXTRA_CONTEXT_SIZE round_up(sizeof(struct extra_context), 16)
+
+/*
+ * Save the user access state into ua_state and reset it to disable any
+ * restrictions.
+ */
+static void save_reset_user_access_state(struct user_access_state *ua_state)
+{
+	if (system_supports_poe()) {
+		u64 por_enable_all = 0;
+
+		for (int pkey = 0; pkey < arch_max_pkey(); pkey++)
+			por_enable_all |= POE_RXW << (pkey * POR_BITS_PER_PKEY);
+
+		ua_state->por_el0 = read_sysreg_s(SYS_POR_EL0);
+		write_sysreg_s(por_enable_all, SYS_POR_EL0);
+		/* Ensure that any subsequent uaccess observes the updated value */
+		isb();
+	}
+}
+
+/*
+ * Set the user access state for invoking the signal handler.
+ *
+ * No uaccess should be done after that function is called.
+ */
+static void set_handler_user_access_state(void)
+{
+	if (system_supports_poe())
+		write_sysreg_s(POR_EL0_INIT, SYS_POR_EL0);
+}
+
+/*
+ * Restore the user access state to the values saved in ua_state.
+ *
+ * No uaccess should be done after that function is called.
+ */
+static void restore_user_access_state(const struct user_access_state *ua_state)
+{
+	if (system_supports_poe())
+		write_sysreg_s(ua_state->por_el0, SYS_POR_EL0);
+}
 
 static void init_user_layout(struct rt_sigframe_user_layout *user)
 {
@@ -184,6 +238,10 @@ struct user_ctxs {
 	u32 za_size;
 	struct zt_context __user *zt;
 	u32 zt_size;
+	struct fpmr_context __user *fpmr;
+	u32 fpmr_size;
+	struct poe_context __user *poe;
+	u32 poe_size;
 };
 
 static int preserve_fpsimd_context(struct fpsimd_context __user *ctx)
@@ -191,6 +249,8 @@ static int preserve_fpsimd_context(struct fpsimd_context __user *ctx)
 	struct user_fpsimd_state const *fpsimd =
 		&current->thread.uw.fpsimd_state;
 	int err;
+
+	fpsimd_sync_from_effective_state(current);
 
 	/* copy the FP and status/control registers */
 	err = __copy_to_user(ctx->vregs, fpsimd->vregs, sizeof(fpsimd->vregs));
@@ -232,6 +292,7 @@ static int restore_fpsimd_context(struct user_ctxs *user)
 		return err;
 
 	clear_thread_flag(TIF_SVE);
+	current->thread.svcr &= ~SVCR_SM_MASK;
 	current->thread.fp_type = FP_STATE_FPSIMD;
 
 	/* load the hardware registers from the fpsimd_state structure */
@@ -239,6 +300,59 @@ static int restore_fpsimd_context(struct user_ctxs *user)
 	return 0;
 }
 
+static int preserve_fpmr_context(struct fpmr_context __user *ctx)
+{
+	int err = 0;
+
+	__put_user_error(FPMR_MAGIC, &ctx->head.magic, err);
+	__put_user_error(sizeof(*ctx), &ctx->head.size, err);
+	__put_user_error(current->thread.uw.fpmr, &ctx->fpmr, err);
+
+	return err;
+}
+
+static int restore_fpmr_context(struct user_ctxs *user)
+{
+	u64 fpmr;
+	int err = 0;
+
+	if (user->fpmr_size != sizeof(*user->fpmr))
+		return -EINVAL;
+
+	__get_user_error(fpmr, &user->fpmr->fpmr, err);
+	if (!err)
+		current->thread.uw.fpmr = fpmr;
+
+	return err;
+}
+
+static int preserve_poe_context(struct poe_context __user *ctx,
+				const struct user_access_state *ua_state)
+{
+	int err = 0;
+
+	__put_user_error(POE_MAGIC, &ctx->head.magic, err);
+	__put_user_error(sizeof(*ctx), &ctx->head.size, err);
+	__put_user_error(ua_state->por_el0, &ctx->por_el0, err);
+
+	return err;
+}
+
+static int restore_poe_context(struct user_ctxs *user,
+			       struct user_access_state *ua_state)
+{
+	u64 por_el0;
+	int err = 0;
+
+	if (user->poe_size != sizeof(*user->poe))
+		return -EINVAL;
+
+	__get_user_error(por_el0, &(user->poe->por_el0), err);
+	if (!err)
+		ua_state->por_el0 = por_el0;
+
+	return err;
+}
 
 #ifdef CONFIG_ARM64_SVE
 
@@ -269,11 +383,6 @@ static int preserve_sve_context(struct sve_context __user *ctx)
 	err |= __copy_to_user(&ctx->__reserved, reserved, sizeof(reserved));
 
 	if (vq) {
-		/*
-		 * This assumes that the SVE state has already been saved to
-		 * the task struct by calling the function
-		 * fpsimd_signal_preserve_current_state().
-		 */
 		err |= __copy_to_user((char __user *)ctx + SVE_SIG_REGS_OFFSET,
 				      current->thread.sve_state,
 				      SVE_SIG_REGS_SIZE(vq));
@@ -336,16 +445,6 @@ static int restore_sve_fpsimd_context(struct user_ctxs *user)
 	if (user->sve_size < SVE_SIG_CONTEXT_SIZE(vq))
 		return -EINVAL;
 
-	/*
-	 * Careful: we are about __copy_from_user() directly into
-	 * thread.sve_state with preemption enabled, so protection is
-	 * needed to prevent a racing context switch from writing stale
-	 * registers back over the new data.
-	 */
-
-	fpsimd_flush_task_state(current);
-	/* From now, fpsimd_thread_switch() won't touch thread.sve_state */
-
 	if (sm) {
 		sme_alloc(current, false);
 		if (!current->thread.sme_state)
@@ -402,13 +501,12 @@ extern int preserve_sve_context(void __user *ctx);
 
 static int preserve_tpidr2_context(struct tpidr2_context __user *ctx)
 {
+	u64 tpidr2_el0 = read_sysreg_s(SYS_TPIDR2_EL0);
 	int err = 0;
-
-	current->thread.tpidr2_el0 = read_sysreg_s(SYS_TPIDR2_EL0);
 
 	__put_user_error(TPIDR2_MAGIC, &ctx->head.magic, err);
 	__put_user_error(sizeof(*ctx), &ctx->head.size, err);
-	__put_user_error(current->thread.tpidr2_el0, &ctx->tpidr2, err);
+	__put_user_error(tpidr2_el0, &ctx->tpidr2, err);
 
 	return err;
 }
@@ -450,11 +548,6 @@ static int preserve_za_context(struct za_context __user *ctx)
 	err |= __copy_to_user(&ctx->__reserved, reserved, sizeof(reserved));
 
 	if (vq) {
-		/*
-		 * This assumes that the ZA state has already been saved to
-		 * the task struct by calling the function
-		 * fpsimd_signal_preserve_current_state().
-		 */
 		err |= __copy_to_user((char __user *)ctx + ZA_SIG_REGS_OFFSET,
 				      current->thread.sme_state,
 				      ZA_SIG_REGS_SIZE(vq));
@@ -488,16 +581,6 @@ static int restore_za_context(struct user_ctxs *user)
 
 	if (user->za_size < ZA_SIG_CONTEXT_SIZE(vq))
 		return -EINVAL;
-
-	/*
-	 * Careful: we are about __copy_from_user() directly into
-	 * thread.sme_state with preemption enabled, so protection is
-	 * needed to prevent a racing context switch from writing stale
-	 * registers back over the new data.
-	 */
-
-	fpsimd_flush_task_state(current);
-	/* From now, fpsimd_thread_switch() won't touch thread.sve_state */
 
 	sve_alloc(current, false);
 	if (!current->thread.sve_state)
@@ -540,11 +623,6 @@ static int preserve_zt_context(struct zt_context __user *ctx)
 	BUILD_BUG_ON(sizeof(ctx->__reserved) != sizeof(reserved));
 	err |= __copy_to_user(&ctx->__reserved, reserved, sizeof(reserved));
 
-	/*
-	 * This assumes that the ZT state has already been saved to
-	 * the task struct by calling the function
-	 * fpsimd_signal_preserve_current_state().
-	 */
 	err |= __copy_to_user((char __user *)ctx + ZT_SIG_REGS_OFFSET,
 			      thread_zt_state(&current->thread),
 			      ZT_SIG_REGS_SIZE(1));
@@ -569,16 +647,6 @@ static int restore_zt_context(struct user_ctxs *user)
 
 	if (nregs != 1)
 		return -EINVAL;
-
-	/*
-	 * Careful: we are about __copy_from_user() directly into
-	 * thread.zt_state with preemption enabled, so protection is
-	 * needed to prevent a racing context switch from writing stale
-	 * registers back over the new data.
-	 */
-
-	fpsimd_flush_task_state(current);
-	/* From now, fpsimd_thread_switch() won't touch ZT in thread state */
 
 	err = __copy_from_user(thread_zt_state(&current->thread),
 			       (char __user const *)user->zt +
@@ -618,6 +686,8 @@ static int parse_user_sigframe(struct user_ctxs *user,
 	user->tpidr2 = NULL;
 	user->za = NULL;
 	user->zt = NULL;
+	user->fpmr = NULL;
+	user->poe = NULL;
 
 	if (!IS_ALIGNED((unsigned long)base, 16))
 		goto invalid;
@@ -668,6 +738,17 @@ static int parse_user_sigframe(struct user_ctxs *user,
 			/* ignore */
 			break;
 
+		case POE_MAGIC:
+			if (!system_supports_poe())
+				goto invalid;
+
+			if (user->poe)
+				goto invalid;
+
+			user->poe = (struct poe_context __user *)head;
+			user->poe_size = size;
+			break;
+
 		case SVE_MAGIC:
 			if (!system_supports_sve() && !system_supports_sme())
 				goto invalid;
@@ -710,6 +791,17 @@ static int parse_user_sigframe(struct user_ctxs *user,
 
 			user->zt = (struct zt_context __user *)head;
 			user->zt_size = size;
+			break;
+
+		case FPMR_MAGIC:
+			if (!system_supports_fpmr())
+				goto invalid;
+
+			if (user->fpmr)
+				goto invalid;
+
+			user->fpmr = (struct fpmr_context __user *)head;
+			user->fpmr_size = size;
 			break;
 
 		case EXTRA_MAGIC:
@@ -795,7 +887,8 @@ invalid:
 }
 
 static int restore_sigframe(struct pt_regs *regs,
-			    struct rt_sigframe __user *sf)
+			    struct rt_sigframe __user *sf,
+			    struct user_access_state *ua_state)
 {
 	sigset_t set;
 	int i, err;
@@ -817,6 +910,8 @@ static int restore_sigframe(struct pt_regs *regs,
 	 */
 	forget_syscall(regs);
 
+	fpsimd_save_and_flush_current_state();
+
 	err |= !valid_user_regs(&regs->user_regs, current);
 	if (err == 0)
 		err = parse_user_sigframe(&user, sf);
@@ -834,11 +929,17 @@ static int restore_sigframe(struct pt_regs *regs,
 	if (err == 0 && system_supports_tpidr2() && user.tpidr2)
 		err = restore_tpidr2_context(&user);
 
+	if (err == 0 && system_supports_fpmr() && user.fpmr)
+		err = restore_fpmr_context(&user);
+
 	if (err == 0 && system_supports_sme() && user.za)
 		err = restore_za_context(&user);
 
 	if (err == 0 && system_supports_sme2() && user.zt)
 		err = restore_zt_context(&user);
+
+	if (err == 0 && system_supports_poe() && user.poe)
+		err = restore_poe_context(&user, ua_state);
 
 	return err;
 }
@@ -847,6 +948,7 @@ SYSCALL_DEFINE0(rt_sigreturn)
 {
 	struct pt_regs *regs = current_pt_regs();
 	struct rt_sigframe __user *frame;
+	struct user_access_state ua_state;
 
 	/* Always make any pending restarted system calls return -EINTR */
 	current->restart_block.fn = do_no_restart_syscall;
@@ -863,11 +965,13 @@ SYSCALL_DEFINE0(rt_sigreturn)
 	if (!access_ok(frame, sizeof (*frame)))
 		goto badframe;
 
-	if (restore_sigframe(regs, frame))
+	if (restore_sigframe(regs, frame, &ua_state))
 		goto badframe;
 
 	if (restore_altstack(&frame->uc.uc_stack))
 		goto badframe;
+
+	restore_user_access_state(&ua_state);
 
 	return regs->regs[0];
 
@@ -956,11 +1060,26 @@ static int setup_sigframe_layout(struct rt_sigframe_user_layout *user,
 		}
 	}
 
+	if (system_supports_fpmr()) {
+		err = sigframe_alloc(user, &user->fpmr_offset,
+				     sizeof(struct fpmr_context));
+		if (err)
+			return err;
+	}
+
+	if (system_supports_poe()) {
+		err = sigframe_alloc(user, &user->poe_offset,
+				     sizeof(struct poe_context));
+		if (err)
+			return err;
+	}
+
 	return sigframe_alloc_end(user);
 }
 
 static int setup_sigframe(struct rt_sigframe_user_layout *user,
-			  struct pt_regs *regs, sigset_t *set)
+			  struct pt_regs *regs, sigset_t *set,
+			  const struct user_access_state *ua_state)
 {
 	int i, err = 0;
 	struct rt_sigframe __user *sf = user->sigframe;
@@ -1009,6 +1128,20 @@ static int setup_sigframe(struct rt_sigframe_user_layout *user,
 		struct tpidr2_context __user *tpidr2_ctx =
 			apply_user_offset(user, user->tpidr2_offset);
 		err |= preserve_tpidr2_context(tpidr2_ctx);
+	}
+
+	/* FPMR if supported */
+	if (system_supports_fpmr() && err == 0) {
+		struct fpmr_context __user *fpmr_ctx =
+			apply_user_offset(user, user->fpmr_offset);
+		err |= preserve_fpmr_context(fpmr_ctx);
+	}
+
+	if (system_supports_poe() && err == 0 && user->poe_offset) {
+		struct poe_context __user *poe_ctx =
+			apply_user_offset(user, user->poe_offset);
+
+		err |= preserve_poe_context(poe_ctx, ua_state);
 	}
 
 	/* ZA state if present */
@@ -1130,21 +1263,9 @@ static void setup_return(struct pt_regs *regs, struct k_sigaction *ka,
 
 	/* Signal handlers are invoked with ZA and streaming mode disabled */
 	if (system_supports_sme()) {
-		/*
-		 * If we were in streaming mode the saved register
-		 * state was SVE but we will exit SM and use the
-		 * FPSIMD register state - flush the saved FPSIMD
-		 * register state in case it gets loaded.
-		 */
-		if (current->thread.svcr & SVCR_SM_MASK) {
-			memset(&current->thread.uw.fpsimd_state, 0,
-			       sizeof(current->thread.uw.fpsimd_state));
-			current->thread.fp_type = FP_STATE_FPSIMD;
-		}
-
-		current->thread.svcr &= ~(SVCR_ZA_MASK |
-					  SVCR_SM_MASK);
-		sme_smstop();
+		task_smstop_sm(current);
+		current->thread.svcr &= ~SVCR_ZA_MASK;
+		write_sysreg_s(0, SYS_TPIDR2_EL0);
 	}
 
 	if (ka->sa.sa_flags & SA_RESTORER)
@@ -1160,20 +1281,22 @@ static int setup_rt_frame(int usig, struct ksignal *ksig, sigset_t *set,
 {
 	struct rt_sigframe_user_layout user;
 	struct rt_sigframe __user *frame;
+	struct user_access_state ua_state;
 	int err = 0;
 
-	fpsimd_signal_preserve_current_state();
+	fpsimd_save_and_flush_current_state();
 
 	if (get_sigframe(&user, ksig, regs))
 		return 1;
 
+	save_reset_user_access_state(&ua_state);
 	frame = user.sigframe;
 
 	__put_user_error(0, &frame->uc.uc_flags, err);
 	__put_user_error(NULL, &frame->uc.uc_link, err);
 
 	err |= __save_altstack(&frame->uc.uc_stack, regs->sp);
-	err |= setup_sigframe(&user, regs, set);
+	err |= setup_sigframe(&user, regs, set, &ua_state);
 	if (err == 0) {
 		setup_return(regs, &ksig->ka, &user, usig);
 		if (ksig->ka.sa.sa_flags & SA_SIGINFO) {
@@ -1182,6 +1305,11 @@ static int setup_rt_frame(int usig, struct ksignal *ksig, sigset_t *set,
 			regs->regs[2] = (unsigned long)&frame->uc;
 		}
 	}
+
+	if (err == 0)
+		set_handler_user_access_state();
+	else
+		restore_user_access_state(&ua_state);
 
 	return err;
 }
@@ -1235,7 +1363,7 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
  * the kernel can handle, and then we build all the user-level signal handling
  * stack-frames in one go after that.
  */
-static void do_signal(struct pt_regs *regs)
+void do_signal(struct pt_regs *regs)
 {
 	unsigned long continue_addr = 0, restart_addr = 0;
 	int retval = 0;
@@ -1304,49 +1432,6 @@ static void do_signal(struct pt_regs *regs)
 	}
 
 	restore_saved_sigmask();
-}
-
-void do_notify_resume(struct pt_regs *regs, unsigned long thread_flags)
-{
-	int thread_lazy_flag = 0;
-	int thread_lazy_resched_flag = 0;
-
-	trace_android_vh_restore_curr_resched(&thread_flags, &thread_lazy_resched_flag);
-	do {
-		trace_android_vh_read_lazy_flag(&thread_lazy_flag, &thread_flags);
-		if ((thread_flags & _TIF_NEED_RESCHED) || thread_lazy_flag ||
-				thread_lazy_resched_flag) {
-			/* Unmask Debug and SError for the next task */
-			thread_lazy_resched_flag = 0;
-			local_daif_restore(DAIF_PROCCTX_NOIRQ);
-
-			schedule();
-		} else {
-			local_daif_restore(DAIF_PROCCTX);
-
-			if (thread_flags & _TIF_UPROBE)
-				uprobe_notify_resume(regs);
-
-			if (thread_flags & _TIF_MTE_ASYNC_FAULT) {
-				clear_thread_flag(TIF_MTE_ASYNC_FAULT);
-				send_sig_fault(SIGSEGV, SEGV_MTEAERR,
-					       (void __user *)NULL, current);
-			}
-
-			if (thread_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
-				do_signal(regs);
-
-			if (thread_flags & _TIF_NOTIFY_RESUME)
-				resume_user_mode_work(regs);
-
-			if (thread_flags & _TIF_FOREIGN_FPSTATE)
-				fpsimd_restore_current_state();
-		}
-
-		local_daif_mask();
-		thread_flags = read_thread_flags();
-		trace_android_vh_restore_curr_resched(&thread_flags, &thread_lazy_resched_flag);
-	} while (thread_flags & _TIF_WORK_MASK || thread_lazy_resched_flag);
 }
 
 unsigned long __ro_after_init signal_minsigstksz;

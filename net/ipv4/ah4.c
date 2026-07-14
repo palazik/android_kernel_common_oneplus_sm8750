@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define pr_fmt(fmt) "IPsec: " fmt
 
-#include <crypto/algapi.h>
 #include <crypto/hash.h>
+#include <crypto/utils.h>
 #include <linux/err.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -607,5 +607,6 @@ static void __exit ah4_fini(void)
 
 module_init(ah4_init);
 module_exit(ah4_fini);
+MODULE_DESCRIPTION("IPv4 AH transformation library");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS_XFRM_TYPE(AF_INET, XFRM_PROTO_AH);

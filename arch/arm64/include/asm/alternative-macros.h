@@ -227,11 +227,15 @@ alternative_endif
 static __always_inline bool
 alternative_has_cap_likely(const unsigned long cpucap)
 {
-	compiletime_assert(cpucap < ARM64_NCAPS,
-			   "cpucap must be < ARM64_NCAPS");
+	if (!cpucap_is_possible(cpucap))
+		return false;
 
 	asm goto(
+#ifdef BUILD_VDSO
+	ALTERNATIVE("b	%l[l_no]", "nop", %[cpucap])
+#else
 	ALTERNATIVE_CB("b	%l[l_no]", %[cpucap], alt_cb_patch_nops)
+#endif
 	:
 	: [cpucap] "i" (cpucap)
 	:
@@ -245,8 +249,8 @@ l_no:
 static __always_inline bool
 alternative_has_cap_unlikely(const unsigned long cpucap)
 {
-	compiletime_assert(cpucap < ARM64_NCAPS,
-			   "cpucap must be < ARM64_NCAPS");
+	if (!cpucap_is_possible(cpucap))
+		return false;
 
 	asm goto(
 	ALTERNATIVE("nop", "b	%l[l_yes]", %[cpucap])
@@ -298,14 +302,19 @@ l_yes:
 
 #include <linux/types.h>
 
-static __always_inline bool
-alternative_has_cap_likely(const unsigned long cpucap)
-{
-	return cpucap == ARM64_HAS_LDAPR ||
-		cpucap == ARM64_HAS_VIRT_HOST_EXTN ||
-		cpucap == ARM64_HAS_GIC_PRIO_MASKING ||
-		cpucap == ARM64_HAS_GIC_PRIO_RELAXED_SYNC;
-}
+static bool __maybe_unused cpus_have_cap(unsigned int num);
+
+/*
+ * Return 'false' for all capabilities listed above, and use the slow path for
+ * the remaining ones. This ensures that the FIPS140 module is consistent with
+ * itself for all capabilities, and with the rest of the kernel at least for the
+ * ones not listed.
+ */
+#define __alternative_has_cap(cpucap, altcap) \
+	__take_second_arg(altcap false, cpus_have_cap(cpucap))
+
+#define alternative_has_cap_likely(cpucap) \
+	__alternative_has_cap(cpucap, __ALT_ ## cpucap)
 
 #define alternative_has_cap_unlikely alternative_has_cap_likely
 

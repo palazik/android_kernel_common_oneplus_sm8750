@@ -177,12 +177,12 @@ static int gzvm_irqfd_assign(struct gzvm *gzvm, struct gzvm_irqfd *args)
 	INIT_WORK(&irqfd->shutdown, irqfd_shutdown);
 
 	f = fdget(args->fd);
-	if (!f.file) {
+	if (fd_empty(f)) {
 		ret = -EBADF;
 		goto out;
 	}
 
-	eventfd = eventfd_ctx_fileget(f.file);
+	eventfd = eventfd_ctx_fileget(fd_file(f));
 	if (IS_ERR(eventfd)) {
 		ret = PTR_ERR(eventfd);
 		goto fail;
@@ -216,7 +216,7 @@ static int gzvm_irqfd_assign(struct gzvm *gzvm, struct gzvm_irqfd *args)
 
 	spin_unlock_irq(&gzvm->irqfds.lock);
 
-	vfs_poll(f.file, &irqfd->pt);
+	vfs_poll(fd_file(f), &irqfd->pt);
 
 	srcu_read_unlock(&gzvm->irq_srcu, idx);
 

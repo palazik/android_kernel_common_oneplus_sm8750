@@ -60,7 +60,7 @@ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
 	might_sleep();
 
 	rwsem_acquire_read(&sem->dep_map, 0, 0, _RET_IP_);
-	_trace_android_vh_record_pcpu_rwsem_starttime(sem, jiffies);
+
 	preempt_disable();
 	/*
 	 * We are in an RCU-sched read-side critical section, so the writer
@@ -78,6 +78,7 @@ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
 	 * The preempt_enable() prevents the compiler from
 	 * bleeding the critical section out.
 	 */
+	_trace_android_vh_record_pcpu_rwsem_starttime(sem, jiffies);
 	preempt_enable();
 }
 
@@ -159,7 +160,7 @@ extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
 #define percpu_rwsem_assert_held(sem)	lockdep_assert_held(sem)
 
 static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
-					bool read, unsigned long ip)
+					unsigned long ip)
 {
 	lock_release(&sem->dep_map, ip);
 }

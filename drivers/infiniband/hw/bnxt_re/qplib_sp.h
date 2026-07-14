@@ -110,7 +110,7 @@ struct bnxt_qplib_ah {
 struct bnxt_qplib_mrw {
 	struct bnxt_qplib_pd		*pd;
 	int				type;
-	u32				flags;
+	u32				access_flags;
 #define BNXT_QPLIB_FR_PMR		0x80000000
 	u32				lkey;
 	u32				rkey;
@@ -118,6 +118,7 @@ struct bnxt_qplib_mrw {
 	u64				va;
 	u64				total_size;
 	u32				npages;
+	u16				flags;
 	u64				mr_handle;
 	struct bnxt_qplib_hwq		hwq;
 };
@@ -324,8 +325,7 @@ int bnxt_qplib_add_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
 int bnxt_qplib_update_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
 			   struct bnxt_qplib_gid *gid, u16 gid_idx,
 			   const u8 *smac);
-int bnxt_qplib_get_dev_attr(struct bnxt_qplib_rcfw *rcfw,
-			    struct bnxt_qplib_dev_attr *attr);
+int bnxt_qplib_get_dev_attr(struct bnxt_qplib_rcfw *rcfw);
 int bnxt_qplib_set_func_resources(struct bnxt_qplib_res *res,
 				  struct bnxt_qplib_rcfw *rcfw,
 				  struct bnxt_qplib_ctx *ctx);
@@ -338,7 +338,7 @@ int bnxt_qplib_alloc_mrw(struct bnxt_qplib_res *res,
 int bnxt_qplib_dereg_mrw(struct bnxt_qplib_res *res, struct bnxt_qplib_mrw *mrw,
 			 bool block);
 int bnxt_qplib_reg_mr(struct bnxt_qplib_res *res, struct bnxt_qplib_mrw *mr,
-		      struct ib_umem *umem, int num_pbls, u32 buf_pg_size);
+		      struct ib_umem *umem, int num_pbls, u32 buf_pg_size, bool unified_mr);
 int bnxt_qplib_free_mrw(struct bnxt_qplib_res *res, struct bnxt_qplib_mrw *mr);
 int bnxt_qplib_alloc_fast_reg_mr(struct bnxt_qplib_res *res,
 				 struct bnxt_qplib_mrw *mr, int max);

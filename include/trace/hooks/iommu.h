@@ -10,8 +10,8 @@
 #include <trace/hooks/vendor_hooks.h>
 
 DECLARE_RESTRICTED_HOOK(android_rvh_iommu_setup_dma_ops,
-	TP_PROTO(struct device *dev, u64 dma_base, u64 dma_limit),
-	TP_ARGS(dev, dma_base, dma_limit), 1);
+	TP_PROTO(struct device *dev),
+	TP_ARGS(dev), 1);
 
 struct iova_domain;
 struct iova;
@@ -35,6 +35,10 @@ DECLARE_HOOK(android_vh_iommu_iovad_free_iova,
 	TP_PROTO(struct iova_domain *iovad, dma_addr_t iova, size_t size),
 	TP_ARGS(iovad, iova, size));
 
+DECLARE_HOOK(android_vh_adjust_alloc_flags,
+	TP_PROTO(unsigned int order, gfp_t *alloc_flags),
+	TP_ARGS(order, alloc_flags));
+
 DECLARE_RESTRICTED_HOOK(android_rvh_iommu_iovad_init_alloc_algo,
 	TP_PROTO(struct device *dev, struct iova_domain *iovad),
 	TP_ARGS(dev, iovad), 1);
@@ -43,10 +47,6 @@ DECLARE_RESTRICTED_HOOK(android_rvh_iommu_limit_align_shift,
 	TP_PROTO(struct iova_domain *iovad, unsigned long size,
 		unsigned long *shift),
 	TP_ARGS(iovad, size, shift), 1);
-
-DECLARE_HOOK(android_vh_adjust_alloc_flags,
-	TP_PROTO(unsigned int order, gfp_t *alloc_flags),
-	TP_ARGS(order, alloc_flags));
 
 #endif /* _TRACE_HOOK_IOMMU_H */
 

@@ -23,7 +23,6 @@
 #include "../../block/blk.h"
 
 #include <trace/events/block.h>
-#include <trace/hooks/blk.h>
 
 #include "trace_output.h"
 
@@ -525,8 +524,7 @@ static int do_blk_trace_setup(struct request_queue *q, char *name, dev_t dev,
 	if (!buts->buf_size || !buts->buf_nr)
 		return -EINVAL;
 
-	strncpy(buts->name, name, BLKTRACE_BDEV_SIZE);
-	buts->name[BLKTRACE_BDEV_SIZE - 1] = '\0';
+	strscpy_pad(buts->name, name, BLKTRACE_BDEV_SIZE);
 
 	/*
 	 * some device names have larger paths - convert the slashes
@@ -1898,6 +1896,29 @@ void blk_fill_rwbs(char *rwbs, blk_opf_t opf)
 	case REQ_OP_READ:
 		rwbs[i++] = 'R';
 		break;
+	case REQ_OP_ZONE_APPEND:
+		rwbs[i++] = 'Z';
+		rwbs[i++] = 'A';
+		break;
+	case REQ_OP_ZONE_RESET:
+	case REQ_OP_ZONE_RESET_ALL:
+		rwbs[i++] = 'Z';
+		rwbs[i++] = 'R';
+		if ((opf & REQ_OP_MASK) == REQ_OP_ZONE_RESET_ALL)
+			rwbs[i++] = 'A';
+		break;
+	case REQ_OP_ZONE_FINISH:
+		rwbs[i++] = 'Z';
+		rwbs[i++] = 'F';
+		break;
+	case REQ_OP_ZONE_OPEN:
+		rwbs[i++] = 'Z';
+		rwbs[i++] = 'O';
+		break;
+	case REQ_OP_ZONE_CLOSE:
+		rwbs[i++] = 'Z';
+		rwbs[i++] = 'C';
+		break;
 	default:
 		rwbs[i++] = 'N';
 	}
@@ -1910,9 +1931,12 @@ void blk_fill_rwbs(char *rwbs, blk_opf_t opf)
 		rwbs[i++] = 'S';
 	if (opf & REQ_META)
 		rwbs[i++] = 'M';
+	if (opf & REQ_ATOMIC)
+		rwbs[i++] = 'U';
+
+	WARN_ON_ONCE(i >= RWBS_LEN);
 
 	rwbs[i] = '\0';
-	trace_android_vh_blk_fill_rwbs(rwbs, opf);
 }
 EXPORT_SYMBOL_GPL(blk_fill_rwbs);
 

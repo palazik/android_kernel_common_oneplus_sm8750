@@ -6,6 +6,7 @@
  */
 #define pr_fmt(fmt)	"PCI: OF: " fmt
 
+#include <linux/cleanup.h>
 #include <linux/irqdomain.h>
 #include <linux/kernel.h>
 #include <linux/pci.h>
@@ -13,6 +14,7 @@
 #include <linux/of_irq.h>
 #include <linux/of_address.h>
 #include <linux/of_pci.h>
+#include <linux/platform_device.h>
 #include "pci.h"
 
 #ifdef CONFIG_PCI
@@ -25,16 +27,20 @@
  */
 int pci_set_of_node(struct pci_dev *dev)
 {
-	struct device_node *node;
-
 	if (!dev->bus->dev.of_node)
 		return 0;
 
-	node = of_pci_find_child_device(dev->bus->dev.of_node, dev->devfn);
+	struct device_node *node __free(device_node) =
+		of_pci_find_child_device(dev->bus->dev.of_node, dev->devfn);
 	if (!node)
 		return 0;
 
-	device_set_node(&dev->dev, of_fwnode_handle(node));
+	struct device *pdev __free(put_device) =
+		bus_find_device_by_of_node(&platform_bus_type, node);
+	if (pdev)
+		dev->bus->dev.of_node_reused = true;
+
+	device_set_node(&dev->dev, of_fwnode_handle(no_free_ptr(node)));
 	return 0;
 }
 
@@ -451,9 +457,9 @@ failed:
  * @out_irq:    structure of_phandle_args filled by this function
  *
  * This function resolves the PCI interrupt for a given PCI device. If a
- * device-node exists for a given pci_dev, it will use normal OF tree
+ * device node exists for a given pci_dev, it will use normal OF tree
  * walking. If not, it will implement standard swizzling and walk up the
- * PCI tree until an device-node is found, at which point it will finish
+ * PCI tree until a device node is found, at which point it will finish
  * resolving using the OF tree walking.
  */
 static int of_irq_parse_pci(const struct pci_dev *pdev, struct of_phandle_args *out_irq)
@@ -513,13 +519,16 @@ static int of_irq_parse_pci(const struct pci_dev *pdev, struct of_phandle_args *
 		}
 
 		/*
-		 * Ok, we have found a parent with a device-node, hand over to
+		 * Ok, we have found a parent with a device node, hand over to
 		 * the OF parsing code.
+		 *
 		 * We build a unit address from the linux device to be used for
 		 * resolution. Note that we use the linux bus number which may
 		 * not match your firmware bus numbering.
+		 *
 		 * Fortunately, in most cases, interrupt-map-mask doesn't
 		 * include the bus number as part of the matching.
+		 *
 		 * You should still be careful about that though if you intend
 		 * to rely on this function (you ship a firmware that doesn't
 		 * create device nodes for all PCI devices).
@@ -721,6 +730,33 @@ out_free_name:
 	kfree(name);
 }
 #endif
+
+/**
+ * of_pci_supply_present() - Check if the power supply is present for the PCI
+ *				device
+ * @np: Device tree node
+ *
+ * Check if the power supply for the PCI device is present in the device tree
+ * node or not.
+ *
+ * Return: true if at least one power supply exists; false otherwise.
+ */
+bool of_pci_supply_present(struct device_node *np)
+{
+	struct property *prop;
+	char *supply;
+
+	if (!np)
+		return false;
+
+	for_each_property_of_node(np, prop) {
+		supply = strrchr(prop->name, '-');
+		if (supply && !strcmp(supply, "-supply"))
+			return true;
+	}
+
+	return false;
+}
 
 #endif /* CONFIG_PCI */
 

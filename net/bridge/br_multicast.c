@@ -145,8 +145,9 @@ static struct net_bridge_mdb_entry *br_mdb_ip6_get(struct net_bridge *br,
 }
 #endif
 
-struct net_bridge_mdb_entry *br_mdb_get(struct net_bridge_mcast *brmctx,
-					struct sk_buff *skb, u16 vid)
+struct net_bridge_mdb_entry *
+br_mdb_entry_skb_get(struct net_bridge_mcast *brmctx, struct sk_buff *skb,
+		     u16 vid)
 {
 	struct net_bridge *br = brmctx->br;
 	struct br_ip ip;
@@ -4641,31 +4642,10 @@ static void br_multicast_start_querier(struct net_bridge_mcast *brmctx,
 	rcu_read_unlock();
 }
 
-static void br_multicast_enable_all_ports(struct net_bridge *br)
-{
-	struct net_bridge_port *port;
-
-	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED))
-		return;
-
-	list_for_each_entry(port, &br->port_list, list)
-		__br_multicast_enable_port_ctx(&port->multicast_ctx);
-}
-
-static void br_multicast_disable_all_ports(struct net_bridge *br)
-{
-	struct net_bridge_port *port;
-
-	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED))
-		return;
-
-	list_for_each_entry(port, &br->port_list, list)
-		__br_multicast_disable_port_ctx(&port->multicast_ctx);
-}
-
 int br_multicast_toggle(struct net_bridge *br, unsigned long val,
 			struct netlink_ext_ack *extack)
 {
+	struct net_bridge_port *port;
 	bool change_snoopers = false;
 	int err = 0;
 
@@ -4682,7 +4662,6 @@ int br_multicast_toggle(struct net_bridge *br, unsigned long val,
 	br_opt_toggle(br, BROPT_MULTICAST_ENABLED, !!val);
 	if (!br_opt_get(br, BROPT_MULTICAST_ENABLED)) {
 		change_snoopers = true;
-		br_multicast_disable_all_ports(br);
 		goto unlock;
 	}
 
@@ -4690,7 +4669,8 @@ int br_multicast_toggle(struct net_bridge *br, unsigned long val,
 		goto unlock;
 
 	br_multicast_open(br);
-	br_multicast_enable_all_ports(br);
+	list_for_each_entry(port, &br->port_list, list)
+		__br_multicast_enable_port_ctx(&port->multicast_ctx);
 
 	change_snoopers = true;
 
@@ -5174,7 +5154,7 @@ void br_multicast_uninit_stats(struct net_bridge *br)
 	free_percpu(br->mcast_stats);
 }
 
-/* noinline for https://bugs.llvm.org/show_bug.cgi?id=45802#c9 */
+/* noinline for https://llvm.org/pr45802#c9 */
 static noinline_for_stack void mcast_stats_add_dir(u64 *dst, u64 *src)
 {
 	dst[BR_MCAST_DIR_RX] += src[BR_MCAST_DIR_RX];

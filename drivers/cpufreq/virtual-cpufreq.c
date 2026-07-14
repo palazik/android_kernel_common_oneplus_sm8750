@@ -229,12 +229,10 @@ static int virt_cpufreq_cpu_init(struct cpufreq_policy *policy)
 	return 0;
 }
 
-static int virt_cpufreq_cpu_exit(struct cpufreq_policy *policy)
+static void virt_cpufreq_cpu_exit(struct cpufreq_policy *policy)
 {
 	topology_clear_scale_freq_source(SCALE_FREQ_SOURCE_VIRT, policy->related_cpus);
 	kfree(policy->freq_table);
-
-	return 0;
 }
 
 static int virt_cpufreq_online(struct cpufreq_policy *policy)
@@ -299,11 +297,9 @@ static int virt_cpufreq_driver_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int virt_cpufreq_driver_remove(struct platform_device *pdev)
+static void virt_cpufreq_driver_remove(struct platform_device *pdev)
 {
 	cpufreq_unregister_driver(&cpufreq_virt_driver);
-
-	return 0;
 }
 
 static const struct of_device_id virt_cpufreq_match[] = {

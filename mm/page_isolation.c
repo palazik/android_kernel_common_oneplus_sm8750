@@ -70,7 +70,7 @@ static struct page *has_unmovable_pages(unsigned long start_pfn, unsigned long e
 		 * pages then it should be reasonably safe to assume the rest
 		 * is movable.
 		 */
-		if (zid_is_virt(zone_idx(zone)))
+		if (zone_idx(zone) == ZONE_MOVABLE)
 			continue;
 
 		/*
@@ -153,6 +153,9 @@ static int set_migratetype_isolate(struct page *page, int migratetype, int isol_
 	unsigned long flags;
 	unsigned long check_unmovable_start, check_unmovable_end;
 
+	if (PageUnaccepted(page))
+		accept_page(page);
+
 	spin_lock_irqsave(&zone->lock, flags);
 
 	/*
@@ -223,7 +226,7 @@ static void unset_migratetype_isolate(struct page *page, int migratetype)
 	 */
 	if (PageBuddy(page)) {
 		order = buddy_order(page);
-		if (order >= pageblock_order && order < MAX_ORDER) {
+		if (order >= pageblock_order && order < MAX_PAGE_ORDER) {
 			buddy = find_buddy_page_pfn(page, page_to_pfn(page),
 						    order, NULL);
 			if (buddy && !is_migrate_isolate_page(buddy)) {
@@ -290,11 +293,12 @@ __first_valid_page(unsigned long pfn, unsigned long nr_pages)
  *			isolate_single_pageblock()
  * @migratetype:	migrate type to set in error recovery.
  *
- * Free and in-use pages can be as big as MAX_ORDER and contain more than one
+ * Free and in-use pages can be as big as MAX_PAGE_ORDER and contain more than one
  * pageblock. When not all pageblocks within a page are isolated at the same
  * time, free page accounting can go wrong. For example, in the case of
- * MAX_ORDER = pageblock_order + 1, a MAX_ORDER page has two pagelbocks.
- * [         MAX_ORDER           ]
+ * MAX_PAGE_ORDER = pageblock_order + 1, a MAX_PAGE_ORDER page has two
+ * pagelbocks.
+ * [      MAX_PAGE_ORDER         ]
  * [  pageblock0  |  pageblock1  ]
  * When either pageblock is isolated, if it is a free page, the page is not
  * split into separate migratetype lists, which is supposed to; if it is an
@@ -367,6 +371,11 @@ static int isolate_single_pageblock(unsigned long boundary_pfn, int flags,
 		VM_BUG_ON(!page);
 		pfn = page_to_pfn(page);
 
+		if (PageUnaccepted(page)) {
+			pfn += MAX_ORDER_NR_PAGES;
+			continue;
+		}
+
 		if (PageBuddy(page)) {
 			int order = buddy_order(page);
 
@@ -395,31 +404,8 @@ static int isolate_single_pageblock(unsigned long boundary_pfn, int flags,
 			unsigned long head_pfn = page_to_pfn(head);
 			unsigned long nr_pages = compound_nr(head);
 
-			if (head_pfn + nr_pages <= boundary_pfn) {
-				pfn = head_pfn + nr_pages;
-				continue;
-			}
-
-#if defined CONFIG_COMPACTION || defined CONFIG_CMA
-			if (PageHuge(page)) {
-				int page_mt = get_pageblock_migratetype(page);
-				struct compact_control cc = {
-					.nr_migratepages = 0,
-					.order = -1,
-					.zone = page_zone(pfn_to_page(head_pfn)),
-					.mode = MIGRATE_SYNC,
-					.ignore_skip_hint = true,
-					.no_set_skip_hint = true,
-					.gfp_mask = gfp_flags,
-					.alloc_contig = true,
-				};
-				INIT_LIST_HEAD(&cc.migratepages);
-
-				ret = __alloc_contig_migrate_range(&cc, head_pfn,
-							head_pfn + nr_pages, page_mt);
-
-				if (ret)
-					goto failed;
+			if (head_pfn + nr_pages <= boundary_pfn ||
+			    PageHuge(page)) {
 				pfn = head_pfn + nr_pages;
 				continue;
 			}
@@ -433,7 +419,7 @@ static int isolate_single_pageblock(unsigned long boundary_pfn, int flags,
 			 */
 			VM_WARN_ON_ONCE_PAGE(PageLRU(page), page);
 			VM_WARN_ON_ONCE_PAGE(__PageMovable(page), page);
-#endif
+
 			goto failed;
 		}
 
@@ -627,8 +613,18 @@ int test_pages_isolated(unsigned long start_pfn, unsigned long end_pfn,
 	int ret;
 
 	/*
-	 * Note: pageblock_nr_pages != MAX_ORDER. Then, chunks of free pages
-	 * are not aligned to pageblock_nr_pages.
+	 * Due to the deferred freeing of hugetlb folios, the hugepage folios may
+	 * not immediately release to the buddy system. This can cause PageBuddy()
+	 * to fail in __test_page_isolated_in_pageblock(). To ensure that the
+	 * hugetlb folios are properly released back to the buddy system, we
+	 * invoke the wait_for_freed_hugetlb_folios() function to wait for the
+	 * release to complete.
+	 */
+	wait_for_freed_hugetlb_folios();
+
+	/*
+	 * Note: pageblock_nr_pages != MAX_PAGE_ORDER. Then, chunks of free
+	 * pages are not aligned to pageblock_nr_pages.
 	 * Then we just check migratetype first.
 	 */
 	for (pfn = start_pfn; pfn < end_pfn; pfn += pageblock_nr_pages) {

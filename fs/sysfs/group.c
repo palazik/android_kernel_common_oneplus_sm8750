@@ -179,7 +179,7 @@ static int internal_create_group(struct kobject *kobj, int update,
 	kernfs_get(kn);
 	error = create_files(kn, kobj, uid, gid, grp, update);
 	if (error) {
-		if (grp->name && !update)
+		if (grp->name)
 			kernfs_remove(kn);
 	}
 	kernfs_put(kn);
@@ -345,13 +345,13 @@ void sysfs_remove_groups(struct kobject *kobj,
 EXPORT_SYMBOL_GPL(sysfs_remove_groups);
 
 /**
- * sysfs_merge_group - merge files into a pre-existing attribute group.
+ * sysfs_merge_group - merge files into a pre-existing named attribute group.
  * @kobj:	The kobject containing the group.
  * @grp:	The files to create and the attribute group they belong to.
  *
- * This function returns an error if the group doesn't exist or any of the
- * files already exist in that group, in which case none of the new files
- * are created.
+ * This function returns an error if the group doesn't exist, the .name field is
+ * NULL or any of the files already exist in that group, in which case none of
+ * the new files are created.
  */
 int sysfs_merge_group(struct kobject *kobj,
 		       const struct attribute_group *grp)
@@ -383,7 +383,7 @@ int sysfs_merge_group(struct kobject *kobj,
 EXPORT_SYMBOL_GPL(sysfs_merge_group);
 
 /**
- * sysfs_unmerge_group - remove files from a pre-existing attribute group.
+ * sysfs_unmerge_group - remove files from a pre-existing named attribute group.
  * @kobj:	The kobject containing the group.
  * @grp:	The files to remove and the attribute group they belong to.
  */

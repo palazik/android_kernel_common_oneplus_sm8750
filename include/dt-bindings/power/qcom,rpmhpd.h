@@ -27,6 +27,7 @@
 #define RPMHPD_DDR              17
 #define RPMHPD_XO               18
 #define RPMHPD_NSP2             19
+#define RPMHPD_GMXC		20
 
 /* RPMh Power Domain performance levels */
 #define RPMH_REGULATOR_LEVEL_RETENTION		16

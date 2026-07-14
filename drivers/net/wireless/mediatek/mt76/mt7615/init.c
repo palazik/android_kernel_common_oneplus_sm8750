@@ -61,10 +61,7 @@ int mt7615_thermal_init(struct mt7615_dev *dev)
 
 	hwmon = devm_hwmon_device_register_with_groups(&wiphy->dev, name, dev,
 						       mt7615_hwmon_groups);
-	if (IS_ERR(hwmon))
-		return PTR_ERR(hwmon);
-
-	return 0;
+	return PTR_ERR_OR_ZERO(hwmon);
 }
 EXPORT_SYMBOL_GPL(mt7615_thermal_init);
 
@@ -573,7 +570,10 @@ int mt7615_register_ext_phy(struct mt7615_dev *dev)
 	       ETH_ALEN);
 	mphy->macaddr[0] |= 2;
 	mphy->macaddr[0] ^= BIT(7);
-	mt76_eeprom_override(mphy);
+
+	ret = mt76_eeprom_override(mphy);
+	if (ret)
+		return ret;
 
 	/* second phy can only handle 5 GHz */
 	mphy->cap.has_5ghz = true;

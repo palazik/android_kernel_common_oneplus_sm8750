@@ -28,8 +28,8 @@ struct kernel_info {
 	__u16 bit_per_long;
 	__u16 module_name_len;
 	__u16 symbol_len;
-	__u64 _addresses_pa;
 	__u64 _relative_pa;
+	__u64 _text_pa;
 	__u64 _stext_pa;
 	__u64 _etext_pa;
 	__u64 _sinittext_pa;
@@ -40,6 +40,7 @@ struct kernel_info {
 	__u64 _token_table_pa;
 	__u64 _token_index_pa;
 	__u64 _markers_pa;
+	__u64 _seqs_of_names_pa;
 
 	/* For frame pointer */
 	__u32 thread_size;

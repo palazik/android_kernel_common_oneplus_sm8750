@@ -61,11 +61,6 @@ struct smsc75xx_priv {
 	u8 suspend_flags;
 };
 
-struct usb_context {
-	struct usb_ctrlrequest req;
-	struct usbnet *dev;
-};
-
 static bool turbo_mode = true;
 module_param(turbo_mode, bool, 0644);
 MODULE_PARM_DESC(turbo_mode, "Enable multiple frames per Rx transaction");
@@ -2221,8 +2216,7 @@ static int smsc75xx_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 				dev->net->stats.rx_frame_errors++;
 		} else {
 			/* MAX_SINGLE_PACKET_SIZE + 4(CRC) + 2(COE) + 4(Vlan) */
-			if (unlikely(size > (MAX_SINGLE_PACKET_SIZE + ETH_HLEN + 12) ||
-				size > skb->len)) {
+			if (unlikely(size > (MAX_SINGLE_PACKET_SIZE + ETH_HLEN + 12))) {
 				netif_dbg(dev, rx_err, dev->net,
 					  "size err rx_cmd_a=0x%08x\n",
 					  rx_cmd_a);
@@ -2235,26 +2229,22 @@ static int smsc75xx_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 					rx_cmd_b);
 
 				skb_trim(skb, skb->len - 4); /* remove fcs */
-				skb->truesize = size + sizeof(struct sk_buff);
 
 				return 1;
 			}
 
-			ax_skb = skb_clone(skb, GFP_ATOMIC);
+			/* Use "size - 4" to remove fcs */
+			ax_skb = netdev_alloc_skb_ip_align(dev->net, size - 4);
 			if (unlikely(!ax_skb)) {
 				netdev_warn(dev->net, "Error allocating skb\n");
 				return 0;
 			}
 
-			ax_skb->len = size;
-			ax_skb->data = packet;
-			skb_set_tail_pointer(ax_skb, size);
+			skb_put(ax_skb, size - 4);
+			memcpy(ax_skb->data, packet, size - 4);
 
 			smsc75xx_rx_csum_offload(dev, ax_skb, rx_cmd_a,
 				rx_cmd_b);
-
-			skb_trim(ax_skb, ax_skb->len - 4); /* remove fcs */
-			ax_skb->truesize = size + sizeof(struct sk_buff);
 
 			usbnet_skb_return(dev, ax_skb);
 		}

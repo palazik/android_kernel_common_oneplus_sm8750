@@ -591,5 +591,5 @@ static void __exit exit_sysv_fs(void)
 
 module_init(init_sysv_fs)
 module_exit(exit_sysv_fs)
+MODULE_DESCRIPTION("SystemV Filesystem");
 MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);

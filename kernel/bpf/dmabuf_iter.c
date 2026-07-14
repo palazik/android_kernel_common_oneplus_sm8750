@@ -156,6 +156,8 @@ struct bpf_iter_dmabuf_kern {
 	struct dma_buf *dmabuf;
 } __aligned(8);
 
+__bpf_kfunc_start_defs();
+
 __bpf_kfunc int bpf_iter_dmabuf_new(struct bpf_iter_dmabuf *it)
 {
 	struct bpf_iter_dmabuf_kern *kit = (void *)it;
@@ -186,3 +188,5 @@ __bpf_kfunc void bpf_iter_dmabuf_destroy(struct bpf_iter_dmabuf *it)
 	if (kit->dmabuf)
 		dma_buf_put(kit->dmabuf);
 }
+
+__bpf_kfunc_end_defs();

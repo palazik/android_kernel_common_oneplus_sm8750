@@ -48,7 +48,7 @@
 
 #include <trace/events/scsi.h>
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 /*
  * These should *probably* be handled by the host itself.
@@ -311,6 +311,7 @@ void scsi_eh_scmd_add(struct scsi_cmnd *scmd)
 	int ret;
 
 	WARN_ON_ONCE(!shost->ehandler);
+	WARN_ON_ONCE(!test_bit(SCMD_STATE_INFLIGHT, &scmd->state));
 
 	spin_lock_irqsave(shost->host_lock, flags);
 	if (scsi_host_set_state(shost, SHOST_RECOVERY)) {
@@ -708,6 +709,22 @@ enum scsi_disposition scsi_check_sense(struct scsi_cmnd *scmd)
 		fallthrough;
 
 	case ILLEGAL_REQUEST:
+		/*
+		 * Unaligned write command. This may indicate that zoned writes
+		 * have been received by the device in the wrong order. If write
+		 * pipelining is enabled, retry.
+		 */
+		if (sshdr.asc == 0x21 && sshdr.ascq == 0x04 &&
+		    blk_pipeline_zwr(req->q) &&
+		    blk_rq_is_seq_zoned_write(req) &&
+		    scsi_cmd_retry_allowed(scmd)) {
+			SCSI_LOG_ERROR_RECOVERY(1,
+				sdev_printk(KERN_WARNING, scmd->device,
+				"Retrying unaligned write at LBA %#llx.\n",
+				scsi_get_lba(scmd)));
+			return NEEDS_RETRY;
+		}
+
 		if (sshdr.asc == 0x20 || /* Invalid command operation code */
 		    sshdr.asc == 0x21 || /* Logical block address out of range */
 		    sshdr.asc == 0x22 || /* Invalid function */
@@ -1887,10 +1904,7 @@ check_type:
 	 * assume caller has checked sense and determined
 	 * the check condition was retryable.
 	 */
-	if (req->cmd_flags & REQ_FAILFAST_DEV)
-		return true;
-	if (blk_rq_is_passthrough(req) &&
-	    !(scmd->flags & SCMD_RETRY_PASSTHROUGH))
+	if (req->cmd_flags & REQ_FAILFAST_DEV || blk_rq_is_passthrough(req))
 		return true;
 
 	return false;

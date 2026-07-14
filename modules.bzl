@@ -6,7 +6,6 @@ This module contains a full list of kernel modules
  compiled by GKI.
 """
 
-# LINT.IfChange
 _COMMON_GKI_MODULES_LIST = [
     # keep sorted
     "drivers/block/virtio_blk.ko",
@@ -16,6 +15,7 @@ _COMMON_GKI_MODULES_LIST = [
     "drivers/bluetooth/btsdio.ko",
     "drivers/bluetooth/hci_uart.ko",
     "drivers/char/virtio_console.ko",
+    "drivers/gnss/gnss.ko",
     "drivers/misc/vcpu_stall_detector.ko",
     "drivers/net/can/dev/can-dev.ko",
     "drivers/net/can/slcan/slcan.ko",
@@ -40,9 +40,11 @@ _COMMON_GKI_MODULES_LIST = [
     "drivers/net/usb/rtl8150.ko",
     "drivers/net/usb/usbnet.ko",
     "drivers/net/wwan/wwan.ko",
+    "drivers/power/sequencing/pwrseq-core.ko",
     "drivers/pps/pps_core.ko",
     "drivers/ptp/ptp.ko",
     "drivers/usb/class/cdc-acm.ko",
+    "drivers/usb/host/xhci-pci-renesas.ko",
     "drivers/usb/mon/usbmon.ko",
     "drivers/usb/serial/ftdi_sio.ko",
     "drivers/usb/serial/usbserial.ko",
@@ -50,6 +52,7 @@ _COMMON_GKI_MODULES_LIST = [
     "drivers/virtio/virtio_pci.ko",
     "drivers/virtio/virtio_pci_legacy_dev.ko",
     "drivers/virtio/virtio_pci_modern_dev.ko",
+    "fs/netfs/netfs.ko",
     "kernel/kheaders.ko",
     "lib/crypto/libarc4.ko",
     "mm/zsmalloc.ko",
@@ -79,8 +82,8 @@ _COMMON_GKI_MODULES_LIST = [
     "net/mac802154/mac802154.ko",
     "net/nfc/nfc.ko",
     "net/rfkill/rfkill.ko",
-    "net/tipc/diag.ko",
     "net/tipc/tipc.ko",
+    "net/tipc/tipc_diag.ko",
     "net/vmw_vsock/vmw_vsock_virtio_transport.ko",
 ]
 
@@ -90,16 +93,29 @@ COMMON_GKI_MODULES_LIST = _COMMON_GKI_MODULES_LIST
 _ARM_GKI_MODULES_LIST = [
     # keep sorted
     "drivers/ptp/ptp_kvm.ko",
+    "fs/pstore/pstore_blk.ko",
+    "fs/pstore/pstore_zone.ko",
+    "sound/pci/hda/snd-hda-codec-hdmi.ko",
+    "sound/soc/generic/snd-soc-audio-graph-card.ko",
+    "sound/soc/generic/snd-soc-simple-card-utils.ko",
 ]
 
 _ARM64_GKI_MODULES_LIST = [
     # keep sorted
+    "arch/arm64/crypto/aes-neon-blk.ko",
     "arch/arm64/geniezone/gzvm.ko",
+    "drivers/android/binder/rust_binder.ko",
     "drivers/char/hw_random/cctrng.ko",
     "drivers/misc/open-dice.ko",
     "drivers/ptp/ptp_kvm.ko",
+    "drivers/virt/halla/exynos-hvm.ko",
+    "fs/efivarfs/efivarfs.ko",
+    "fs/pstore/pstore_blk.ko",
+    "fs/pstore/pstore_zone.ko",
+    "sound/pci/hda/snd-hda-codec-hdmi.ko",
+    "sound/soc/generic/snd-soc-audio-graph-card.ko",
+    "sound/soc/generic/snd-soc-simple-card-utils.ko",
 ]
-# LINT.ThenChange(android/abi_gki_protected_exports_aarch64)
 
 _X86_GKI_MODULES_LIST = [
     # keep sorted
@@ -108,6 +124,7 @@ _X86_GKI_MODULES_LIST = [
 
 _X86_64_GKI_MODULES_LIST = [
     # keep sorted
+    "drivers/android/binder/rust_binder.ko",
     "drivers/ptp/ptp_kvm.ko",
 ]
 
@@ -142,7 +159,7 @@ _KUNIT_FRAMEWORK_MODULES = [
     "lib/kunit/kunit.ko",
 ]
 
-# Common Kunit test modules
+# Modules defined by tools/testing/kunit/configs/android/kunit_defconfig
 _KUNIT_COMMON_MODULES_LIST = [
     # keep sorted
     "drivers/base/regmap/regmap-kunit.ko",
@@ -151,22 +168,25 @@ _KUNIT_COMMON_MODULES_LIST = [
     "drivers/hid/hid-uclogic-test.ko",
     "drivers/iio/test/iio-test-format.ko",
     "drivers/input/tests/input_test.ko",
+    "drivers/of/of_kunit_helpers.ko",
     "drivers/rtc/lib_test.ko",
     "fs/ext4/ext4-inode-test.ko",
     "fs/fat/fat_test.ko",
     "kernel/time/time_test.ko",
     "lib/kunit/kunit-example-test.ko",
     "lib/kunit/kunit-test.ko",
+    "lib/kunit/platform-test.ko",
     # "mm/kfence/kfence_test.ko",
     "net/core/dev_addr_lists_test.ko",
     "sound/soc/soc-topology-test.ko",
     "sound/soc/soc-utils-test.ko",
 ]
 
-# KUnit test module for arm64 only
+# Modules defined by tools/testing/kunit/configs/android/kunit_clk_defconfig
 _KUNIT_CLK_MODULES_LIST = [
     "drivers/clk/clk-gate_test.ko",
-    "drivers/clk/clk_test.ko",
+    "drivers/clk/clk-test.ko",
+    "drivers/clk/clk_kunit_helpers.ko",
 ]
 
 # buildifier: disable=unnamed-macro
@@ -196,17 +216,14 @@ def get_kunit_modules_list(arch = None):
 
     return kunit_modules_list
 
-# LINT.IfChange
 _COMMON_UNPROTECTED_MODULES_LIST = [
     "drivers/block/zram/zram.ko",
-    "kernel/kheaders.ko",
     "mm/zsmalloc.ko",
 ]
-# LINT.ThenChange(android/abi_gki_protected_exports_aarch64)
 
 # buildifier: disable=unnamed-macro
 def get_gki_protected_modules_list(arch = None):
     all_gki_modules = get_gki_modules_list(arch) + get_kunit_modules_list(arch)
     unprotected_modules = _COMMON_UNPROTECTED_MODULES_LIST
     protected_modules = [mod for mod in all_gki_modules if mod not in unprotected_modules]
-    return protected_modules
+    return sorted(protected_modules)

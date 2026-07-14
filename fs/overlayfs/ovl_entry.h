@@ -18,8 +18,7 @@ struct ovl_config {
 	int xino;
 	bool metacopy;
 	bool userxattr;
-	bool ovl_volatile;
-	bool override_creds;
+	int fsync_mode;
 };
 
 struct ovl_sb {
@@ -41,6 +40,8 @@ struct ovl_layer {
 	int idx;
 	/* One fsid per unique underlying sb (upper fsid == 0) */
 	int fsid;
+	/* xwhiteouts were found on this layer */
+	bool has_xwhiteouts;
 };
 
 struct ovl_path {
@@ -60,14 +61,12 @@ struct ovl_fs {
 	unsigned int numfs;
 	/* Number of data-only lower layers */
 	unsigned int numdatalayer;
-	const struct ovl_layer *layers;
+	struct ovl_layer *layers;
 	struct ovl_sb *fs;
 	/* workbasedir is the path at workdir= mount option */
 	struct dentry *workbasedir;
-	/* workdir is the 'work' directory under workbasedir */
+	/* workdir is the 'work' or 'index' directory under workbasedir */
 	struct dentry *workdir;
-	/* index directory listing overlay inodes by origin file handle */
-	struct dentry *indexdir;
 	long namelen;
 	/* pathnames of lower and upper dirs, for show_options */
 	struct ovl_config config;
@@ -82,7 +81,6 @@ struct ovl_fs {
 	/* Traps in ovl inode cache */
 	struct inode *workbasedir_trap;
 	struct inode *workdir_trap;
-	struct inode *indexdir_trap;
 	/* -1: disabled, 0: same fs, 1..32: number of unused ino bits */
 	int xino_mode;
 	/* For allocation of non-persistent inode numbers */
@@ -118,11 +116,6 @@ static inline struct ovl_fs *OVL_FS(struct super_block *sb)
 		WARN_ON_ONCE(sb->s_type != &ovl_fs_type);
 
 	return (struct ovl_fs *)sb->s_fs_info;
-}
-
-static inline bool ovl_should_sync(struct ovl_fs *ofs)
-{
-	return !ofs->config.ovl_volatile;
 }
 
 static inline unsigned int ovl_numlower(struct ovl_entry *oe)

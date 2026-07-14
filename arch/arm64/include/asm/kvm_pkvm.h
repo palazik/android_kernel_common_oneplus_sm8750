@@ -13,23 +13,6 @@
 #include <asm/kvm_pgtable.h>
 #include <asm/sysreg.h>
 
-/*
- * Stores the sve state for the host in protected mode.
- */
-struct kvm_host_sve_state {
-	u64 zcr_el1;
-
-	/*
-	 * Ordering is important since __sve_save_state/__sve_restore_state
-	 * relies on it.
-	 */
-	u32 fpsr;
-	u32 fpcr;
-
-	/* Must be SVE_VQ_BYTES (128 bit) aligned. */
-	char sve_regs[];
-};
-
 /* Maximum number of VMs that can co-exist under pKVM. */
 #define KVM_MAX_PVMS 255
 
@@ -40,212 +23,69 @@ int pkvm_vm_ioctl_enable_cap(struct kvm *kvm,struct kvm_enable_cap *cap);
 int pkvm_init_host_vm(struct kvm *kvm, unsigned long type);
 int pkvm_create_hyp_vm(struct kvm *kvm);
 void pkvm_destroy_hyp_vm(struct kvm *kvm);
+bool pkvm_is_hyp_created(struct kvm *kvm);
+int pkvm_create_hyp_vcpu(struct kvm_vcpu *vcpu);
 void pkvm_host_reclaim_page(struct kvm *host_kvm, phys_addr_t ipa);
-
+int pvkm_enable_smc_forwarding(struct file *kvm_file);
 /*
- * Definitions for features to be allowed or restricted for guest virtual
- * machines, depending on the mode KVM is running in and on the type of guest
- * that is running.
- *
- * Each field in the masks represents the highest supported *unsigned* value for
- * the feature, if supported by the system.
- *
- * If a feature field is not present in either, than it is not supported.
- *
- * The approach taken for protected VMs is to allow features that are:
- * - Needed by common Linux distributions (e.g., floating point)
- * - Trivial to support, e.g., supporting the feature does not introduce or
- * require tracking of additional state in KVM
- * - Cannot be trapped or prevent the guest from using anyway
+ * This functions as an allow-list of protected VM capabilities.
+ * Features not explicitly allowed by this function are denied.
  */
+static inline bool kvm_pvm_ext_allowed(long ext)
+{
+	switch (ext) {
+	case KVM_CAP_IRQCHIP:
+	case KVM_CAP_ONE_REG:
+	case KVM_CAP_ARM_PSCI:
+	case KVM_CAP_ARM_PSCI_0_2:
+	case KVM_CAP_NR_VCPUS:
+	case KVM_CAP_MAX_VCPUS:
+	case KVM_CAP_MAX_VCPU_ID:
+	case KVM_CAP_MSI_DEVID:
+	case KVM_CAP_ARM_VM_IPA_SIZE:
+	case KVM_CAP_ARM_PMU_V3:
+	case KVM_CAP_ARM_SVE:
+	case KVM_CAP_ARM_PTRAUTH_ADDRESS:
+	case KVM_CAP_ARM_PTRAUTH_GENERIC:
+	case KVM_CAP_ARM_PROTECTED_VM:
+		return true;
+	default:
+		return false;
+	}
+}
 
-/*
- * Allow for protected VMs:
- * - Floating-point and Advanced SIMD
- * - GICv3(+) system register interface
- * - Data Independent Timing
- *
- * Restrict to the following *unsigned* features for protected VMs:
- * - AArch64 guests only (no support for AArch32 guests):
- *	AArch32 adds complexity in trap handling, emulation, condition codes,
- *	etc...
- * - SVE
- * - RAS (v1)
- *	Supported by KVM
- */
-#define PVM_ID_AA64PFR0_ALLOW (\
-	ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_FP) | \
-	ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_AdvSIMD) | \
-	ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_GIC) | \
-	ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_DIT) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_EL0), ID_AA64PFR0_EL1_ELx_64BIT_ONLY) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_EL1), ID_AA64PFR0_EL1_ELx_64BIT_ONLY) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_EL2), ID_AA64PFR0_EL1_ELx_64BIT_ONLY) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_EL3), ID_AA64PFR0_EL1_ELx_64BIT_ONLY) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_SVE), ID_AA64PFR0_EL1_SVE_IMP) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_RAS), ID_AA64PFR0_EL1_RAS_IMP) \
-	)
+static inline unsigned long pvm_supported_vcpu_features(void)
+{
+	unsigned long features = 0;
 
-/*
- * Allow for protected VMs:
- * - Branch Target Identification
- * - Speculative Store Bypassing
- */
-#define PVM_ID_AA64PFR1_ALLOW (\
-	ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_BT) | \
-	ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_SSBS) \
-	)
+	set_bit(KVM_ARM_VCPU_POWER_OFF, &features);
 
-#define PVM_ID_AA64PFR2_ALLOW (0ULL)
+	if (kvm_pvm_ext_allowed(KVM_CAP_ARM_EL1_32BIT))
+		set_bit(KVM_ARM_VCPU_EL1_32BIT, &features);
 
-/*
- * Allow for protected VMs:
- * - Mixed-endian
- * - Distinction between Secure and Non-secure Memory
- * - Mixed-endian at EL0 only
- * - Non-context synchronizing exception entry and exit
- *
- * Restrict to the following *unsigned* features for protected VMs:
- * - 40-bit IPA
- * - 16-bit ASID
- */
-#define PVM_ID_AA64MMFR0_ALLOW (\
-	ARM64_FEATURE_MASK(ID_AA64MMFR0_EL1_BIGEND) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR0_EL1_SNSMEM) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR0_EL1_BIGENDEL0) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR0_EL1_TGRAN16) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR0_EL1_EXS) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64MMFR0_EL1_PARANGE), ID_AA64MMFR0_EL1_PARANGE_40) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64MMFR0_EL1_ASIDBITS), ID_AA64MMFR0_EL1_ASIDBITS_16) \
-	)
+	if (kvm_pvm_ext_allowed(KVM_CAP_ARM_PSCI_0_2))
+		set_bit(KVM_ARM_VCPU_PSCI_0_2, &features);
 
-/*
- * Allow for protected VMs:
- * - Hardware translation table updates to Access flag and Dirty state
- * - Number of VMID bits from CPU
- * - Hierarchical Permission Disables
- * - Privileged Access Never
- * - SError interrupt exceptions from speculative reads
- * - Enhanced Translation Synchronization
- * - Control for cache maintenance permission
- */
-#define PVM_ID_AA64MMFR1_ALLOW (\
-	ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_HAFDBS) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_VMIDBits) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_HPDS) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_PAN) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_SpecSEI) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_ETS) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_CMOW) \
-	)
+	if (kvm_pvm_ext_allowed(KVM_CAP_ARM_PMU_V3))
+		set_bit(KVM_ARM_VCPU_PMU_V3, &features);
 
-/*
- * Allow for protected VMs:
- * - Common not Private translations
- * - User Access Override
- * - IESB bit in the SCTLR_ELx registers
- * - Unaligned single-copy atomicity and atomic functions
- * - ESR_ELx.EC value on an exception by read access to feature ID space
- * - TTL field in address operations.
- * - Break-before-make sequences when changing translation block size
- * - E0PDx mechanism
- */
-#define PVM_ID_AA64MMFR2_ALLOW (\
-	ARM64_FEATURE_MASK(ID_AA64MMFR2_EL1_CnP) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR2_EL1_UAO) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR2_EL1_IESB) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR2_EL1_AT) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR2_EL1_IDS) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR2_EL1_TTL) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR2_EL1_BBM) | \
-	ARM64_FEATURE_MASK(ID_AA64MMFR2_EL1_E0PD) \
-	)
+	if (kvm_pvm_ext_allowed(KVM_CAP_ARM_SVE))
+		set_bit(KVM_ARM_VCPU_SVE, &features);
 
-#define PVM_ID_AA64MMFR3_ALLOW (0ULL)
+	if (kvm_pvm_ext_allowed(KVM_CAP_ARM_PTRAUTH_ADDRESS) &&
+	    kvm_pvm_ext_allowed(KVM_CAP_ARM_PTRAUTH_GENERIC)) {
+		set_bit(KVM_ARM_VCPU_PTRAUTH_ADDRESS, &features);
+		set_bit(KVM_ARM_VCPU_PTRAUTH_GENERIC, &features);
+	}
 
-/*
- * No restrictions for Scalable Vectors (SVE).
- */
-#define PVM_ID_AA64ZFR0_ALLOW (\
-	ARM64_FEATURE_MASK(ID_AA64ZFR0_EL1_SVEver) | \
-	ARM64_FEATURE_MASK(ID_AA64ZFR0_EL1_AES) | \
-	ARM64_FEATURE_MASK(ID_AA64ZFR0_EL1_BitPerm) | \
-	ARM64_FEATURE_MASK(ID_AA64ZFR0_EL1_BF16) | \
-	ARM64_FEATURE_MASK(ID_AA64ZFR0_EL1_SHA3) | \
-	ARM64_FEATURE_MASK(ID_AA64ZFR0_EL1_SM4) | \
-	ARM64_FEATURE_MASK(ID_AA64ZFR0_EL1_I8MM) | \
-	ARM64_FEATURE_MASK(ID_AA64ZFR0_EL1_F32MM) | \
-	ARM64_FEATURE_MASK(ID_AA64ZFR0_EL1_F64MM) \
-	)
-
-/*
- * No support for debug, including breakpoints, and watchpoints for protected
- * VMs:
- *	The Arm architecture mandates support for at least the Armv8 debug
- *	architecture, which would include at least 2 hardware breakpoints and
- *	watchpoints. Providing that support to protected guests adds
- *	considerable state and complexity. Therefore, the reserved value of 0 is
- *	used for debug-related fields.
- */
-#define PVM_ID_AA64DFR0_ALLOW (0ULL)
-#define PVM_ID_AA64DFR1_ALLOW (0ULL)
-
-/*
- * No support for implementation defined features.
- */
-#define PVM_ID_AA64AFR0_ALLOW (0ULL)
-#define PVM_ID_AA64AFR1_ALLOW (0ULL)
-
-/*
- * No restrictions on instructions implemented in AArch64.
- */
-#define PVM_ID_AA64ISAR0_ALLOW (\
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_AES) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_SHA1) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_SHA2) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_CRC32) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_ATOMIC) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_RDM) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_SHA3) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_SM3) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_SM4) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_DP) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_FHM) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_TS) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_TLB) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_RNDR) \
-	)
-
-/* Restrict pointer authentication to the basic version. */
-#define PVM_ID_AA64ISAR1_ALLOW (\
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_DPB) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_JSCVT) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_FCMA) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_LRCPC) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_GPA) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_GPI) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_FRINTTS) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_SB) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_SPECRES) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_BF16) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_DGH) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_I8MM) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_APA), ID_AA64ISAR1_EL1_APA_PAuth) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_API), ID_AA64ISAR1_EL1_API_PAuth) \
-	)
-
-#define PVM_ID_AA64ISAR2_ALLOW (\
-	ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_ATS1A) | \
-	ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_GPA3) | \
-	FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_APA3), ID_AA64ISAR2_EL1_APA3_PAuth) \
-	)
-
+	return features;
+}
 
 /* All HAFGRTR_EL2 bits are AMU */
 #define HAFGRTR_AMU	__HAFGRTR_EL2_MASK
 
 #define PVM_HAFGRTR_EL2_SET \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_AMU), PVM_ID_AA64PFR0_ALLOW) ? 0ULL : HAFGRTR_AMU)
+	(kvm_has_feat(kvm, ID_AA64PFR0_EL1, AMU, IMP) ? 0ULL : HAFGRTR_AMU)
 
 #define PVM_HAFGRTR_EL2_CLR (0ULL)
 
@@ -314,24 +154,24 @@ void pkvm_host_reclaim_page(struct kvm *host_kvm, phys_addr_t ipa);
 #define HFGxTR_nLS64 	HFGxTR_EL2_nACCDATA_EL1
 
 #define PVM_HFGXTR_EL2_SET \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_RAS), PVM_ID_AA64PFR0_ALLOW) >= ID_AA64PFR0_EL1_RAS_IMP ? 0ULL : HFGxTR_RAS_IMP) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_RAS), PVM_ID_AA64PFR0_ALLOW) >= ID_AA64PFR0_EL1_RAS_V1P1 ? 0ULL : HFGxTR_RAS_V1P1) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_GIC), PVM_ID_AA64PFR0_ALLOW) ? 0ULL : HFGxTR_GIC) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_CSV2), PVM_ID_AA64PFR0_ALLOW) ? 0ULL : HFGxTR_CSV2) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_LO), PVM_ID_AA64MMFR1_ALLOW) ? 0ULL : HFGxTR_LOR) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_APA), PVM_ID_AA64ISAR1_ALLOW) ? 0ULL : HFGxTR_PAUTH) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_API), PVM_ID_AA64ISAR1_ALLOW) ? 0ULL : HFGxTR_PAUTH) | \
+	(kvm_has_feat(kvm, ID_AA64PFR0_EL1, RAS, IMP) ? 0ULL : HFGxTR_RAS_IMP) | \
+	(kvm_has_feat(kvm, ID_AA64PFR0_EL1, RAS, V1P1) ? 0ULL : HFGxTR_RAS_V1P1) | \
+	(kvm_has_feat(kvm, ID_AA64PFR0_EL1, GIC, IMP) ? 0ULL : HFGxTR_GIC) | \
+	(kvm_has_feat(kvm, ID_AA64PFR0_EL1, CSV2, IMP) ? 0ULL : HFGxTR_CSV2) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR1_EL1, LO, IMP) ? 0ULL : HFGxTR_LOR) | \
+	(vcpu_has_ptrauth(vcpu) ? 0ULL : HFGxTR_PAUTH) | \
+	(vcpu_has_ptrauth(vcpu) ? 0ULL : HFGxTR_PAUTH) | \
 	0
 
 #define PVM_HFGXTR_EL2_CLR \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR3_EL1_AIE), PVM_ID_AA64MMFR3_ALLOW) ? 0ULL : HFGxTR_nAIE) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR3_EL1_S2POE), PVM_ID_AA64MMFR3_ALLOW) ? 0ULL : HFGxTR_nS2POE) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR3_EL1_S1POE), PVM_ID_AA64MMFR3_ALLOW) ? 0ULL : HFGxTR_nS1POE) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR3_EL1_S1PIE), PVM_ID_AA64MMFR3_ALLOW) ? 0ULL : HFGxTR_nS1PIE) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_THE), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HFGxTR_nTHE) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_SME), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HFGxTR_nSME) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_GCS), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HFGxTR_nGCS) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_LS64), PVM_ID_AA64ISAR1_ALLOW) ? 0ULL : HFGxTR_nLS64) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR3_EL1, AIE, IMP) ? 0ULL : HFGxTR_nAIE) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR3_EL1, S2POE, IMP) ? 0ULL : HFGxTR_nS2POE) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR3_EL1, S1POE, IMP) ? 0ULL : HFGxTR_nS1POE) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR3_EL1, S1PIE, IMP) ? 0ULL : HFGxTR_nS1PIE) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, THE, IMP) ? 0ULL : HFGxTR_nTHE) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, SME, IMP) ? 0ULL : HFGxTR_nSME) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, GCS, IMP) ? 0ULL : HFGxTR_nGCS) | \
+	(kvm_has_feat(kvm, ID_AA64ISAR1_EL1, LS64, LS64) ? 0ULL : HFGxTR_nLS64) | \
 	0
 
 #define PVM_HFGRTR_EL2_SET	PVM_HFGXTR_EL2_SET
@@ -399,16 +239,16 @@ void pkvm_host_reclaim_page(struct kvm *host_kvm, phys_addr_t ipa);
 			)
 
 #define PVM_HFGITR_EL2_SET \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_ATS1A), PVM_ID_AA64ISAR2_ALLOW) ? 0ULL : HFGITR_EL2_ATS1E1A) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_SPECRES), PVM_ID_AA64ISAR1_ALLOW) ? 0ULL : HFGITR_SPECRES) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR0_EL1_TLB), PVM_ID_AA64ISAR0_ALLOW) ? 0ULL : HFGITR_TLB) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_PAN), PVM_ID_AA64MMFR1_ALLOW) ? 0ULL : HFGITR_PAN) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_DPB), PVM_ID_AA64ISAR1_ALLOW) ? 0ULL : HFGITR_DPB) | \
+	(kvm_has_feat(kvm, ID_AA64ISAR2_EL1, ATS1A, IMP) ? 0ULL : HFGITR_EL2_ATS1E1A) | \
+	(kvm_has_feat(kvm, ID_AA64ISAR1_EL1, SPECRES, IMP) ? 0ULL : HFGITR_SPECRES) | \
+	(kvm_has_feat(kvm, ID_AA64ISAR0_EL1, TLB, OS) ? 0ULL : HFGITR_TLB) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR1_EL1, PAN, IMP) ? 0ULL : HFGITR_PAN) | \
+	(kvm_has_feat(kvm, ID_AA64ISAR1_EL1, DPB, IMP) ? 0ULL : HFGITR_DPB) | \
 	0
 
 #define PVM_HFGITR_EL2_CLR \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_GCS), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HFGITR_nGCS) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64DFR0_EL1_BRBE), PVM_ID_AA64DFR0_ALLOW) ? 0ULL : HFGITR_nBRBE) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, GCS, IMP) ? 0ULL : HFGITR_nGCS) | \
+	(kvm_has_feat(kvm, ID_AA64DFR0_EL1, BRBE, IMP) ? 0ULL : HFGITR_nBRBE) | \
 	0
 
 #define HCRX_NMI		HCRX_EL2_TALLINT
@@ -432,59 +272,32 @@ void pkvm_host_reclaim_page(struct kvm *host_kvm, phys_addr_t ipa);
 #define HCRX_nLS64		(HCRX_EL2_EnASR| HCRX_EL2_EnALS | HCRX_EL2_EnAS0)
 
 #define PVM_HCRX_EL2_SET \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_NMI), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HCRX_NMI) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_SME), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HCRX_SME) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, NMI, IMP) ? 0ULL : HCRX_NMI) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, SME, IMP) ? 0ULL : HCRX_SME) | \
 	0
 
 #define PVM_HCRX_EL2_CLR \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_APA), PVM_ID_AA64ISAR1_ALLOW) < ID_AA64ISAR1_EL1_APA_PAuth_LR ? 0ULL : HCRX_nPAuth_LR) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_API), PVM_ID_AA64ISAR1_ALLOW) < ID_AA64ISAR1_EL1_APA_PAuth_LR ? 0ULL : HCRX_nPAuth_LR) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_GCS), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HCRX_nGCS) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_SYSREG_128), PVM_ID_AA64ISAR2_ALLOW) ? 0ULL : HCRX_nSYSREG128) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR3_EL1_ADERR), PVM_ID_AA64MMFR3_ALLOW) ? 0ULL : HCRX_nADERR) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_DF2), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HCRX_nDoubleFault2) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR3_EL1_ANERR), PVM_ID_AA64MMFR3_ALLOW) ? 0ULL : HCRX_nANERR) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR0_EL1_PARANGE), PVM_ID_AA64MMFR0_ALLOW) ? 0ULL : HCRX_nD128) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_THE), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HCRX_nTHE) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR3_EL1_SCTLRX), PVM_ID_AA64MMFR3_ALLOW) ? 0ULL : HCRX_nSCTLR2) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR3_EL1_TCRX), PVM_ID_AA64MMFR3_ALLOW) ? 0ULL : HCRX_nTCR2) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR2_EL1_MOPS), PVM_ID_AA64ISAR2_ALLOW) ? 0ULL : HCRX_nMOPS) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR1_EL1_CMOW), PVM_ID_AA64MMFR1_ALLOW) ? 0ULL : HCRX_nCMOW) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64PFR1_EL1_NMI), PVM_ID_AA64PFR1_ALLOW) ? 0ULL : HCRX_nNMI) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_XS), PVM_ID_AA64ISAR1_ALLOW) ? 0ULL : HCRX_nXS) | \
-	(FIELD_GET(ARM64_FEATURE_MASK(ID_AA64ISAR1_EL1_LS64), PVM_ID_AA64ISAR1_ALLOW) ? 0ULL : HCRX_nLS64) | \
+	(vcpu_has_ptrauth(vcpu) ? HCRX_nPAuth_LR : 0ULL) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, GCS, IMP) ? 0ULL : HCRX_nGCS) | \
+	(kvm_has_feat(kvm, ID_AA64ISAR2_EL1, SYSREG_128, IMP) ? 0ULL : HCRX_nSYSREG128) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR3_EL1, ADERR, FEAT_ADERR) ? 0ULL : HCRX_nADERR) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, DF2, IMP) ? 0ULL : HCRX_nDoubleFault2) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR3_EL1, ANERR, FEAT_ANERR) ? 0ULL : HCRX_nANERR) | \
+	(true /* trap unless ID_AA64MMFR0_EL1 PARANGE == 0b111 */ ? 0ULL : HCRX_nD128) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, THE, IMP) ? 0ULL : HCRX_nTHE) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR3_EL1, SCTLRX, IMP) ? 0ULL : HCRX_nSCTLR2) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR3_EL1, TCRX, IMP) ? 0ULL : HCRX_nTCR2) | \
+	(kvm_has_feat(kvm, ID_AA64ISAR2_EL1, MOPS, IMP) ? 0ULL : HCRX_nMOPS) | \
+	(kvm_has_feat(kvm, ID_AA64MMFR1_EL1, CMOW, IMP) ? 0ULL : HCRX_nCMOW) | \
+	(kvm_has_feat(kvm, ID_AA64PFR1_EL1, NMI, IMP) ? 0ULL : HCRX_nNMI) | \
+	(kvm_has_feat(kvm, ID_AA64ISAR1_EL1, XS, IMP) ? 0ULL : HCRX_nXS) | \
+	(kvm_has_feat(kvm, ID_AA64ISAR1_EL1, LS64, LS64) ? 0ULL : HCRX_nLS64) | \
 	0
-
-/*
- * Returns the maximum number of breakpoints supported for protected VMs.
- */
-static inline int pkvm_get_max_brps(void)
-{
-	int num = FIELD_GET(ARM64_FEATURE_MASK(ID_AA64DFR0_EL1_BRPs),
-			    PVM_ID_AA64DFR0_ALLOW);
-
-	/*
-	 * If breakpoints are supported, the maximum number is 1 + the field.
-	 * Otherwise, return 0, which is not compliant with the architecture,
-	 * but is reserved and is used here to indicate no debug support.
-	 */
-	return num ? num + 1 : 0;
-}
-
-/*
- * Returns the maximum number of watchpoints supported for protected VMs.
- */
-static inline int pkvm_get_max_wrps(void)
-{
-	int num = FIELD_GET(ARM64_FEATURE_MASK(ID_AA64DFR0_EL1_WRPs),
-			    PVM_ID_AA64DFR0_ALLOW);
-
-	return num ? num + 1 : 0;
-}
 
 enum pkvm_moveable_reg_type {
 	PKVM_MREG_MEMORY,
 	PKVM_MREG_PROTECTED_RANGE,
+	PKVM_MREG_ASSIGN_MMIO,
 };
 
 struct pkvm_moveable_reg {
@@ -536,10 +349,11 @@ static inline unsigned long hyp_vm_table_pages(void)
 
 static inline unsigned long __hyp_pgtable_max_pages(unsigned long nr_pages)
 {
-	unsigned long total = 0, i;
+	unsigned long total = 0;
+	int i;
 
 	/* Provision the worst case scenario */
-	for (i = 0; i < KVM_PGTABLE_MAX_LEVELS; i++) {
+	for (i = KVM_PGTABLE_FIRST_LEVEL; i <= KVM_PGTABLE_LAST_LEVEL; i++) {
 		nr_pages = DIV_ROUND_UP(nr_pages, PTRS_PER_PTE);
 		total += nr_pages;
 	}
@@ -593,17 +407,27 @@ static inline unsigned long host_s2_pgtable_pages(void)
 	return res;
 }
 
-#define KVM_FFA_MBOX_NR_PAGES	1
+#ifdef CONFIG_PKVM_SELFTESTS
+static inline unsigned long pkvm_selftest_pages(void) { return 32; }
+#else
+static inline unsigned long pkvm_selftest_pages(void) { return 0; }
+#endif
+
+#define KVM_FFA_MBOX_NR_PAGES		1
+#define KVM_FFA_SPM_HANDLE_NR_PAGES	2
 
 /*
  * Maximum number of consitutents allowed in a descriptor. This number is
  * arbitrary, see comment below on SG_MAX_SEGMENTS in hyp_ffa_proxy_pages().
  */
-#define KVM_FFA_MAX_NR_CONSTITUENTS	12288
+#define KVM_FFA_MAX_NR_CONSTITUENTS	4096
+
+DECLARE_STATIC_KEY_FALSE(kvm_ffa_unmap_on_lend);
 
 static inline unsigned long hyp_ffa_proxy_pages(void)
 {
 	size_t desc_max;
+	unsigned long num_pages;
 
 	/*
 	 * SG_MAX_SEGMENTS is supposed to bound the number of elements in an
@@ -626,16 +450,21 @@ static inline unsigned long hyp_ffa_proxy_pages(void)
 		   KVM_FFA_MAX_NR_CONSTITUENTS * sizeof(struct ffa_mem_region_addr_range);
 
 	/* Plus a page each for the hypervisor's RX and TX mailboxes. */
-	return (2 * KVM_FFA_MBOX_NR_PAGES) + DIV_ROUND_UP(desc_max, PAGE_SIZE);
+	num_pages = (2 * KVM_FFA_MBOX_NR_PAGES) + DIV_ROUND_UP(desc_max, PAGE_SIZE);
+
+	if (static_branch_unlikely(&kvm_ffa_unmap_on_lend))
+		num_pages += KVM_FFA_SPM_HANDLE_NR_PAGES;
+
+	return num_pages;
 }
 
-static inline size_t pkvm_host_fp_state_size(void)
+static inline size_t pkvm_host_sve_state_size(void)
 {
-	if (system_supports_sve())
-		return size_add(sizeof(struct kvm_host_sve_state),
-		       SVE_SIG_REGS_SIZE(sve_vq_from_vl(kvm_host_sve_max_vl)));
-	else
-		return sizeof(struct user_fpsimd_state);
+	if (!system_supports_sve())
+		return 0;
+
+	return size_add(sizeof(struct cpu_sve_state),
+			SVE_SIG_REGS_SIZE(sve_vq_from_vl(kvm_host_sve_max_vl)));
 }
 
 int __pkvm_topup_hyp_alloc(unsigned long nr_pages);
@@ -645,7 +474,7 @@ int __pkvm_topup_hyp_alloc(unsigned long nr_pages);
 	struct arm_smccc_res res;					\
 	int __ret;							\
 	do {								\
-		__ret = -1; 						\
+		__ret = -1;						\
 		arm_smccc_1_1_hvc(KVM_HOST_SMCCC_FUNC(f),		\
 				  ##__VA_ARGS__, &res);			\
 		if (WARN_ON(res.a0 != SMCCC_RET_SUCCESS))		\
@@ -661,15 +490,60 @@ int __pkvm_topup_hyp_alloc(unsigned long nr_pages);
 	__ret;								\
 })
 
-int pkvm_call_hyp_nvhe_ppage(struct kvm_pinned_page *ppage,
-			     int (*call_hyp_nvhe)(u64, u64, u8, void*),
-			     void *args, bool unmap);
+enum pkvm_ptdump_ops {
+	PKVM_PTDUMP_GET_LEVEL,
+	PKVM_PTDUMP_GET_RANGE,
+	PKVM_PTDUMP_WALK_RANGE,
+};
 
-int pkvm_guest_stage2_pa(pkvm_handle_t handle, u64 ipa, phys_addr_t *phys);
+struct pkvm_ptdump_log {
+	/* VA_BIT - PAGE_SHIFT + 1 (INVALID_PTDUMP_PFN) */
+	u64	pfn: 41;
+	bool	valid: 1;
+	bool	r: 1;
+	bool	w: 1;
+	char	xn: 2;
+	bool	table: 1;
+	u16	page_state: 2;
+	u16	level: 8;
+} __packed;
 
-#ifdef CONFIG_DEBUG_FS
-void kvm_hyp_s1_pool_debugfs(void);
-#else
-static inline void kvm_hyp_s1_pool_debugfs(void) { }
-#endif
+#define INVALID_PTDUMP_PFN	(BIT(41) - 1)
+
+struct pkvm_ptdump_log_hdr {
+	/* The next page */
+	u64	pfn_next: 48;
+	/* The write index in the log page */
+	u64	w_index: 16;
+};
+
+struct pkvm_mapping {
+	struct rb_node node;
+	u64 gfn;
+	u64 pfn;
+	u64 nr_pages;
+	u64 __subtree_last;	/* Internal member for interval tree */
+};
+
+int pkvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
+			     struct kvm_pgtable_mm_ops *mm_ops, struct kvm_pgtable_pte_ops *pte_ops);
+void pkvm_pgtable_stage2_destroy(struct kvm_pgtable *pgt);
+int pkvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size, u64 phys,
+			    enum kvm_pgtable_prot prot, void *mc,
+			    enum kvm_pgtable_walk_flags flags);
+int pkvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size);
+int pkvm_pgtable_stage2_wrprotect(struct kvm_pgtable *pgt, u64 addr, u64 size);
+int pkvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size);
+bool pkvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr, u64 size, bool mkold);
+int pkvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr, enum kvm_pgtable_prot prot,
+				    enum kvm_pgtable_walk_flags flags);
+kvm_pte_t pkvm_pgtable_stage2_mkyoung(struct kvm_pgtable *pgt, u64 addr,
+				      enum kvm_pgtable_walk_flags flags);
+int pkvm_pgtable_stage2_split(struct kvm_pgtable *pgt, u64 addr, u64 size, void *mc);
+void pkvm_pgtable_stage2_free_unlinked(struct kvm_pgtable_mm_ops *mm_ops,
+				       struct kvm_pgtable_pte_ops *pte_ops,
+				       void *pgtable, s8 level);
+kvm_pte_t *pkvm_pgtable_stage2_create_unlinked(struct kvm_pgtable *pgt, u64 phys, s8 level,
+					       enum kvm_pgtable_prot prot, void *mc,
+					       bool force_pte);
 #endif	/* __ARM64_KVM_PKVM_H__ */

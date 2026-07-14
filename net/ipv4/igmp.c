@@ -120,12 +120,12 @@
  */
 
 #define IGMP_V1_SEEN(in_dev) \
-	(IPV4_DEVCONF_ALL(dev_net(in_dev->dev), FORCE_IGMP_VERSION) == 1 || \
+	(IPV4_DEVCONF_ALL_RO(dev_net(in_dev->dev), FORCE_IGMP_VERSION) == 1 || \
 	 IN_DEV_CONF_GET((in_dev), FORCE_IGMP_VERSION) == 1 || \
 	 ((in_dev)->mr_v1_seen && \
 	  time_before(jiffies, (in_dev)->mr_v1_seen)))
 #define IGMP_V2_SEEN(in_dev) \
-	(IPV4_DEVCONF_ALL(dev_net(in_dev->dev), FORCE_IGMP_VERSION) == 2 || \
+	(IPV4_DEVCONF_ALL_RO(dev_net(in_dev->dev), FORCE_IGMP_VERSION) == 2 || \
 	 IN_DEV_CONF_GET((in_dev), FORCE_IGMP_VERSION) == 2 || \
 	 ((in_dev)->mr_v2_seen && \
 	  time_before(jiffies, (in_dev)->mr_v2_seen)))
@@ -424,7 +424,7 @@ static int igmpv3_sendpack(struct sk_buff *skb)
 
 	pig->csum = ip_compute_csum(igmp_hdr(skb), igmplen);
 
-	return ip_local_out(dev_net(skb_dst(skb)->dev), skb->sk, skb);
+	return ip_local_out(skb_dst_dev_net(skb), skb->sk, skb);
 }
 
 static int grec_size(struct ip_mc_list *pmc, int type, int gdel, int sdel)
@@ -1842,7 +1842,8 @@ static struct in_device *ip_mc_find_dev(struct net *net, struct ip_mreqn *imr)
 	if (!dev) {
 		struct rtable *rt = ip_route_output(net,
 						    imr->imr_multiaddr.s_addr,
-						    0, 0, 0);
+						    0, 0, 0,
+						    RT_SCOPE_UNIVERSE);
 		if (!IS_ERR(rt)) {
 			dev = rt->dst.dev;
 			ip_rt_put(rt);
@@ -2946,8 +2947,6 @@ static struct ip_sf_list *igmp_mcf_get_next(struct seq_file *seq, struct ip_sf_l
 				continue;
 			state->im = rcu_dereference(state->idev->mc_list);
 		}
-		if (!state->im)
-			break;
 		spin_lock_bh(&state->im->lock);
 		psf = state->im->sources;
 	}

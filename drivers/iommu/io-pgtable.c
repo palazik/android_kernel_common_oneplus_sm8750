@@ -34,6 +34,26 @@ io_pgtable_init_table[IO_PGTABLE_NUM_FMTS] = {
 #endif
 };
 
+static int check_custom_allocator(enum io_pgtable_fmt fmt,
+				  struct io_pgtable_cfg *cfg)
+{
+	/* No custom allocator, no need to check the format. */
+	if (!cfg->alloc && !cfg->free)
+		return 0;
+
+	/* When passing a custom allocator, both the alloc and free
+	 * functions should be provided.
+	 */
+	if (!cfg->alloc || !cfg->free)
+		return -EINVAL;
+
+	/* Make sure the format supports custom allocators. */
+	if (io_pgtable_init_table[fmt]->caps & IO_PGTABLE_CAP_CUSTOM_ALLOCATOR)
+		return 0;
+
+	return -EINVAL;
+}
+
 struct io_pgtable_ops *alloc_io_pgtable_ops(enum io_pgtable_fmt fmt,
 					    struct io_pgtable_cfg *cfg,
 					    void *cookie)
@@ -42,6 +62,9 @@ struct io_pgtable_ops *alloc_io_pgtable_ops(enum io_pgtable_fmt fmt,
 	const struct io_pgtable_init_fns *fns;
 
 	if (fmt >= IO_PGTABLE_NUM_FMTS)
+		return NULL;
+
+	if (check_custom_allocator(fmt, cfg))
 		return NULL;
 
 	fns = io_pgtable_init_table[fmt];
@@ -77,7 +100,7 @@ void free_io_pgtable_ops(struct io_pgtable_ops *ops)
 }
 EXPORT_SYMBOL_GPL(free_io_pgtable_ops);
 
-int io_pgtable_configure(struct io_pgtable_cfg *cfg, size_t *pgd_size)
+int io_pgtable_configure(struct io_pgtable_cfg *cfg)
 {
 	const struct io_pgtable_init_fns *fns;
 
@@ -88,6 +111,6 @@ int io_pgtable_configure(struct io_pgtable_cfg *cfg, size_t *pgd_size)
 	if (!fns || !fns->configure)
 		return -EOPNOTSUPP;
 
-	return fns->configure(cfg, pgd_size);
+	return fns->configure(cfg);
 }
 EXPORT_SYMBOL_GPL(io_pgtable_configure);

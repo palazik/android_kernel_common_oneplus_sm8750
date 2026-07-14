@@ -82,7 +82,7 @@ static int system_refcount_dec(struct event_subsystem *system)
 	}
 
 static struct ftrace_event_field *
-__find_event_field(struct list_head *head, char *name)
+__find_event_field(struct list_head *head, const char *name)
 {
 	struct ftrace_event_field *field;
 
@@ -114,7 +114,8 @@ trace_find_event_field(struct trace_event_call *call, char *name)
 
 static int __trace_define_field(struct list_head *head, const char *type,
 				const char *name, int offset, int size,
-				int is_signed, int filter_type, int len)
+				int is_signed, int filter_type, int len,
+				int need_test)
 {
 	struct ftrace_event_field *field;
 
@@ -133,6 +134,7 @@ static int __trace_define_field(struct list_head *head, const char *type,
 	field->offset = offset;
 	field->size = size;
 	field->is_signed = is_signed;
+	field->needs_test = need_test;
 	field->len = len;
 
 	list_add(&field->link, head);
@@ -151,13 +153,13 @@ int trace_define_field(struct trace_event_call *call, const char *type,
 
 	head = trace_get_fields(call);
 	return __trace_define_field(head, type, name, offset, size,
-				    is_signed, filter_type, 0);
+				    is_signed, filter_type, 0, 0);
 }
 EXPORT_SYMBOL_GPL(trace_define_field);
 
 static int trace_define_field_ext(struct trace_event_call *call, const char *type,
 		       const char *name, int offset, int size, int is_signed,
-		       int filter_type, int len)
+		       int filter_type, int len, int need_test)
 {
 	struct list_head *head;
 
@@ -166,13 +168,13 @@ static int trace_define_field_ext(struct trace_event_call *call, const char *typ
 
 	head = trace_get_fields(call);
 	return __trace_define_field(head, type, name, offset, size,
-				    is_signed, filter_type, len);
+				    is_signed, filter_type, len, need_test);
 }
 
 #define __generic_field(type, item, filter_type)			\
 	ret = __trace_define_field(&ftrace_generic_fields, #type,	\
 				   #item, 0, 0, is_signed_type(type),	\
-				   filter_type, 0);			\
+				   filter_type, 0, 0);			\
 	if (ret)							\
 		return ret;
 
@@ -181,7 +183,8 @@ static int trace_define_field_ext(struct trace_event_call *call, const char *typ
 				   "common_" #item,			\
 				   offsetof(typeof(ent), item),		\
 				   sizeof(ent.item),			\
-				   is_signed_type(type), FILTER_OTHER, 0);	\
+				   is_signed_type(type), FILTER_OTHER,	\
+				   0, 0);				\
 	if (ret)							\
 		return ret;
 
@@ -332,6 +335,7 @@ static bool process_pointer(const char *fmt, int len, struct trace_event_call *c
 /* Return true if the string is safe */
 static bool process_string(const char *fmt, int len, struct trace_event_call *call)
 {
+	struct trace_event_fields *field;
 	const char *r, *e, *s;
 
 	e = fmt + len;
@@ -384,8 +388,16 @@ static bool process_string(const char *fmt, int len, struct trace_event_call *ca
 	if (process_pointer(fmt, len, call))
 		return true;
 
-	/* Make sure the field is found, and consider it OK for now if it is */
-	return find_event_field(fmt, call) != NULL;
+	/* Make sure the field is found */
+	field = find_event_field(fmt, call);
+	if (!field)
+		return false;
+
+	/* Test this field's string before printing the event */
+	call->flags |= TRACE_EVENT_FL_TEST_STR;
+	field->needs_test = 1;
+
+	return true;
 }
 
 /*
@@ -1130,18 +1142,18 @@ static void remove_subsystem(struct trace_subsystem_dir *dir)
 
 void event_file_get(struct trace_event_file *file)
 {
-	atomic_inc(&file->ref);
+	refcount_inc(&file->ref);
 }
 
 void event_file_put(struct trace_event_file *file)
 {
-	if (WARN_ON_ONCE(!atomic_read(&file->ref))) {
+	if (WARN_ON_ONCE(!refcount_read(&file->ref))) {
 		if (file->flags & EVENT_FILE_FL_FREED)
 			kmem_cache_free(file_cachep, file);
 		return;
 	}
 
-	if (atomic_dec_and_test(&file->ref)) {
+	if (refcount_dec_and_test(&file->ref)) {
 		/* Count should only go to zero when it is freed */
 		if (WARN_ON_ONCE(!(file->flags & EVENT_FILE_FL_FREED)))
 			return;
@@ -1157,6 +1169,9 @@ static void remove_event_file_dir(struct trace_event_file *file)
 	free_event_filter(file->filter);
 	file->flags |= EVENT_FILE_FL_FREED;
 	event_file_put(file);
+
+	/* Wake up hist poll waiters to notice the EVENT_FILE_FL_FREED flag. */
+	hist_poll_wakeup();
 }
 
 /*
@@ -1326,7 +1341,7 @@ ftrace_event_write(struct file *file, const char __user *ubuf,
 	if (!cnt)
 		return 0;
 
-	ret = tracing_update_buffers();
+	ret = tracing_update_buffers(tr);
 	if (ret < 0)
 		return ret;
 
@@ -1557,18 +1572,20 @@ event_enable_write(struct file *filp, const char __user *ubuf, size_t cnt,
 	if (ret)
 		return ret;
 
-	ret = tracing_update_buffers();
-	if (ret < 0)
-		return ret;
-
 	switch (val) {
 	case 0:
 	case 1:
 		ret = -ENODEV;
 		mutex_lock(&event_mutex);
 		file = event_file_file(filp);
-		if (likely(file))
+		if (likely(file)) {
+			ret = tracing_update_buffers(file->tr);
+			if (ret < 0) {
+				mutex_unlock(&event_mutex);
+				return ret;
+			}
 			ret = ftrace_event_enable_disable(file, val);
+		}
 		mutex_unlock(&event_mutex);
 		break;
 
@@ -1581,28 +1598,28 @@ event_enable_write(struct file *filp, const char __user *ubuf, size_t cnt,
 	return ret ? ret : cnt;
 }
 
-static ssize_t
-system_enable_read(struct file *filp, char __user *ubuf, size_t cnt,
-		   loff_t *ppos)
+/*
+ * Returns:
+ *   0 : no events exist?
+ *   1 : all events are disabled
+ *   2 : all events are enabled
+ *   3 : some events are enabled and some are enabled
+ */
+int trace_events_enabled(struct trace_array *tr, const char *system)
 {
-	const char set_to_char[4] = { '?', '0', '1', 'X' };
-	struct trace_subsystem_dir *dir = filp->private_data;
-	struct event_subsystem *system = dir->subsystem;
 	struct trace_event_call *call;
 	struct trace_event_file *file;
-	struct trace_array *tr = dir->tr;
-	char buf[2];
 	int set = 0;
-	int ret;
 
-	mutex_lock(&event_mutex);
+	guard(mutex)(&event_mutex);
+
 	list_for_each_entry(file, &tr->events, list) {
 		call = file->event_call;
 		if ((call->flags & TRACE_EVENT_FL_IGNORE_ENABLE) ||
 		    !trace_event_name(call) || !call->class || !call->class->reg)
 			continue;
 
-		if (system && strcmp(call->class->system, system->name) != 0)
+		if (system && strcmp(call->class->system, system) != 0)
 			continue;
 
 		/*
@@ -1618,7 +1635,23 @@ system_enable_read(struct file *filp, char __user *ubuf, size_t cnt,
 		if (set == 3)
 			break;
 	}
-	mutex_unlock(&event_mutex);
+
+	return set;
+}
+
+static ssize_t
+system_enable_read(struct file *filp, char __user *ubuf, size_t cnt,
+		   loff_t *ppos)
+{
+	const char set_to_char[4] = { '?', '0', '1', 'X' };
+	struct trace_subsystem_dir *dir = filp->private_data;
+	struct event_subsystem *system = dir->subsystem;
+	struct trace_array *tr = dir->tr;
+	char buf[2];
+	int set;
+	int ret;
+
+	set = trace_events_enabled(tr, system ? system->name : NULL);
 
 	buf[0] = set_to_char[set];
 	buf[1] = '\n';
@@ -1642,7 +1675,7 @@ system_enable_write(struct file *filp, const char __user *ubuf, size_t cnt,
 	if (ret)
 		return ret;
 
-	ret = tracing_update_buffers();
+	ret = tracing_update_buffers(dir->tr);
 	if (ret < 0)
 		return ret;
 
@@ -2039,9 +2072,9 @@ subsystem_filter_write(struct file *filp, const char __user *ubuf, size_t cnt,
 }
 
 static ssize_t
-show_header(struct file *filp, char __user *ubuf, size_t cnt, loff_t *ppos)
+show_header_page_file(struct file *filp, char __user *ubuf, size_t cnt, loff_t *ppos)
 {
-	int (*func)(struct trace_seq *s) = filp->private_data;
+	struct trace_array *tr = filp->private_data;
 	struct trace_seq *s;
 	int r;
 
@@ -2054,7 +2087,31 @@ show_header(struct file *filp, char __user *ubuf, size_t cnt, loff_t *ppos)
 
 	trace_seq_init(s);
 
-	func(s);
+	ring_buffer_print_page_header(tr->array_buffer.buffer, s);
+	r = simple_read_from_buffer(ubuf, cnt, ppos,
+				    s->buffer, trace_seq_used(s));
+
+	kfree(s);
+
+	return r;
+}
+
+static ssize_t
+show_header_event_file(struct file *filp, char __user *ubuf, size_t cnt, loff_t *ppos)
+{
+	struct trace_seq *s;
+	int r;
+
+	if (*ppos)
+		return 0;
+
+	s = kmalloc(sizeof(*s), GFP_KERNEL);
+	if (!s)
+		return -ENOMEM;
+
+	trace_seq_init(s);
+
+	ring_buffer_print_entry_header(s);
 	r = simple_read_from_buffer(ubuf, cnt, ppos,
 				    s->buffer, trace_seq_used(s));
 
@@ -2126,7 +2183,7 @@ event_pid_write(struct file *filp, const char __user *ubuf,
 	if (!cnt)
 		return 0;
 
-	ret = tracing_update_buffers();
+	ret = tracing_update_buffers(tr);
 	if (ret < 0)
 		return ret;
 
@@ -2313,10 +2370,18 @@ static const struct file_operations ftrace_tr_enable_fops = {
 	.release = subsystem_release,
 };
 
-static const struct file_operations ftrace_show_header_fops = {
-	.open = tracing_open_generic,
-	.read = show_header,
+static const struct file_operations ftrace_show_header_page_fops = {
+	.open = tracing_open_generic_tr,
+	.read = show_header_page_file,
 	.llseek = default_llseek,
+	.release = tracing_release_generic_tr,
+};
+
+static const struct file_operations ftrace_show_header_event_fops = {
+	.open = tracing_open_generic_tr,
+	.read = show_header_event_file,
+	.llseek = default_llseek,
+	.release = tracing_release_generic_tr,
 };
 
 static int
@@ -2575,7 +2640,7 @@ event_define_fields(struct trace_event_call *call)
 			ret = trace_define_field_ext(call, field->type, field->name,
 						 offset, field->size,
 						 field->is_signed, field->filter_type,
-						 field->len);
+						 field->len, field->needs_test);
 			if (WARN_ON_ONCE(ret)) {
 				pr_err("error code is %d\n", ret);
 				break;
@@ -2663,6 +2728,14 @@ static int event_callback(const char *name, umode_t *mode, void **data,
 	return 0;
 }
 
+/* The file is incremented on creation and freeing the enable file decrements it */
+static void event_release(const char *name, void *data)
+{
+	struct trace_event_file *file = data;
+
+	event_file_put(file);
+}
+
 static int
 event_create_dir(struct eventfs_inode *parent, struct trace_event_file *file)
 {
@@ -2677,6 +2750,7 @@ event_create_dir(struct eventfs_inode *parent, struct trace_event_file *file)
 		{
 			.name		= "enable",
 			.callback	= event_callback,
+			.release	= event_release,
 		},
 		{
 			.name		= "filter",
@@ -2745,10 +2819,13 @@ event_create_dir(struct eventfs_inode *parent, struct trace_event_file *file)
 		return ret;
 	}
 
+	/* Gets decremented on freeing of the "enable" file */
+	event_file_get(file);
+
 	return 0;
 }
 
-static void remove_event_from_tracers(struct trace_event_call *call)
+void remove_event_from_tracers(struct trace_event_call *call)
 {
 	struct trace_event_file *file;
 	struct trace_array *tr;
@@ -3067,6 +3144,20 @@ static bool event_in_systems(struct trace_event_call *call,
 	return !*p || isspace(*p) || *p == ',';
 }
 
+#ifdef CONFIG_HIST_TRIGGERS
+/*
+ * Wake up waiter on the hist_poll_wq from irq_work because the hist trigger
+ * may happen in any context.
+ */
+static void hist_poll_event_irq_work(struct irq_work *work)
+{
+	wake_up_all(&hist_poll_wq);
+}
+
+DEFINE_IRQ_WORK(hist_poll_work, hist_poll_event_irq_work);
+DECLARE_WAIT_QUEUE_HEAD(hist_poll_wq);
+#endif
+
 static struct trace_event_file *
 trace_create_new_event(struct trace_event_call *call,
 		       struct trace_array *tr)
@@ -3076,7 +3167,7 @@ trace_create_new_event(struct trace_event_call *call,
 	struct trace_event_file *file;
 	unsigned int first;
 
-	if (!event_in_systems(call, trace_array_get_system_names(tr)))
+	if (!event_in_systems(call, tr->system_names))
 		return NULL;
 
 	file = kmem_cache_alloc(file_cachep, GFP_TRACE);
@@ -3098,7 +3189,7 @@ trace_create_new_event(struct trace_event_call *call,
 	atomic_set(&file->tm_ref, 0);
 	INIT_LIST_HEAD(&file->triggers);
 	list_add(&file->list, &tr->events);
-	event_file_get(file);
+	refcount_set(&file->ref, 1);
 
 	return file;
 }
@@ -3120,7 +3211,7 @@ static __init int setup_trace_triggers(char *str)
 	int i;
 
 	strscpy(bootup_trigger_buf, str, COMMAND_LINE_SIZE);
-	ring_buffer_expanded = true;
+	trace_set_ring_buffer_expanded(NULL);
 	disable_tracing_selftest("running event triggers");
 
 	buf = bootup_trigger_buf;
@@ -3924,8 +4015,12 @@ static char bootup_event_buf[COMMAND_LINE_SIZE] __initdata;
 
 static __init int setup_trace_event(char *str)
 {
-	strscpy(bootup_event_buf, str, COMMAND_LINE_SIZE);
-	ring_buffer_expanded = true;
+	if (bootup_event_buf[0] != '\0')
+		strlcat(bootup_event_buf, ",", COMMAND_LINE_SIZE);
+
+	strlcat(bootup_event_buf, str, COMMAND_LINE_SIZE);
+
+	trace_set_ring_buffer_expanded(NULL);
 	disable_tracing_selftest("running event tracing");
 
 	return 1;
@@ -3941,17 +4036,16 @@ static int events_callback(const char *name, umode_t *mode, void **data,
 		return 1;
 	}
 
-	if (strcmp(name, "header_page") == 0)
-		*data = ring_buffer_print_page_header;
+	if (strcmp(name, "header_page") == 0) {
+		*mode = TRACE_MODE_READ;
+		*fops = &ftrace_show_header_page_fops;
 
-	else if (strcmp(name, "header_event") == 0)
-		*data = ring_buffer_print_entry_header;
-
-	else
+	} else if (strcmp(name, "header_event") == 0) {
+		*mode = TRACE_MODE_READ;
+		*fops = &ftrace_show_header_event_fops;
+	} else
 		return 0;
 
-	*mode = TRACE_MODE_READ;
-	*fops = &ftrace_show_header_fops;
 	return 1;
 }
 

@@ -346,7 +346,7 @@ static inline void exceps_update(struct md_info_t *rec, int id, unsigned long ji
 
 	idx = &rec->kern_dump.excep_idx[id];
 	rec->kern_dump.excep_rec[id][*idx] = jiffies;
-	*idx = ++(*idx) % MAX_EXCEPS;
+	*idx = (*idx + 1) % MAX_EXCEPS;
 }
 
 static inline void sw_update(struct md_info_t *rec, u64 switch_at,
@@ -362,7 +362,7 @@ static inline void sw_update(struct md_info_t *rec, u64 switch_at,
 	rec->kern_dump.sw_rec[*idx].is_success = is_success;
 	rec->kern_dump.sw_rec[*idx].end_state = end_state;
 	rec->kern_dump.sw_rec[*idx].switch_reason = switch_reason;
-	*idx = ++(*idx) % MAX_SWITCHS;
+	*idx = (*idx + 1) % MAX_SWITCHS;
 }
 
 struct hmbird_ops {

@@ -195,7 +195,7 @@ static void update_history(struct rq *rq, struct task_struct *p,
 	/* Push new 'runtime' value onto stack */
 	for (; samples > 0; samples--) {
 		hist[sts->cidx] = runtime;
-		sts->cidx = ++(sts->cidx) % RAVG_HIST_SIZE;
+		sts->cidx = (sts->cidx + 1) % RAVG_HIST_SIZE;
 	}
 
 	for (i = 0; i < RAVG_HIST_SIZE; i++) {

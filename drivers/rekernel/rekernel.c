@@ -14,6 +14,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/freezer.h>
+#include <linux/sched/task.h>
 #include <linux/ktime.h>
 #include <linux/hrtimer.h>
 #include <linux/proc_fs.h>
@@ -144,6 +145,8 @@ void line_binder_alloc_new_buf_locked(void *data, size_t size, size_t *free_asyn
 		|| (alloc->free_async_space < WARN_AHEAD_SPACE))) {
 		rcu_read_lock();
 		p = find_task_by_vpid(alloc->pid);
+		if (p != NULL)
+			get_task_struct(p);
 		rcu_read_unlock();
 		if (p != NULL && line_is_frozen(p)) {
 #ifdef DEBUG
@@ -155,6 +158,8 @@ void line_binder_alloc_new_buf_locked(void *data, size_t size, size_t *free_asyn
 				sendMessage(binder_kmsg, strlen(binder_kmsg));
 			}
 		}
+		if (p != NULL)
+			put_task_struct(p);
 	}
 }
 
